@@ -1,3 +1,5 @@
+#ifdef FIDESLIB_ENABLE_CUDA
+
 #include "engine/cuda/CudaEngine.hpp"
 
 #include "CryptoContext.hpp"
@@ -772,3 +774,5 @@ CudaEngine::~CudaEngine() {
 }
 
 } // namespace fideslib
+
+#endif // FIDESLIB_ENABLE_CUDA

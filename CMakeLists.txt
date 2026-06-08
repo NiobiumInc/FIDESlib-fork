@@ -41,6 +41,11 @@ option(FIDESLIB_COMPILE_BENCHMARKS "Set ON to compile the FIDESlib benchmark sui
 # Option to compile the test suite.
 option(FIDESLIB_COMPILE_TESTS "Set ON to compile the FIDESlib test suite." ON)
 
+# CUDA backend. ON (default) requires the CUDA toolchain and builds the CUDA engine; OFF builds
+# CPU-only (CPU/OpenFHE is always available, no CUDA toolchain needed). Future accelerator backends
+# are added as their own FIDESLIB_ENABLE_<backend> flag.
+option(FIDESLIB_ENABLE_CUDA "Build the CUDA backend (CPU/OpenFHE is always available)." ON)
+
 # Export compile commands for debugging.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 
@@ -55,33 +60,41 @@ set(CMAKE_CXX_COMPILER "g++")
 
 ############### CUDA Configuration ###################
 
-# Set CUDA_PATH if not defined previously.
-if (NOT DEFINED CUDA_PATH)
-    set(CUDA_PATH "/usr/local/cuda")
+if (FIDESLIB_ENABLE_CUDA)
+    # Set CUDA_PATH if not defined previously.
+    if (NOT DEFINED CUDA_PATH)
+        set(CUDA_PATH "/usr/local/cuda")
+    endif ()
+
+    set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc")
+
+    # Check if CUDA is installed.
+    if (NOT EXISTS "${CUDA_PATH}")
+        message(FATAL_ERROR "CUDA not found at ${CUDA_PATH}. Please install CUDA.")
+    endif ()
+
+    # Global language config.
+    set(CMAKE_CUDA_ARCHITECTURES "${FIDESLIB_ARCH}")
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS ON)
+    set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
 endif ()
-
-set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc")
-
-# Check if CUDA is installed.
-if (NOT EXISTS "${CUDA_PATH}")
-    message(FATAL_ERROR "CUDA not found at ${CUDA_PATH}. Please install CUDA.")
-endif ()
-
-# Global language config.
-set(CMAKE_CUDA_ARCHITECTURES "${FIDESLIB_ARCH}")
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_EXTENSIONS ON)
-set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
 
 ################ Project Definition ###################
 
-project(fideslib VERSION 1.0 DESCRIPTION "Homomorphic Encryption Library" LANGUAGES CXX CUDA)
+if (NOT FIDESLIB_ENABLE_CUDA)
+    project(fideslib VERSION 1.0 DESCRIPTION "Homomorphic Encryption Library" LANGUAGES CXX)
+else ()
+    project(fideslib VERSION 1.0 DESCRIPTION "Homomorphic Encryption Library" LANGUAGES CXX CUDA)
+endif ()
 
 ################ Extra Flags ###################
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-restrict -Wall -rdc=true --diag-suppress=3133,611")
+if (FIDESLIB_ENABLE_CUDA)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-restrict -Wall -rdc=true --diag-suppress=3133,611")
+endif ()
 
 ############### Utils ###################
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -94,22 +107,24 @@ include(ClangFormat)
 
 ################ CUDA Libraries ###################
 
-find_package(CUDAToolkit REQUIRED)
-if (NOT CUDAToolkit_FOUND)
-    message(FATAL_ERROR "CUDA not found!")
-else ()
-    message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
-    message(STATUS "CUDA include path: ${CUDAToolkit_INCLUDE_DIRS}")
-endif ()
+if (FIDESLIB_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    if (NOT CUDAToolkit_FOUND)
+        message(FATAL_ERROR "CUDA not found!")
+    else ()
+        message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
+        message(STATUS "CUDA include path: ${CUDAToolkit_INCLUDE_DIRS}")
+    endif ()
 
-# Check for NCCL installation. Do not do anything more. It is managed by CUDA. This is just to
-# enable conditional NCCL-dependent code.
-find_library(nccl_FOUND NAMES nccl HINTS /usr/local/cuda/lib64 /usr/lib /usr/local/lib)
-if (nccl_FOUND)
-    message(STATUS "Found NCCL: ${nccl_FOUND}")
-    add_compile_definitions(MULTI_GPU NCCL RCCL)
-else ()
-    message(STATUS "NCCL not found: building without NCCL support")
+    # Check for NCCL installation. Do not do anything more. It is managed by CUDA. This is just to
+    # enable conditional NCCL-dependent code.
+    find_library(nccl_FOUND NAMES nccl HINTS /usr/local/cuda/lib64 /usr/lib /usr/local/lib)
+    if (nccl_FOUND)
+        message(STATUS "Found NCCL: ${nccl_FOUND}")
+        add_compile_definitions(MULTI_GPU NCCL RCCL)
+    else ()
+        message(STATUS "NCCL not found: building without NCCL support")
+    endif ()
 endif ()
 
 ############### OpenFHE Configuration ###################
@@ -152,13 +167,17 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif ()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FIX_OMP_FLAGS}")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler ${FIX_OMP_FLAGS}")
+if (FIDESLIB_ENABLE_CUDA)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler ${FIX_OMP_FLAGS}")
+endif ()
 
 ############### Optimization Flags ###################
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O0 -Xcompiler -O0 -Xcompiler -g -G")
+    if (FIDESLIB_ENABLE_CUDA)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O0 -Xcompiler -O0 -Xcompiler -g -G")
+    endif ()
 elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CheckIPOSupported)
     check_ipo_supported(RESULT supported OUTPUT error)
@@ -169,11 +188,17 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     else ()
         message(STATUS "IPO / LTO not supported: <${error}>")
     endif ()
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -O3")
+    if (FIDESLIB_ENABLE_CUDA)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -O3")
+    endif ()
 elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -O2 -Xcompiler -g")
+    if (FIDESLIB_ENABLE_CUDA)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -O2 -Xcompiler -g")
+    endif ()
 elseif (CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Os")
+    if (FIDESLIB_ENABLE_CUDA)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Os")
+    endif ()
 endif ()
 
 ############### Configuration export ###################
@@ -187,34 +212,50 @@ set(INSTALL_DATA_DIR "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}/cmake")
 
 
 ############### NVTX ###################
-include(nvtx/c/nvtxImportedTargets.cmake)
+if (FIDESLIB_ENABLE_CUDA)
+    include(nvtx/c/nvtxImportedTargets.cmake)
+endif ()
 
 ############### FIDESlib Definition ###################
 
 set(SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/api")
 
-file(GLOB_RECURSE SOURCE_FILES_CUDA ${SOURCE_DIR}/*.cu)
-file(GLOB_RECURSE SOURCE_FILES_CXX ${SOURCE_DIR}/*.cpp)
-file(GLOB_RECURSE HEADER_FILES_CUDA ${SOURCE_DIR}/*.cuh)
-file(GLOB_RECURSE HEADER_FILES_CXX ${SOURCE_DIR}/*.hpp ${SOURCE_DIR}/*.h ${SOURCE_DIR}/*.inc)
-set_source_files_properties(${SOURCE_FILES_CUDA} ${HEADER_FILES_CUDA} PROPERTIES LANGUAGE CUDA)
-set_source_files_properties(${SOURCE_FILES_CXX} ${HEADER_FILES_CXX} PROPERTIES LANGUAGE CXX)
+if (FIDESLIB_ENABLE_CUDA)
+    file(GLOB_RECURSE SOURCE_FILES_CUDA ${SOURCE_DIR}/*.cu)
+    file(GLOB_RECURSE SOURCE_FILES_CXX ${SOURCE_DIR}/*.cpp)
+    file(GLOB_RECURSE HEADER_FILES_CUDA ${SOURCE_DIR}/*.cuh)
+    file(GLOB_RECURSE HEADER_FILES_CXX ${SOURCE_DIR}/*.hpp ${SOURCE_DIR}/*.h ${SOURCE_DIR}/*.inc)
+    set_source_files_properties(${SOURCE_FILES_CUDA} ${HEADER_FILES_CUDA} PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(${SOURCE_FILES_CXX} ${HEADER_FILES_CXX} PROPERTIES LANGUAGE CXX)
+endif ()
 
 file(GLOB_RECURSE SOURCE_FILES_API ${API_DIR}/*.cpp)
+# engine/cuda/CudaEngine.cpp is the CUDA backend; exclude it from CPU-only builds.
+if (NOT FIDESLIB_ENABLE_CUDA)
+    list(REMOVE_ITEM SOURCE_FILES_API ${API_DIR}/engine/cuda/CudaEngine.cpp)
+endif ()
 file(GLOB_RECURSE HEADER_FILES_PUBLIC ${API_DIR}/*.hpp)
 set_source_files_properties(${HEADER_FILES_PUBLIC} ${SOURCE_FILES_API} PROPERTIES LANGUAGE CXX)
 
 add_library(fideslib STATIC)
 
-target_sources(fideslib PRIVATE ${SOURCE_FILES_CXX} ${SOURCE_FILES_CUDA} ${SOURCE_FILES_API})
-target_sources(fideslib PRIVATE
-        FILE_SET private_headers
-        TYPE HEADERS
-        BASE_DIRS "${SOURCE_DIR}"
-        DESTINATION "${INSTALL_INCLUDE_DIR}"
-        FILES ${HEADER_FILES_CXX} ${HEADER_FILES_CUDA}
-)
+if (NOT FIDESLIB_ENABLE_CUDA)
+    target_sources(fideslib PRIVATE ${SOURCE_FILES_API})
+else ()
+    target_compile_definitions(fideslib PUBLIC FIDESLIB_ENABLE_CUDA)
+    target_sources(fideslib PRIVATE ${SOURCE_FILES_CXX} ${SOURCE_FILES_CUDA} ${SOURCE_FILES_API})
+endif ()
+
+if (FIDESLIB_ENABLE_CUDA)
+    target_sources(fideslib PRIVATE
+            FILE_SET private_headers
+            TYPE HEADERS
+            BASE_DIRS "${SOURCE_DIR}"
+            DESTINATION "${INSTALL_INCLUDE_DIR}"
+            FILES ${HEADER_FILES_CXX} ${HEADER_FILES_CUDA}
+    )
+endif ()
 target_sources(fideslib PUBLIC
         FILE_SET public_headers
         TYPE HEADERS
@@ -224,10 +265,12 @@ target_sources(fideslib PUBLIC
 )
 
 target_include_directories(fideslib
-        PRIVATE nvtx/c/include
         # api/ is the include root so headers use api-relative paths (e.g. "engine/cuda/CudaEngine.hpp").
         PUBLIC $<BUILD_INTERFACE:${API_DIR}>
 )
+if (FIDESLIB_ENABLE_CUDA)
+    target_include_directories(fideslib PRIVATE nvtx/c/include)
+endif ()
 
 target_link_libraries(fideslib
         PRIVATE "${OpenFHE_LIBDIR}/libOPENFHEpke_static.a"
@@ -235,47 +278,54 @@ target_link_libraries(fideslib
         PRIVATE "${OpenFHE_LIBDIR}/libOPENFHEcore_static.a"
 )
 
-target_link_libraries(fideslib
-        PRIVATE CUDA::cudart
-        PRIVATE CUDA::cuda_driver
-)
+if (FIDESLIB_ENABLE_CUDA)
+    target_link_libraries(fideslib
+            PRIVATE CUDA::cudart
+            PRIVATE CUDA::cuda_driver
+    )
+
+    if (nccl_FOUND)
+        message(STATUS "FIDESlib linked against NCCL")
+        target_link_libraries(fideslib PRIVATE nccl)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNCCL")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -DNCCL")
+    endif ()
+endif ()
 
 target_link_options(fideslib PRIVATE -static-libstdc++ -static-libgcc)
 
-
-if (nccl_FOUND)
-    message(STATUS "FIDESlib linked against NCCL")
-    target_link_libraries(fideslib PRIVATE nccl)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNCCL")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -DNCCL")
-endif ()
-
 set_target_properties(fideslib PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
         POSITION_INDEPENDENT_CODE ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         PREFIX ""
 )
+if (FIDESLIB_ENABLE_CUDA)
+    set_target_properties(fideslib PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+endif ()
 
 ############### GPU Checker ###################
 
-add_executable(gpu-test)
+if (FIDESLIB_ENABLE_CUDA)
+    add_executable(gpu-test)
 
-file(GLOB_RECURSE GPUTEST_SOURCES other/GPUTest.cpp)
-set_source_files_properties(${GPUTEST_SOURCES} PROPERTIES LANGUAGE CUDA)
+    file(GLOB_RECURSE GPUTEST_SOURCES other/GPUTest.cpp)
+    set_source_files_properties(${GPUTEST_SOURCES} PROPERTIES LANGUAGE CUDA)
 
-target_sources(gpu-test PRIVATE ${GPUTEST_SOURCES})
-set_target_properties(gpu-test PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-)
+    target_sources(gpu-test PRIVATE ${GPUTEST_SOURCES})
+    set_target_properties(gpu-test PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+    )
 
-target_link_libraries(gpu-test PRIVATE CUDA::cudart)
+    target_link_libraries(gpu-test PRIVATE CUDA::cudart)
 
-set_target_properties(gpu-test PROPERTIES
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON
-)
+    set_target_properties(gpu-test PROPERTIES
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            CUDA_SEPARABLE_COMPILATION ON
+            POSITION_INDEPENDENT_CODE ON
+    )
+endif ()
 
 ############### Dummy executable ###################
 
@@ -285,24 +335,21 @@ file(GLOB_RECURSE DUMMY_SOURCES other/Dummy.cpp)
 set_source_files_properties(${DUMMY_SOURCES} PROPERTIES LANGUAGE CXX)
 
 target_sources(dummy PRIVATE ${DUMMY_SOURCES})
-target_sources(dummy PUBLIC
-        FILE_SET dependency_headers
-        TYPE HEADERS
-        BASE_DIRS ${SOURCE_DIR}
-        FILES ${HEADER_FILES_CUDA} ${HEADER_FILES_CXX}
-)
+target_link_libraries(dummy PRIVATE fideslib)
+set_target_properties(dummy PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-target_link_libraries(dummy
-        PRIVATE fideslib
-)
-
-set_target_properties(dummy PROPERTIES
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON
-)
-
-set_target_properties(dummy PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+if (FIDESLIB_ENABLE_CUDA)
+    target_sources(dummy PUBLIC
+            FILE_SET dependency_headers
+            TYPE HEADERS
+            BASE_DIRS ${SOURCE_DIR}
+            FILES ${HEADER_FILES_CUDA} ${HEADER_FILES_CXX}
+    )
+    set_target_properties(dummy PROPERTIES
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            CUDA_SEPARABLE_COMPILATION ON
+    )
+endif ()
 
 ############### Library Installation ###################
 
@@ -314,8 +361,15 @@ install(
         RUNTIME DESTINATION "${INSTALL_BINARY_DIR}"
         INCLUDES DESTINATION "${INSTALL_INCLUDE_DIR}"
         FILE_SET public_headers DESTINATION "${INSTALL_INCLUDE_DIR}"
-        FILE_SET private_headers DESTINATION "${INSTALL_INCLUDE_DIR}"
 )
+
+# The private_headers FILE_SET (src/ implementation headers) only exists in GPU builds.
+if (FIDESLIB_ENABLE_CUDA)
+    install(
+            TARGETS fideslib
+            FILE_SET private_headers DESTINATION "${INSTALL_INCLUDE_DIR}"
+    )
+endif ()
 
 install(
         EXPORT ${PROJECT_NAME}Targets
@@ -343,61 +397,82 @@ install(FILES
 )
 
 # Also install private headers so downstream targets can include implementation details when needed.
-install(
-        DIRECTORY "${SOURCE_DIR}/"
-        DESTINATION "${INSTALL_INCLUDE_DIR}"
-        FILES_MATCHING
-        PATTERN "*.hpp"
-        PATTERN "*.h"
-        PATTERN "*.cuh"
-        PATTERN "*.inc"
-)
+if (FIDESLIB_ENABLE_CUDA)
+    install(
+            DIRECTORY "${SOURCE_DIR}/"
+            DESTINATION "${INSTALL_INCLUDE_DIR}"
+            FILES_MATCHING
+            PATTERN "*.hpp"
+            PATTERN "*.h"
+            PATTERN "*.cuh"
+            PATTERN "*.inc"
+    )
+endif ()
 
 
 ############### Test ###################
 
 if (FIDESLIB_COMPILE_TESTS)
 
-    set(INSTALL_GTEST OFF)
-
-    FetchContent_Declare(googletest GIT_REPOSITORY https://github.com/google/googletest.git GIT_TAG main)
-    FetchContent_MakeAvailable(googletest)
+    # Use system-installed GTest when available (e.g. inside a nix derivation);
+    # fall back to FetchContent for dev-shell use where there is network access.
+    find_package(GTest QUIET)
+    if (GTest_FOUND)
+        add_library(gtest      ALIAS GTest::gtest)
+        add_library(gtest_main ALIAS GTest::gtest_main)
+    else ()
+        set(INSTALL_GTEST OFF)
+        FetchContent_Declare(googletest GIT_REPOSITORY https://github.com/google/googletest.git GIT_TAG main)
+        FetchContent_MakeAvailable(googletest)
+    endif ()
     include(GoogleTest)
 
     set(TEST_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
-    file(GLOB_RECURSE TEST_SOURCE ${TEST_SOURCE_DIR}/*.cpp ${TEST_SOURCE_DIR}/*.cu)
-    set_source_files_properties(${TEST_SOURCE} PROPERTIES LANGUAGE CUDA)
+    if (FIDESLIB_ENABLE_CUDA)
+        file(GLOB_RECURSE TEST_SOURCE ${TEST_SOURCE_DIR}/*.cpp ${TEST_SOURCE_DIR}/*.cu)
+        set_source_files_properties(${TEST_SOURCE} PROPERTIES LANGUAGE CUDA)
 
-    add_executable(fideslib-test)
+        add_executable(fideslib-test)
 
-    target_sources(fideslib-test PRIVATE ${TEST_SOURCE})
+        target_sources(fideslib-test PRIVATE ${TEST_SOURCE})
 
-    target_sources(fideslib-test PRIVATE
-            FILE_SET dependency_headers
-            TYPE HEADERS
-            BASE_DIRS ${SOURCE_DIR}
-            FILES ${HEADER_FILES_CUDA} ${HEADER_FILES_CXX}
-    )
+        target_sources(fideslib-test PRIVATE
+                FILE_SET dependency_headers
+                TYPE HEADERS
+                BASE_DIRS ${SOURCE_DIR}
+                FILES ${HEADER_FILES_CUDA} ${HEADER_FILES_CXX}
+        )
 
-    target_link_libraries(fideslib-test
-            PRIVATE gtest
-            PRIVATE gtest_main
-            PRIVATE fideslib
-    )
+        target_link_libraries(fideslib-test
+                PRIVATE gtest
+                PRIVATE gtest_main
+                PRIVATE fideslib
+        )
 
-    set_target_properties(fideslib-test PROPERTIES
-            CUDA_RESOLVE_DEVICE_SYMBOLS ON
-            CUDA_SEPARABLE_COMPILATION ON
-            POSITION_INDEPENDENT_CODE ON
-    )
+        set_target_properties(fideslib-test PROPERTIES
+                CUDA_RESOLVE_DEVICE_SYMBOLS ON
+                CUDA_SEPARABLE_COMPILATION ON
+                POSITION_INDEPENDENT_CODE ON
+        )
+    else ()
+        # CPU-only build: the .cu suite (GPU-vs-OpenFHE parity) needs CUDA and is excluded.
+        # The api-level suites compile as plain CXX and run against the CPU backend.
+        add_executable(fideslib-cpu-test)
+        target_sources(fideslib-cpu-test PRIVATE
+                ${TEST_SOURCE_DIR}/ApiTests.cpp
+                ${TEST_SOURCE_DIR}/ApiParityTest.cpp)
+        target_link_libraries(fideslib-cpu-test PRIVATE gtest gtest_main fideslib)
+        set_target_properties(fideslib-cpu-test PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        gtest_discover_tests(fideslib-cpu-test DISCOVERY_MODE PRE_TEST)
+    endif ()
 
 endif ()
 
 
 ############### Benchmark ###################
 
-if (FIDESLIB_COMPILE_BENCHMARKS)
+if (FIDESLIB_COMPILE_BENCHMARKS AND FIDESLIB_ENABLE_CUDA)
 
     set(BENCHMARK_ENABLE_INSTALL OFF)
     set(BENCHMARK_INSTALL_DOCS OFF)

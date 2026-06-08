@@ -1,6 +1,8 @@
 #ifndef API_CUDAENGINE_HPP
 #define API_CUDAENGINE_HPP
 
+#ifdef FIDESLIB_ENABLE_CUDA
+
 #include "engine/Engine.hpp"
 
 #include "CKKS/forwardDefs.cuh" // FIDESlib::CKKS::Context (= shared_ptr<ContextData>)
@@ -122,4 +124,5 @@ class CudaEngine final : public Engine {
 
 } // namespace fideslib
 
+#endif // FIDESLIB_ENABLE_CUDA
 #endif
