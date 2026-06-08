@@ -429,6 +429,108 @@ void OpenFheEngine::recoverHostCiphertext(CryptoContextImpl<DCRTPoly>&, Cipherte
 	// value. Nothing to read back.
 }
 
+namespace {
+// Internal giant-step block size. Must match INTERNAL_GSTEP in
+// FIDESlib::CKKS::ConvolutionTransform (src/CKKS/LinearTransform.cu) so the keys from
+// GetConvolutionTransformRotationIndices (api/HostMath.cpp) cover the rotations used here.
+constexpr uint32_t kCpuInternalGStep = 8;
+
+// Tree-reduce v[0..count) into v[0]: pairwise halving when even, linear when odd,
+// matching the GPU accumulation order in src/CKKS/LinearTransform.cu.
+void cpuTreeAccumulate(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context, std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>& v, uint32_t count) {
+	if (count % 2 == 0) {
+		for (uint32_t active = count; active > 1; active /= 2)
+			for (uint32_t j = 0; j < active / 2; ++j)
+				context->EvalAddInPlace(v[j], v[j + active / 2]);
+	} else {
+		for (uint32_t j = 1; j < count; ++j)
+			context->EvalAddInPlace(v[0], v[j]);
+	}
+}
+
+// Baby-step/giant-step homomorphic linear transform on CPU via OpenFHE, mirroring
+// FIDESlib::CKKS::{Special,}ConvolutionTransform. A non-null `mask` selects the
+// "special" variant: each giant-step result is folded with two mask-rotations and
+// masked before the intra-block rotation. Returns the transformed (rescaled) ciphertext.
+lbcrypto::Ciphertext<lbcrypto::DCRTPoly> cpuConvolutionTransform(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context,
+  lbcrypto::Ciphertext<lbcrypto::DCRTPoly> ct,
+  const std::vector<lbcrypto::Plaintext>& pts,
+  const std::vector<int>& indexes,
+  int bStep,
+  int gStep,
+  int stride,
+  int rowSize,
+  const lbcrypto::Plaintext* mask,
+  int maskRotationStride) {
+	if (rowSize == 0)
+		rowSize = bStep * gStep;
+	assert(static_cast<int>(pts.size()) >= rowSize);
+
+	// Match the GPU path: rescale a freshly-multiplied (noise level 2) input.
+	if (ct->GetNoiseScaleDeg() == 2)
+		ct = context->Rescale(ct);
+
+	// Phase 1: baby-step rotations via hoisted key switching.
+	auto precomp = context->EvalFastRotationPrecompute(ct);
+	uint32_t m	 = context->GetCyclotomicOrder();
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> fastRotation(bStep);
+	for (int i = 0; i < bStep; ++i)
+		fastRotation[i] = (indexes[i] == 0) ? std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(ct) : context->EvalFastRotation(ct, indexes[i], m, precomp);
+
+	// Phase 2: process blocks of kCpuInternalGStep giant steps.
+	uint32_t blockCount = (static_cast<uint32_t>(gStep) + kCpuInternalGStep - 1) / kCpuInternalGStep;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> blockResults;
+	blockResults.reserve(blockCount);
+
+	for (uint32_t blockIdx = 0; blockIdx < blockCount; ++blockIdx) {
+		uint32_t blockStart		   = blockIdx * kCpuInternalGStep;
+		uint32_t blockEnd		   = std::min(blockStart + kCpuInternalGStep, static_cast<uint32_t>(gStep));
+		uint32_t currentBlockGStep = blockEnd - blockStart;
+
+		std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> results(currentBlockGStep);
+		for (uint32_t j = 0; j < currentBlockGStep; ++j) {
+			uint32_t globalJ = blockStart + j;
+			// Dot product: results[j] = sum_i fastRotation[i] * pts[bStep*globalJ + i].
+			results[j] = context->EvalMult(fastRotation[0], pts[bStep * globalJ]);
+			for (int i = 1; i < bStep; ++i) {
+				int ptIdx = bStep * static_cast<int>(globalJ) + i;
+				if (ptIdx < rowSize)
+					context->EvalAddInPlace(results[j], context->EvalMult(fastRotation[i], pts[ptIdx]));
+			}
+
+			if (mask != nullptr) {
+				// temp = result + rot(result, s) + rot(result, 2s), then temp *= mask.
+				auto temp = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(results[j]);
+				context->EvalAddInPlace(temp, context->EvalRotate(results[j], maskRotationStride));
+				context->EvalAddInPlace(temp, context->EvalRotate(results[j], 2 * maskRotationStride));
+				results[j] = context->EvalMult(temp, *mask);
+			}
+
+			// Intra-block rotation by stride * (currentBlockGStep - j).
+			int rotation = stride * static_cast<int>(currentBlockGStep - j);
+			if (rotation != 0)
+				results[j] = context->EvalRotate(results[j], rotation);
+		}
+
+		cpuTreeAccumulate(context, results, currentBlockGStep);
+		blockResults.push_back(results[0]);
+	}
+
+	// Phase 3: inter-block rotation and accumulation.
+	if (blockCount > 1) {
+		int baseRotation = static_cast<int>(kCpuInternalGStep) * stride;
+		for (uint32_t blockIdx = 0; blockIdx < blockCount - 1; ++blockIdx) {
+			int rotation = static_cast<int>(blockCount - 1 - blockIdx) * baseRotation;
+			if (rotation != 0)
+				blockResults[blockIdx] = context->EvalRotate(blockResults[blockIdx], rotation);
+		}
+		cpuTreeAccumulate(context, blockResults, blockCount);
+	}
+
+	return context->Rescale(blockResults[0]);
+}
+} // namespace
+
 void OpenFheEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
   Ciphertext<DCRTPoly>& ct,
   int gStep,
@@ -437,7 +539,13 @@ void OpenFheEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx
   const std::vector<int>& indexes,
   int stride,
   int rowSize) {
-	OPENFHE_THROW("ConvolutionTransform: not implemented for CPU path");
+	auto& context = hostContext(ctx);
+	auto& ctImpl  = hostCt(ct);
+	std::vector<lbcrypto::Plaintext> ptImpls;
+	ptImpls.reserve(pts.size());
+	for (const auto& pt : pts)
+		ptImpls.push_back(hostPt(pt));
+	setHostCt(ct, cpuConvolutionTransform(context, ctImpl, ptImpls, indexes, bStep, gStep, stride, rowSize, nullptr, 0));
 }
 
 void OpenFheEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
@@ -450,7 +558,14 @@ void OpenFheEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPol
   int stride,
   int maskRotationStride,
   int rowSize) {
-	OPENFHE_THROW("SpecialConvolutionTransform: not implemented for CPU path");
+	auto& context  = hostContext(ctx);
+	auto& ctImpl   = hostCt(ct);
+	auto& maskImpl = hostPt(mask);
+	std::vector<lbcrypto::Plaintext> ptImpls;
+	ptImpls.reserve(pts.size());
+	for (const auto& pt : pts)
+		ptImpls.push_back(hostPt(pt));
+	setHostCt(ct, cpuConvolutionTransform(context, ctImpl, ptImpls, indexes, bStep, gStep, stride, rowSize, &maskImpl, maskRotationStride));
 }
 
 // Loading objects to a device is a CUDA-only concept; on the CPU backend these are no-ops.

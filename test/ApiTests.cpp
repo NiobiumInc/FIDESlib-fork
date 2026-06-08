@@ -550,8 +550,6 @@ TEST_F(CKKSTest, AccumulateSumInPlace) {
 // ---- 11b. ConvolutionTransform ----
 
 TEST_F(CKKSTest, ConvolutionTransformIdentity) {
-	if (!TestUseCuda())
-		GTEST_SKIP() << "CPU convolution is implemented in PR3 (backend-abstraction-cpu-impl).";
 	// Identity transform: bStep=1, gStep=1, single plaintext of ones.
 	// With indexes={0} (no baby-step rotation), the result should be
 	// ct * pt (scaled by 1), rotated by stride*(1-0)=stride, then rescaled.
@@ -667,25 +665,31 @@ class CKKSBootstrapTest : public ::testing::Test {
 		cc->Enable(FHE);
 		keys = cc->KeyGen();
 		cc->EvalMultKeyGen(keys.secretKey);
-		// correctionFactor=11 ensures it exceeds deg=10 (round(log2(q0/2^50))
-		// with the default firstModSize=60 used by OpenFHE for FIXEDAUTO).
-		cc->EvalBootstrapSetup({ 1, 1 }, { 0, 0 }, kSlots, 11);
-		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
-		if (TestUseCuda())
-			cc->LoadContext(keys.publicKey);
+		// FIXEDAUTO EvalBootstrapSetup({1,1}) segfaults on GPU (pre-existing on main, tracked
+		// separately); the tests below skip on GPU, so set up bootstrap only on the CPU backend.
+		if (!TestUseCuda()) {
+			// correctionFactor=11 ensures it exceeds deg=10 (round(log2(q0/2^50))
+			// with the default firstModSize=60 used by OpenFHE for FIXEDAUTO).
+			cc->EvalBootstrapSetup({ 1, 1 }, { 0, 0 }, kSlots, 11);
+			cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
+		}
 	}
 };
 
 // ---- 8. Bootstrap ----
 
-TEST_F(CKKSBootstrapTest, DISABLED_Bootstrap) {
+TEST_F(CKKSBootstrapTest, Bootstrap) {
+	if (TestUseCuda())
+		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	auto pt		   = cc->MakeCKKSPackedPlaintext(v1);
 	auto ct		   = cc->Encrypt(pt, keys.publicKey);
 	auto refreshed = cc->EvalBootstrap(ct);
 	CheckPrecision(cc, refreshed, keys.secretKey, v1, CKKS_BOOTSTRAP_PRECISION);
 }
 
-TEST_F(CKKSBootstrapTest, DISABLED_BootstrapInPlace) {
+TEST_F(CKKSBootstrapTest, BootstrapInPlace) {
+	if (TestUseCuda())
+		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	auto pt = cc->MakeCKKSPackedPlaintext(v1);
 	auto ct = cc->Encrypt(pt, keys.publicKey);
 	cc->EvalBootstrapInPlace(ct);
@@ -694,7 +698,9 @@ TEST_F(CKKSBootstrapTest, DISABLED_BootstrapInPlace) {
 
 // ---- 9. GetPreScaleFactor (FIXEDAUTO) ----
 
-TEST_F(CKKSBootstrapTest, DISABLED_GetPreScaleFactorFIXEDAUTO) {
+TEST_F(CKKSBootstrapTest, GetPreScaleFactorFIXEDAUTO) {
+	if (TestUseCuda())
+		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	// EvalBootstrapSetup sets m_correctionFactor; without it the result underflows.
 	double r = cc->GetPreScaleFactor(kSlots);
 	EXPECT_TRUE(std::isfinite(r)) << "result is not finite: " << r;
@@ -743,7 +749,7 @@ class CKKSFlexBootstrapTest : public ::testing::Test {
 
 // ---- 9. GetPreScaleFactor (FLEXIBLEAUTO) ----
 
-TEST_F(CKKSFlexBootstrapTest, DISABLED_GetPreScaleFactorFLEXIBLEAUTO) {
+TEST_F(CKKSFlexBootstrapTest, GetPreScaleFactorFLEXIBLEAUTO) {
 	double r = cc->GetPreScaleFactor(kSlots);
 	EXPECT_TRUE(std::isfinite(r)) << "result is not finite: " << r;
 	EXPECT_GT(r, 0.0);
@@ -1100,8 +1106,6 @@ Ciphertext<DCRTPoly> EncryptVec(CryptoContext<DCRTPoly>& cc, const std::vector<d
 } // namespace
 
 TEST_F(CKKSTest, ConvolutionTransformSingleBlockEven) {
-	if (!TestUseCuda())
-		GTEST_SKIP() << "CPU convolution is implemented in PR3 (backend-abstraction-cpu-impl).";
 	// bStep=2, gStep=2: single block, even-tree accumulate.
 	const int gStep = 2, bStep = 2, stride = 1;
 	const std::vector<int> indexes = { 0, 1 };
@@ -1119,8 +1123,6 @@ TEST_F(CKKSTest, ConvolutionTransformSingleBlockEven) {
 }
 
 TEST_F(CKKSTest, ConvolutionTransformSingleBlockOdd) {
-	if (!TestUseCuda())
-		GTEST_SKIP() << "CPU convolution is implemented in PR3 (backend-abstraction-cpu-impl).";
 	// bStep=2, gStep=3: single block, odd count exercises the linear-accumulate branch.
 	const int gStep = 3, bStep = 2, stride = 1;
 	const std::vector<int> indexes = { 0, 1 };
@@ -1138,8 +1140,6 @@ TEST_F(CKKSTest, ConvolutionTransformSingleBlockOdd) {
 }
 
 TEST_F(CKKSTest, ConvolutionTransformMultiBlock) {
-	if (!TestUseCuda())
-		GTEST_SKIP() << "CPU convolution is implemented in PR3 (backend-abstraction-cpu-impl).";
 	// bStep=1, gStep=9: two giant-step blocks, exercising inter-block rotation
 	// and accumulation on top of the per-block (size-8 even) accumulate.
 	const int gStep = 9, bStep = 1, stride = 1;
@@ -1158,8 +1158,6 @@ TEST_F(CKKSTest, ConvolutionTransformMultiBlock) {
 }
 
 TEST_F(CKKSTest, SpecialConvolutionTransform) {
-	if (!TestUseCuda())
-		GTEST_SKIP() << "CPU convolution is implemented in PR3 (backend-abstraction-cpu-impl).";
 	// Masked variant: bStep=2, gStep=2, maskRotationStride=1.
 	const int gStep = 2, bStep = 2, stride = 1, maskRotationStride = 1;
 	const std::vector<int> indexes = { 0, 1 };
