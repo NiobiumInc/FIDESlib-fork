@@ -11,6 +11,13 @@
 
 namespace fideslib {
 
+// Most methods here are thin shims over OpenFHE, which makes OpenFHE the reference oracle: if CPU and
+// CUDA disagree on, say, evalMult, the CUDA kernel is the suspect. The exceptions are the ops OpenFHE has
+// no equivalent for — convolutionTransform / specialConvolutionTransform, and more simply accumulateSum
+// — which re-trace the CUDA algorithm by hand. Their tests compare against a clear-text replay of that
+// same algorithm, so they catch a rotation/rescale/encoding slip but not a flaw in the algorithm
+// itself. Keep these as thin as possible.
+
 namespace {
 // Unwrap the host-side OpenFHE objects from the value types' / context's `host` std::any (parity with
 // engine/cuda's deviceCt/devicePt). On the CPU backend `host` always carries the value, so these are the

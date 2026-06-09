@@ -5,8 +5,8 @@
 
 namespace fideslib {
 
-/// @brief CPU backend. Every operation delegates to OpenFHE on the host.
-/// All CPU operation code lives in OpenFheEngine.cpp.
+/// @brief CPU backend. Most operations delegate to OpenFHE on the host; a few native ops
+/// (convolution, accumulate) are reimplemented. All CPU operation code lives in OpenFheEngine.cpp.
 class OpenFheEngine final : public Engine {
   public:
 	const char* name() const override {
