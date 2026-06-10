@@ -1202,6 +1202,11 @@ TEST_F(CKKSTest, EvalFastRotationVector) {
 	uint32_t m						   = cc->GetCyclotomicOrder();
 	auto results					   = cc->EvalFastRotation(ct, indices, m, precomp);
 	ASSERT_EQ(results.size(), indices.size());
+	// Declare every result an output before the first decrypt: a record/replay backend
+	// (haze) executes the recorded program once at the first readback, so all results that
+	// will be read back must be declared up front (no-op on CPU/CUDA).
+	for (auto& r : results)
+		cc->MarkOutput(r);
 	for (size_t k = 0; k < indices.size(); ++k) {
 		std::vector<double> expected(v1.size());
 		for (size_t i = 0; i < v1.size(); ++i)

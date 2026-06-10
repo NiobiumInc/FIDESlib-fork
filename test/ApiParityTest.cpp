@@ -286,19 +286,33 @@ TEST_F(ApiParityTest, RescaleAfterMult) {
 // NoiseScaleDeg divergence, so they compare decrypted values (approximate). Bit-identity at each
 // individual level remains covered by the retained raw OpenFheInterfaceTests *AllLevels tests.
 
+// Program shape note (record/replay backends): the AllLevels tests compute every level's
+// result first, declaring each as an output via MarkOutput, and only then read them all
+// back. A record/replay backend (haze) executes the recorded program exactly once at the
+// first readback, so per-level decrypt-then-keep-computing would be compute-after-readback.
+// The op sequence and order are identical to the previous interleaved form — only the
+// readback placement moved — so CPU/CUDA results are unchanged (MarkOutput is a no-op there).
+
 TEST_F(ApiParityTest, EvalMultAllLevels) {
 	Ciphertext<DCRTPoly> a, b;
 	EncryptInputs(a, b);
 	auto lbA = LbCt(a);
 	auto lbB = LbCt(b);
+	std::vector<Ciphertext<DCRTPoly>> perLevel;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> oracles;
 	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
-		SCOPED_TRACE("level " + std::to_string(lvl));
 		a = cc->EvalMult(a, b);
 		cc->RescaleInPlace(a);
+		cc->MarkOutput(a);
+		perLevel.push_back(a);
 		lbA = LbCc(cc)->EvalMult(lbA, lbB);
 		LbCc(cc)->RescaleInPlace(lbA);
-		auto got = HostCt(cc, a);
-		ExpectSlotsNear(cc, keys.secretKey, got, lbA, kSlots, 1e-5);
+		oracles.push_back(lbA);
+	}
+	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
+		SCOPED_TRACE("level " + std::to_string(lvl));
+		auto got = HostCt(cc, perLevel[lvl]);
+		ExpectSlotsNear(cc, keys.secretKey, got, oracles[lvl], kSlots, 1e-5);
 	}
 }
 
@@ -306,14 +320,21 @@ TEST_F(ApiParityTest, EvalSquareAllLevels) {
 	auto p	 = cc->MakeCKKSPackedPlaintext(vsq);
 	auto a	 = cc->Encrypt(p, keys.publicKey);
 	auto lbA = LbCt(a);
+	std::vector<Ciphertext<DCRTPoly>> perLevel;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> oracles;
 	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
-		SCOPED_TRACE("level " + std::to_string(lvl));
 		a = cc->EvalSquare(a);
 		cc->RescaleInPlace(a);
+		cc->MarkOutput(a);
+		perLevel.push_back(a);
 		lbA = LbCc(cc)->EvalSquare(lbA);
 		LbCc(cc)->RescaleInPlace(lbA);
-		auto got = HostCt(cc, a);
-		ExpectSlotsNear(cc, keys.secretKey, got, lbA, kSlots, 1e-5);
+		oracles.push_back(lbA);
+	}
+	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
+		SCOPED_TRACE("level " + std::to_string(lvl));
+		auto got = HostCt(cc, perLevel[lvl]);
+		ExpectSlotsNear(cc, keys.secretKey, got, oracles[lvl], kSlots, 1e-5);
 	}
 }
 
@@ -322,18 +343,24 @@ TEST_F(ApiParityTest, EvalRotateAllLevels) {
 	EncryptInputs(a, b);
 	auto lbA = LbCt(a);
 	auto lbB = LbCt(b);
+	std::vector<Ciphertext<DCRTPoly>> rotations;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> oracles;
 	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
-		SCOPED_TRACE("level " + std::to_string(lvl));
-		// Rotate at the current level.
-		auto r		 = cc->EvalRotate(a, 1);
-		auto gotR	 = HostCt(cc, r);
-		auto oracleR = LbCc(cc)->EvalRotate(lbA, 1);
-		ExpectSlotsNear(cc, keys.secretKey, gotR, oracleR, kSlots, 1e-5);
+		// Rotate at the current level; the per-level descent chain stays a program-local.
+		auto r = cc->EvalRotate(a, 1);
+		cc->MarkOutput(r);
+		rotations.push_back(r);
+		oracles.push_back(LbCc(cc)->EvalRotate(lbA, 1));
 		// Descend a level for the next iteration.
 		a = cc->EvalMult(a, b);
 		cc->RescaleInPlace(a);
 		lbA = LbCc(cc)->EvalMult(lbA, lbB);
 		LbCc(cc)->RescaleInPlace(lbA);
+	}
+	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
+		SCOPED_TRACE("level " + std::to_string(lvl));
+		auto gotR = HostCt(cc, rotations[lvl]);
+		ExpectSlotsNear(cc, keys.secretKey, gotR, oracles[lvl], kSlots, 1e-5);
 	}
 }
 
