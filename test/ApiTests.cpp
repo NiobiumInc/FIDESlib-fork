@@ -20,13 +20,25 @@
 
 using namespace fideslib;
 
-// The api test fixtures run against either backend: set FIDESLIB_TEST_BACKEND=cuda
-// (on a CUDA build) to exercise the CUDA engine end-to-end. CPU-only builds always
-// run on the CPU backend, since IsBackendAvailable(CUDA) is false when CUDA is not
-// compiled in, so this is a no-op there.
-static bool TestUseCuda() {
+// The api test fixtures run against any backend: set FIDESLIB_TEST_BACKEND=cuda (on a
+// CUDA build) or =haze (on a haze build) to exercise that engine end-to-end. Builds
+// without the requested backend fall back to CPU, since IsBackendAvailable is false
+// when it is not compiled in.
+enum class TestBackend { CPU, CUDA, HAZE };
+static TestBackend GetTestBackend() {
 	const char* b = std::getenv("FIDESLIB_TEST_BACKEND");
-	return b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA);
+	if (b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA))
+		return TestBackend::CUDA;
+	if (b != nullptr && std::string(b) == "haze" && IsBackendAvailable(Backend::HAZE))
+		return TestBackend::HAZE;
+	return TestBackend::CPU;
+}
+static bool TestUseCuda() {
+	return GetTestBackend() == TestBackend::CUDA;
+}
+// Any device backend (CUDA or haze): gates SetBackend + LoadContext in the fixtures.
+static bool TestUseDevice() {
+	return GetTestBackend() != TestBackend::CPU;
 }
 
 // Precision tolerance for standard CKKS operations (encrypt, add, mult, rotate).
@@ -75,6 +87,8 @@ class CKKSTest : public ::testing::Test {
 		params.SetScalingTechnique(FIXEDAUTO);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
+		else if (GetTestBackend() == TestBackend::HAZE)
+			params.SetBackend(Backend::HAZE);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -82,11 +96,11 @@ class CKKSTest : public ::testing::Test {
 		cc->Enable(ADVANCEDSHE);
 		keys = cc->KeyGen();
 		cc->EvalMultKeyGen(keys.secretKey);
-		// Generate every rotation index the tests use up front. In GPU mode the keys are
+		// Generate every rotation index the tests use up front. In device mode the keys are
 		// uploaded by LoadContext, so they must all exist before it; the convolution and
 		// accumulate ops need the full 1..8 range (incl. 3,5,6,7), not just powers of two.
 		cc->EvalRotateKeyGen(keys.secretKey, { 1, 2, 3, 4, 5, 6, 7, 8, -1, -2 });
-		if (TestUseCuda())
+		if (TestUseDevice())
 			cc->LoadContext(keys.publicKey);
 	}
 };
