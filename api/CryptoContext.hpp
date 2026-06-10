@@ -121,6 +121,13 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// tests; the readback itself is backend-specific (see Engine).
 	void RecoverHostCiphertext(Ciphertext<DCRTPoly>& ct);
 
+	/// @brief Declare ct as a program output for record/replay backends (e.g. haze); no-op on
+	/// CPU/CUDA. Must be called before the first Decrypt/RecoverHostCiphertext of any result when
+	/// multiple outputs need to be read back — so all outputs are registered before the single
+	/// hazeFlush that materializes them. On CPU/CUDA this is a no-op and may be safely called in
+	/// all backends without a runtime cost.
+	void MarkOutput(Ciphertext<DCRTPoly>& ct);
+
 	// ---- Operations ----
 
 	Ciphertext<DCRTPoly> EvalNegate(const Ciphertext<DCRTPoly>& ct);

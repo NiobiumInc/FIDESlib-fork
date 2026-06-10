@@ -414,6 +414,10 @@ void CryptoContextImpl<DCRTPoly>::RecoverHostCiphertext(Ciphertext<DCRTPoly>& ct
 	engine_->recoverHostCiphertext(*this, ct);
 }
 
+void CryptoContextImpl<DCRTPoly>::MarkOutput(Ciphertext<DCRTPoly>& ct) {
+	engine_->markOutput(*this, ct);
+}
+
 // ---- Operations ----
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalNegate(const Ciphertext<DCRTPoly>& ct) {

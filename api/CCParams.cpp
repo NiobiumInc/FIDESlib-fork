@@ -113,6 +113,7 @@ void CCParams<CryptoContextCKKSRNS>::SetBackend(Backend backend) {
 		switch (backend) {
 		case Backend::CPU:  name = "CPU";  break;
 		case Backend::CUDA: name = "CUDA"; break;
+		case Backend::HAZE: name = "haze (FHETCH)"; break;
 		}
 		OPENFHE_THROW(std::string(name) + " backend requested but not available (FIDESlib was not built with support for this backend)");
 	}
