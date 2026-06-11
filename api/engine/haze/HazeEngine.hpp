@@ -4,7 +4,11 @@
 #ifdef FIDESLIB_ENABLE_HAZE
 
 #include "engine/Engine.hpp"
+#include "engine/haze/HazeKeyExtract.hpp"
 #include "engine/haze/HazePayload.hpp"
+#include "engine/haze/HazeScalarEncode.hpp"
+
+#include <map>
 
 #include <atomic>
 #include <cstdint>
@@ -52,10 +56,37 @@ class HazeEngine final : public Engine {
 	void setCiphertextSlots(CryptoContextImpl<DCRTPoly>& ctx, CiphertextImpl<DCRTPoly>& ct, size_t slots) override;
 	void setCiphertextLevel(CryptoContextImpl<DCRTPoly>& ctx, CiphertextImpl<DCRTPoly>& ct, size_t level) override;
 
-	// ---- Operations (aligned ct+ct addition only; the FIXEDAUTO adjust family
-	// and the remaining op surface land in later phases) ----
+	// ---- Linear operations + scalar multiplication ----
+	Ciphertext<DCRTPoly> evalNegate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
+	void evalNegateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) override;
 	Ciphertext<DCRTPoly> evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
 	void evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
+	Ciphertext<DCRTPoly> evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, Plaintext& pt) override;
+	Ciphertext<DCRTPoly> evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) override;
+	void evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
+	void evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) override;
+	Ciphertext<DCRTPoly> evalAddMany(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Ciphertext<DCRTPoly>>& ciphertexts) override;
+	void evalAddManyInPlace(CryptoContextImpl<DCRTPoly>& ctx, std::vector<Ciphertext<DCRTPoly>>& ciphertexts) override;
+	Ciphertext<DCRTPoly> evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
+	Ciphertext<DCRTPoly> evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, Plaintext& pt) override;
+	Ciphertext<DCRTPoly> evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt, const Ciphertext<DCRTPoly>& ct) override;
+	Ciphertext<DCRTPoly> evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) override;
+	Ciphertext<DCRTPoly> evalSub(CryptoContextImpl<DCRTPoly>& ctx, double scalar, const Ciphertext<DCRTPoly>& ct) override;
+	void evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
+	void evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) override;
+	void evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scalar, Ciphertext<DCRTPoly>& ct1) override;
+	Ciphertext<DCRTPoly> evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, double scalar) override;
+	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) override;
+
+	// ---- Multiplication family + rescale ----
+	Ciphertext<DCRTPoly> evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
+	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Ciphertext<DCRTPoly>& ct2) override;
+	Ciphertext<DCRTPoly> evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
+	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
+	Ciphertext<DCRTPoly> evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
+	void evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) override;
+	Ciphertext<DCRTPoly> rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) override;
+	void rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) override;
 
 	// ---- Context backend state ----
 	bool isContextLoaded() const override;
@@ -88,6 +119,107 @@ class HazeEngine final : public Engine {
 
 	/// @brief Q-base prefix for the first `towers` limbs (the per-op MRP base argument).
 	std::vector<uint64_t> qPrefix(size_t towers) const;
+
+	// ---- FIXEDAUTO adjust + scalar-op cores (OpenFHE ckksrns-leveledshe is the oracle) ----
+
+	/// @brief Adjusted read-only view of a ciphertext payload. `towers` may be smaller than
+	/// p->towers (OpenFHE LevelReduce is a view truncation here — no IR, no copy), and the
+	/// metadata fields are the post-adjust values. `p` is either the operand's own payload
+	/// (no adjustment recorded) or a fresh payload produced by recorded compute — a const
+	/// operand is never mutated.
+	struct Operand {
+		std::shared_ptr<hazebk::HazePayload> p;
+		size_t towers;
+		size_t noiseScaleDeg;
+		double scalingFactor;
+		size_t slots;
+	};
+	Operand asOperand(const std::shared_ptr<hazebk::HazePayload>& p) const;
+	/// @brief OpenFHE level of a view: |Q| − towers.
+	size_t levelOf(const Operand& x) const {
+		return qBase_.size() - x.towers;
+	}
+	/// @brief Borrowed views of the engine's scale-factor caches for HazeScalarEncode.
+	hazebk::ScalarEncodeParams scalarParams() const;
+	/// @brief Recorded per-residue pass-through copy of the leading `towers` limbs
+	/// (epoch.cpp copy_device_to_device) — for result components an op leaves unchanged.
+	hazebk::LimbChain passThroughChain(const hazebk::LimbChain& src, size_t towers);
+
+	/// @brief INTT → ModDown (drop the last Q prime; centered lift + q_l^{-1}, matching
+	/// OpenFHE ModReduce exactly) → NTT on one chain (port of ops.cpp rescale_chain_one_tower).
+	hazebk::LimbChain rescaleChainOneTower(const hazebk::LimbChain& src, size_t srcTowers);
+	/// @brief OpenFHE EvalMultCoreInPlace analog into a fresh payload: per-limb CRT scalar
+	/// multiply, NSD+1, sf ×= ScalingFactorReal[level]. No pre-rescale.
+	Operand multScalarCore(const Operand& x, double operand);
+	/// @brief OpenFHE ModReduceInternalInPlace (one level) analog into a fresh payload:
+	/// rescale both chains, towers−1, NSD−1 (guard ≥1), sf ÷= ModReduceFactor[oldTowers−1].
+	Operand rescaleCore(const Operand& x);
+	/// @brief Exact EvalNegate into a fresh payload: per-limb scalar q_i − 1; metadata
+	/// unchanged (do not copy CUDA's multScalar(-1.0), which bumps NSD).
+	Operand negateCore(const Operand& x);
+	/// @brief OpenFHE AdjustLevelsAndDepthInPlace port (FIXEDAUTO; compositeDegree == 1):
+	/// equalize (level, NSD) of the two views via recorded compute + view truncation.
+	/// FIXEDMANUAL: level-align by truncation only. FLEXIBLE modes: notImplemented.
+	void adjustForAddOrSub(Operand& a, Operand& b);
+	/// @brief FIXEDAUTO multScalar precheck (Ciphertext.cpp:761-775): rescale first when
+	/// NSD == 2, then multScalarCore.
+	Operand multScalarWithPrecheck(const Operand& x, double scalar);
+	/// @brief c0 ± pt with the FIXEDAUTO rescale-if rule (Ciphertext.cpp:250-252): rescale
+	/// the ct when (pt.NSD==1, ct.NSD==2, ptTowers == ctTowers−1); then require level/NSD
+	/// agreement with the pt chain trimmed to the ct's towers. c1 passes through (D2D).
+	Operand applyPt(const Operand& ct, const hazebk::HazePtPayload& pt, bool subtract);
+	/// @brief Encode ±scalar per ElemForEvalAddOrSub (negative: per-limb q_i − e_i flip)
+	/// and add it onto c0; metadata unchanged. c1 passes through (D2D).
+	Operand addScalarCore(const Operand& x, double scalar);
+
+	/// @brief Materialize a view as a payload: if the view truncates its payload, record
+	/// nothing — build the result payload that owns fresh chains is the OPS' job; this
+	/// simply packages computed chains + view metadata into a fresh Recorded payload.
+	std::shared_ptr<hazebk::HazePayload> finishPayload(hazebk::LimbChain c0, hazebk::LimbChain c1, const Operand& meta) const;
+	/// @brief Rebind an existing payload's contents to a computed result (facade "InPlace"
+	/// semantics: fresh chains per op result; the old chains are freed).
+	void rebindPayload(hazebk::HazePayload& dst, hazebk::LimbChain c0, hazebk::LimbChain c1, const Operand& meta) const;
+	/// @brief Ensure the plaintext is device-resident and return its payload.
+	std::shared_ptr<hazebk::HazePtPayload> ensurePt(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt);
+
+	// ---- Hybrid keyswitch (ops.cpp hybrid_keyswitch is the verified reference) ----
+
+	/// @brief A HYBRID keyswitch key: host limbs + the lazily-uploaded device chains
+	/// (full Q∥P rows per digit; Uploaded state, never tagged, reused across epochs).
+	struct KsKey {
+		hazebk::HybridKeyswitchLimbs host;
+		std::vector<hazebk::LimbChain> aDigits; // [digit] -> |Q|+|P| rows
+		std::vector<hazebk::LimbChain> bDigits;
+		bool uploaded = false;
+	};
+	/// @brief H2D-upload the key's full Q∥P rows once (per-call trimming is pointer
+	/// selection, not re-upload).
+	void ensureKeyUploaded(KsKey& key);
+
+	struct KsContribution {
+		hazebk::LimbChain b;
+		hazebk::LimbChain a;
+	};
+	/// @brief Hybrid keyswitch of `src` (degree-1 component, EVAL form, first `towers` Q
+	/// primes) against `key` — same math for relin (ct×ct) and automorphism (rotation)
+	/// keys. Returns the (b, a) contribution in EVAL form at `towers` Q primes.
+	KsContribution hybridKeyswitch(const hazebk::LimbChain& src, size_t towers, KsKey& key);
+
+	/// @brief OpenFHE AdjustLevelsAndDepthToOneInPlace: adjustForAddOrSub, then rescale both
+	/// to NSD 1 when needed, so both enter the tensor product at depth 1.
+	void adjustForMult(Operand& a, Operand& b);
+	/// @brief ct×pt with the multPt adjust rules (Ciphertext.cpp:356-421): full polynomial
+	/// MulMrp of both components against the pt chain (never the slot-constant shortcut).
+	Operand multPtCore(const Operand& ct, const hazebk::HazePtPayload& pt);
+
+	// ---- keys ----
+	KsKey relinKey_;
+	bool haveRelinKey_ = false;
+	struct RotKey {
+		uint32_t autoIndex = 0;
+		KsKey key;
+	};
+	std::map<int32_t, RotKey> rotKeys_; // slot step -> key
 
 	// ---- context state ----
 	bool loaded_	  = false;
