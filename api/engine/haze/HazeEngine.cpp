@@ -1588,6 +1588,24 @@ void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 	}
 }
 
+// ---- Bootstrap setup hooks (staged compute lands in a later change) ----
+
+BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool /*precompute*/, bool /*btsfirstboot*/, int32_t modEvalLevels) const {
+	// Verbatim CPU policy (OpenFheEngine.cpp:400-408): haze's host setup must match the CPU
+	// oracle, including the pre-existing modall-lands-in-BTSlotsEncoding quirk flagged there.
+	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/modEvalLevels != 0, /*modEvalLevels=*/-1 };
+}
+
+void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
+	if (isContextLoaded()) {
+		OPENFHE_THROW("Context is already loaded");
+	}
+	auto& skImpl  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
+	auto& context = hostContext(ctx);
+	context->EvalBootstrapKeyGen(skImpl, slots);
+	ctx.slots_bootstrap.push_back(slots);
+}
+
 std::vector<uint64_t> HazeEngine::qPrefix(size_t towers) const {
 	return { qBase_.begin(), qBase_.begin() + static_cast<std::ptrdiff_t>(towers) };
 }

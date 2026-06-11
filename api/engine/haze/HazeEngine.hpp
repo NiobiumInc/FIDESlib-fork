@@ -104,6 +104,12 @@ class HazeEngine final : public Engine {
 	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) override;
 	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) override;
 
+	// ---- Bootstrap setup hooks (the compute itself lands in a later change) ----
+	/// @brief Replicates the CPU policy verbatim (OpenFheEngine.cpp:400-408), including its
+	/// flagged pre-existing arg-slot quirk — the host setup must match the CPU oracle.
+	BootstrapSetupPolicy bootstrapSetupPolicy(bool precompute, bool btsfirstboot, int32_t modEvalLevels) const override;
+	void evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) override;
+
 	// ---- Context backend state ----
 	bool isContextLoaded() const override;
 	/// @brief No-op: haze records synchronously; hazeDeviceSynchronize is itself a no-op and
