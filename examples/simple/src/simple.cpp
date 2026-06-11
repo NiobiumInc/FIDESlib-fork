@@ -103,6 +103,16 @@ int main() {
 	auto cRot1 = cc->EvalRotate(c1, 1);
 	auto cRot2 = cc->EvalRotate(c1, -2);
 
+	// Declare every result that will be read back: a record/replay backend (haze) executes
+	// the recorded program once at the first decryption, so all outputs must be declared
+	// before it (no-op on the CPU/CUDA backends).
+	cc->MarkOutput(cAdd);
+	cc->MarkOutput(cSub);
+	cc->MarkOutput(cScalar);
+	cc->MarkOutput(cMul);
+	cc->MarkOutput(cRot1);
+	cc->MarkOutput(cRot2);
+
 	// Step 5: Decryption and output.
 
 	Plaintext result;

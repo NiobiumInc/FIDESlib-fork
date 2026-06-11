@@ -50,14 +50,15 @@ LimbChain::~LimbChain() {
 	freeAll();
 }
 
-LimbChain::LimbChain(LimbChain&& other) noexcept : ptrs_(std::move(other.ptrs_)) {
+LimbChain::LimbChain(LimbChain&& other) noexcept : epochStamp(other.epochStamp), ptrs_(std::move(other.ptrs_)) {
 	other.ptrs_.clear();
 }
 
 LimbChain& LimbChain::operator=(LimbChain&& other) noexcept {
 	if (this != &other) {
 		freeAll();
-		ptrs_ = std::move(other.ptrs_);
+		ptrs_	   = std::move(other.ptrs_);
+		epochStamp = other.epochStamp;
 		other.ptrs_.clear();
 	}
 	return *this;
