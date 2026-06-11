@@ -161,23 +161,31 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	// relin key if EvalMultKeyGen ran, one rotation key per registered slot step (keyed by
 	// step; FindAutomorphismIndex handles negative steps). Limbs are H2D-uploaded lazily at
 	// the first keyswitch use and then reused as program inputs every epoch.
-	const auto& pkImpl		 = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
-	const std::string keyTag = pkImpl->GetKeyTag();
-	const auto& keyMap		 = context->GetAllEvalMultKeys();
-	if (keyMap.find(keyTag) != keyMap.end()) {
-		relinKey_	  = KsKey{};
-		relinKey_.host = hazebk::extractEvalMultKeyLimbs(context, keyTag);
+	const auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
+	keyTag_			   = pkImpl->GetKeyTag();
+	plaintextModulus_  = cryptoParams->GetPlaintextModulus();
+	const auto& keyMap = context->GetAllEvalMultKeys();
+	if (keyMap.find(keyTag_) != keyMap.end()) {
+		relinKey_	   = KsKey{};
+		relinKey_.host = hazebk::extractEvalMultKeyLimbs(context, keyTag_);
 		haveRelinKey_  = true;
 	}
 	rotKeys_.clear();
+	autoKeys_.clear();
 	for (const int32_t step : ctx.rotation_indexes) {
 		if (rotKeys_.count(step) != 0) {
 			continue;
 		}
 		RotKey rk;
 		rk.autoIndex = context->FindAutomorphismIndex(step);
-		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag, rk.autoIndex);
+		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, rk.autoIndex);
 		rotKeys_.emplace(step, std::move(rk));
+	}
+	// Bootstrap precomputation per registered slot count (host-only). The rotation
+	// and conjugation keys it needs resolve lazily through autoKeyFor at first use.
+	boot_.clear();
+	for (const uint32_t slots : ctx.slots_bootstrap) {
+		extractBootPrecom(ctx, slots);
 	}
 
 	// haze bring-up, exact order (program info/directory must precede the first
@@ -238,9 +246,11 @@ void HazeEngine::teardown() {
 	outputs_.clear();
 	// Drop uploaded key chains before the device reset frees their meaning; the host limbs
 	// are re-extracted by the next loadContext.
-	relinKey_ = KsKey{};
+	relinKey_	  = KsKey{};
 	haveRelinKey_ = false;
 	rotKeys_.clear();
+	autoKeys_.clear();
+	boot_.clear();
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
 	// outlive the device reset, then clear all process-global haze state. Outstanding
 	// LimbChain destructors of still-live ciphertexts will see stale addresses afterwards;
@@ -1470,33 +1480,65 @@ void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 
 // ---- Rotation + accumulate ----
 
-HazeEngine::Operand HazeEngine::rotateCore(const Operand& x, int32_t step) {
-	const auto it = rotKeys_.find(step);
-	if (it == rotKeys_.end()) {
-		OPENFHE_THROW("haze backend: no rotation key for step " + std::to_string(step) + "; generate it with EvalRotateKeyGen before LoadContext");
+HazeEngine::KsKey& HazeEngine::autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint32_t autoIndex) {
+	auto it = autoKeys_.find(autoIndex);
+	if (it == autoKeys_.end()) {
+		auto& context = hostContext(ctx);
+		KsKey key;
+		key.host = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, autoIndex);
+		it		 = autoKeys_.emplace(autoIndex, std::move(key)).first;
 	}
-	RotKey& rk = it->second;
+	return it->second;
+}
+
+HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t autoIndex) {
+	KsKey& key = autoKeyFor(ctx, autoIndex);
 
 	// Keyswitch first, automorphism last (OpenFHE EvalAtIndex order; ops.cpp rotate).
-	KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
+	KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, key);
 	const auto base	  = qPrefix(x.towers);
 	LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
 
 	LimbChain out0(x.towers, polyBytes_);
 	LimbChain out1(x.towers, polyBytes_);
-	hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
-	hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+	hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+	hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
 
 	Operand res = x; // metadata unchanged
 	res.p		= finishPayload(std::move(out0), std::move(out1), res);
 	return res;
 }
 
+HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
+	const auto it = rotKeys_.find(step);
+	if (it != rotKeys_.end()) {
+		// Pre-extracted EvalRotateKeyGen key (keyed by slot step).
+		RotKey& rk		  = it->second;
+		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
+		const auto base	  = qPrefix(x.towers);
+		LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
+
+		LimbChain out0(x.towers, polyBytes_);
+		LimbChain out1(x.towers, polyBytes_);
+		hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+		hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+
+		Operand res = x; // metadata unchanged
+		res.p		= finishPayload(std::move(out0), std::move(out1), res);
+		return res;
+	}
+	// Fallback (bootstrap rotations and any other keyed step): resolve the automorphism
+	// index on the host and extract the key lazily from the tag's automorphism key map.
+	auto& context			 = hostContext(ctx);
+	const uint32_t autoIndex = context->FindAutomorphismIndex(static_cast<uint32_t>(step));
+	return rotateByAutoIndex(ctx, x, autoIndex);
+}
+
 Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotate");
 	beginNewProgramIfExecuted();
-	Operand res = rotateCore(asOperand(p), index);
+	Operand res = rotateCore(ctx, asOperand(p), index);
 	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
 }
 
@@ -1504,7 +1546,7 @@ void HazeEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotateInPlace");
 	beginNewProgramIfExecuted();
-	Operand res = rotateCore(asOperand(p), index);
+	Operand res = rotateCore(ctx, asOperand(p), index);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
 
@@ -1608,6 +1650,559 @@ void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const Pri
 
 std::vector<uint64_t> HazeEngine::qPrefix(size_t towers) const {
 	return { qBase_.begin(), qBase_.begin() + static_cast<std::ptrdiff_t>(towers) };
+}
+
+// ---- Chebyshev series + convolution ----
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Chebyshev helpers — all ported from
+//   deps/openfhe-src/src/pke/lib/scheme/ckksrns/ckksrns-advancedshe.cpp
+// and
+//   deps/openfhe-src/src/pke/include/scheme/ckksrns/ckksrns-utils.h
+// expressed over the fideslib facade (CryptoContextImpl<DCRTPoly>& ctx).
+// ---------------------------------------------------------------------------
+
+// Under FIXEDAUTO (FIXEDMANUAL + AUTO modes):
+//   ctx.Rescale = OpenFHE ModReduceInPlace = no-op (clone) for AUTO.
+//   LevelReduce by n levels = SetLevel(ct, ct->GetLevel() + n): truncation only.
+//
+// compositeDegree = 1 (the default for FIXEDAUTO with standard params; see
+// deps/openfhe-src/src/pke/include/scheme/gen-cryptocontext-params-defaults.h:84).
+
+// Rescale one level (OpenFHE ModReduceInPlace). Under FIXEDAUTO this is a
+// no-op/clone in the facade — any depth-equalization needed is handled inside
+// EvalMult/EvalAdd adjust. We call it at exactly the same places OpenFHE does.
+static void hazeModReduceInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	ctx.RescaleInPlace(ct);
+}
+
+// Drop `n` levels (OpenFHE LevelReduceInPlace with diff/compositeDegree = n).
+// On the haze engine this calls setCiphertextLevel which truncates the limb chains
+// (no IR, no flush) — exactly as OpenFHE's DropLastElements.
+static void hazeLevelReduceInPlace(Ciphertext<DCRTPoly>& ct, size_t n) {
+	if (n == 0)
+		return;
+	ct->SetLevel(ct->GetLevel() + n);
+}
+
+// EvalPartialLinearWSum(T, coefficients, limit): sum_{i=1}^{limit} T[i-1] * coefficients[i],
+// rescaled by one level. Ported from ckksrns-advancedshe.cpp:142-193. Uses T[0..limit-1]
+// with coefficient indices [1..limit] (i.e. index 0 is the constant term, handled separately).
+static Ciphertext<DCRTPoly> hazeEvalPartialLinearWSum(CryptoContextImpl<DCRTPoly>& ctx,
+  const std::vector<Ciphertext<DCRTPoly>>& T,
+  const std::vector<double>& coefficients,
+  uint32_t limit) {
+	if (limit == 0)
+		limit = static_cast<uint32_t>(T.size());
+
+	// Under FIXEDAUTO, align all Ts to the same level (the max level + NSD).
+	// We do a simple clone-and-level-reduce approach matching what OpenFHE does:
+	// find the deepest (highest-level) T[i] up to limit, then drop others to match.
+	// For our use case (degree 5, all Ts were equalized to T[k-1] before calling),
+	// they are already equal, so this is mostly a no-op clone step.
+	std::vector<Ciphertext<DCRTPoly>> cts(limit);
+	size_t maxLevel = 0;
+	uint32_t maxIdx = 0;
+	for (uint32_t i = 0; i < limit; ++i) {
+		cts[i] = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[i]);
+		size_t lvl = cts[i]->GetLevel();
+		if (lvl > maxLevel || (lvl == maxLevel && cts[i]->GetNoiseScaleDeg() == 2)) {
+			maxLevel = lvl;
+			maxIdx	 = i;
+		}
+	}
+	// Drop all to the same level as the deepest.
+	for (uint32_t i = 0; i < limit; ++i) {
+		if (i != maxIdx) {
+			size_t diff = cts[maxIdx]->GetLevel() - cts[i]->GetLevel();
+			if (diff > 0)
+				hazeLevelReduceInPlace(cts[i], diff);
+		}
+	}
+	// Rescale depth-2 entries if the max is also depth 2.
+	if (cts[maxIdx]->GetNoiseScaleDeg() == 2) {
+		for (uint32_t i = 0; i < limit; ++i)
+			hazeModReduceInPlace(ctx, cts[i]);
+	}
+
+	// EvalMult by coefficients[i+1] (index i+1 corresponds to T[i]).
+	ctx.EvalMultInPlace(cts[0], coefficients[1]);
+	for (uint32_t i = 1; i < limit; ++i) {
+		ctx.EvalMultInPlace(cts[i], coefficients[i + 1]);
+		ctx.EvalAddInPlace(cts[0], cts[i]);
+	}
+	ctx.RescaleInPlace(cts[0]);
+	return cts[0];
+}
+
+// Forward declaration.
+static Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& x,
+  const std::vector<double>& coefficients,
+  uint32_t k, uint32_t m,
+  const std::vector<Ciphertext<DCRTPoly>>& T,
+  const std::vector<Ciphertext<DCRTPoly>>& T2);
+
+// Port of InnerEvalChebyshevPS from ckksrns-advancedshe.cpp:650-760.
+// Recurses on the Paterson-Stockmeyer tree.
+static Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& x,
+  const std::vector<double>& coefficients,
+  uint32_t k, uint32_t m,
+  const std::vector<Ciphertext<DCRTPoly>>& T,
+  const std::vector<Ciphertext<DCRTPoly>>& T2) {
+	// k2m2k = k*2^{m-1} - k
+	uint32_t k2m2k = k * (1u << (m - 1)) - k;
+
+	// Divide coefficients by T^{k*2^{m-1}}
+	std::vector<double> Tkm(k2m2k + k + 1, 0.0);
+	Tkm.back() = 1.0;
+	auto divqr = lbcrypto::LongDivisionChebyshev(coefficients, Tkm);
+
+	// Subtract T^{k(2^{m-1} - 1)} from r
+	auto& r2 = divqr->r;
+	uint32_t n = lbcrypto::Degree(r2);
+	if (static_cast<int32_t>(k2m2k - n) <= 0) {
+		r2.resize(n + 1);
+		r2[k2m2k] -= 1.0;
+	} else {
+		r2.resize(k2m2k + 1);
+		r2.back() = -1.0;
+	}
+
+	auto divcs = lbcrypto::LongDivisionChebyshev(r2, divqr->q);
+
+	Ciphertext<DCRTPoly> cu, qu, su;
+
+	{
+		// Evaluate q at u.
+		if (lbcrypto::Degree(divqr->q) > k) {
+			qu = hazeInnerEvalChebyshevPS(ctx, x, divqr->q, k, m - 1, T, T2);
+		} else {
+			// dq = k from construction; highest order is a power of 2 up to 2^{m-1}.
+			qu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
+			uint32_t limit = static_cast<uint32_t>(std::log2(lbcrypto::ToReal(divqr->q.back())));
+			for (uint32_t i = 0; i < limit; ++i)
+				ctx.EvalAddInPlace(qu, qu);
+			// adds the free term (constant) /2
+			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
+			// Add partial linear sum for remaining coefficients
+			divqr->q.resize(k);
+			if (uint32_t nn = lbcrypto::Degree(divqr->q); nn > 0)
+				ctx.EvalAddInPlace(qu, hazeEvalPartialLinearWSum(ctx, T, divqr->q, nn));
+		}
+	}
+
+	{
+		// Evaluate s2 at u: first add T^{k(2^{m-1}-1)} back to s.
+		auto& s2 = divcs->r;
+		s2.resize(k2m2k + 1);
+		s2.back() = 1.0;
+
+		if (lbcrypto::Degree(s2) > k) {
+			su = hazeInnerEvalChebyshevPS(ctx, x, s2, k, m - 1, T, T2);
+		} else {
+			// Highest order is 1 (s2 is monic).
+			su = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
+			s2.resize(k);
+			if (uint32_t nn = lbcrypto::Degree(s2); nn > 0)
+				ctx.EvalAddInPlace(su, hazeEvalPartialLinearWSum(ctx, T, s2, nn));
+			// adds the free term /2
+			ctx.EvalAddInPlace(su, s2.front() / 2.0);
+			// reduce su to match T2[m-1] + 1 levels
+			hazeLevelReduceInPlace(su, (su->GetLevel() > T2[m - 1]->GetLevel()) ? su->GetLevel() - T2[m - 1]->GetLevel() : 0);
+		}
+	}
+
+	// Evaluate c (the quotient polynomial from divcs).
+	{
+		uint32_t n_c = lbcrypto::Degree(divcs->q);
+		if (n_c >= 1) {
+			if (n_c == 1) {
+				if (lbcrypto::IsNotEqualOne(divcs->q[1])) {
+					cu = ctx.EvalMult(T[0], divcs->q[1]);
+					hazeModReduceInPlace(ctx, cu);
+				} else {
+					cu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[0]);
+				}
+			} else {
+				cu = hazeEvalPartialLinearWSum(ctx, T, divcs->q, n_c);
+			}
+			// adds the free term /2
+			ctx.EvalAddInPlace(cu, divcs->q.front() / 2.0);
+			// level-reduce cu to T2[m-1]
+			size_t cuLvl	 = cu->GetLevel();
+			size_t t2mLvl	 = T2[m - 1]->GetLevel();
+			if (cuLvl < t2mLvl)
+				hazeLevelReduceInPlace(cu, t2mLvl - cuLvl);
+		}
+	}
+
+	if (cu) {
+		cu = ctx.EvalAdd(T2[m - 1], cu);
+	} else {
+		cu = ctx.EvalAdd(T2[m - 1], divcs->q.front() / 2.0);
+	}
+
+	auto result = ctx.EvalMult(cu, qu);
+	hazeModReduceInPlace(ctx, result);
+	ctx.EvalAddInPlace(result, su);
+	return result;
+}
+
+// Port of internalEvalChebyPolysLinear (ckksrns-advancedshe.cpp:572-621):
+// build T[0..k-1] (Chebyshev powers of the linearly-transformed argument) and
+// level-equalize them to T[k-1].
+static std::vector<Ciphertext<DCRTPoly>> hazeEvalChebyPolysLinear(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& x,
+  const std::vector<double>& coefficients,
+  double a, double b) {
+	const uint32_t k = static_cast<uint32_t>(coefficients.size()) - 1;
+	std::vector<Ciphertext<DCRTPoly>> T(k);
+
+	// Linear transformation: y = -1 + 2*(x-a)/(b-a), consuming one level when [a,b] != [-1,1].
+	if (!lbcrypto::IsNotEqualNegOne(a) && !lbcrypto::IsNotEqualOne(b)) {
+		T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*x);
+	} else {
+		double alpha = 2.0 / (b - a);
+		double beta	 = a * alpha;
+		T[0]		 = ctx.EvalMult(x, alpha);
+		hazeModReduceInPlace(ctx, T[0]);
+		ctx.EvalAddInPlace(T[0], -1.0 - beta);
+	}
+
+	// Build Chebyshev powers up to degree k: T_{2i}(y) = 2*T_i(y)^2 - 1; T_{2i+1} = 2*T_i*T_{i+1} - y.
+	for (uint32_t i = 2; i <= k; ++i) {
+		if (i & 0x1u) {
+			// T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
+			T[i - 1] = ctx.EvalMult(T[i / 2 - 1], T[i / 2]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2 (no rescale; NSD already 2)
+			hazeModReduceInPlace(ctx, T[i - 1]);
+			ctx.EvalSubInPlace(T[i - 1], T[0]);
+		} else {
+			// T_{2i}(y) = 2*T_i(y)^2 - 1
+			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
+			hazeModReduceInPlace(ctx, T[i - 1]);
+			ctx.EvalAddInPlace(T[i - 1], -1.0);
+		}
+	}
+
+	// Level-equalize: bring all T[0..k-2] to the level of T[k-1].
+	for (uint32_t i = 1; i < k; ++i) {
+		size_t diff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
+		hazeLevelReduceInPlace(T[i - 1], diff);
+	}
+
+	return T;
+}
+
+// Port of internalEvalChebyshevSeriesLinearWithPrecomp (ckksrns-advancedshe.cpp:624-647):
+// compute the linear weighted sum of the T powers, adding the free term at the end.
+static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesLinearWithPrecomp(CryptoContextImpl<DCRTPoly>& ctx,
+  std::vector<Ciphertext<DCRTPoly>>& T,
+  const std::vector<double>& coefficients) {
+	const uint32_t k = static_cast<uint32_t>(coefficients.size()) - 2;
+
+	// Scalar multiply for highest-order term.
+	auto result = ctx.EvalMult(T[k], coefficients[k + 1]);
+
+	// Scalar multiply for all other terms and accumulate.
+	for (uint32_t i = 0; i < k; ++i) {
+		if (lbcrypto::IsNotEqualZero(coefficients[i + 1])) {
+			ctx.EvalMultInPlace(T[i], coefficients[i + 1]);
+			ctx.EvalAddInPlace(result, T[i]);
+		}
+	}
+
+	// Rescale after the scalar multiplications.
+	hazeModReduceInPlace(ctx, result);
+
+	// Add the free term (constant) / 2.
+	ctx.EvalAddInPlace(result, coefficients[0] / 2.0);
+
+	return result;
+}
+
+// Port of internalEvalChebyPolysPS (ckksrns-advancedshe.cpp:763-841):
+// build T[0..k-1] (the base Chebyshev powers), T2[0..m-1] (the extended chain),
+// and T2km1 = T_{k(2^m - 1)}.
+struct HazeChebyPS {
+	std::vector<Ciphertext<DCRTPoly>> T;	 // T[0] = T_1(y), ... T[k-1] = T_k(y)
+	std::vector<Ciphertext<DCRTPoly>> T2; // T2[i] = T_{k*2^i}(y), T2[0] placeholder = T[k-1]
+	Ciphertext<DCRTPoly> T2km1;			 // T_{k(2^m-1)}(y)
+	uint32_t k, m;
+};
+
+static HazeChebyPS hazeEvalChebyPolysPS(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& x,
+  uint32_t degree, double a, double b) {
+	auto degs  = lbcrypto::ComputeDegreesPS(degree);
+	uint32_t k = degs[0];
+	uint32_t m = degs[1];
+
+	std::vector<Ciphertext<DCRTPoly>> T(k);
+	// Linear transformation (same as linear path).
+	if (!lbcrypto::IsNotEqualNegOne(a) && !lbcrypto::IsNotEqualOne(b)) {
+		T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*x);
+	} else {
+		double alpha = 2.0 / (b - a);
+		double beta	 = a * alpha;
+		T[0]		 = ctx.EvalMult(x, alpha);
+		hazeModReduceInPlace(ctx, T[0]);
+		ctx.EvalAddInPlace(T[0], -1.0 - beta);
+	}
+
+	// Build Chebyshev powers up to degree k.
+	for (uint32_t i = 2; i <= k; ++i) {
+		if (i & 0x1u) {
+			T[i - 1] = ctx.EvalMult(T[i / 2 - 1], T[i / 2]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
+			hazeModReduceInPlace(ctx, T[i - 1]);
+			ctx.EvalSubInPlace(T[i - 1], T[0]);
+		} else {
+			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
+			hazeModReduceInPlace(ctx, T[i - 1]);
+			ctx.EvalAddInPlace(T[i - 1], -1.0);
+		}
+	}
+
+	// Under FIXEDAUTO, equalize T[0..k-2] to T[k-1] via AdjustLevelsAndDepthInPlace.
+	// For FIXEDAUTO this means adjustForAddOrSub: the engine handles this inside EvalAdd,
+	// but we must pre-equalize for the PS algorithm which accesses T directly.
+	// Use the same approach as the PS path: AdjustLevelsAndDepthInPlace = SetLevel to max.
+	for (uint32_t i = 1; i < k; ++i) {
+		size_t diff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
+		if (diff > 0)
+			hazeLevelReduceInPlace(T[i - 1], diff);
+	}
+
+	// Build T2[0..m-1] and T2km1.
+	std::vector<Ciphertext<DCRTPoly>> T2(m);
+	T2[0] = T.back(); // placeholder
+
+	auto T2km1 = T.back();
+
+	for (uint32_t i = 1; i < m; ++i) {
+		// T2[i] = 2*T2[i-1]^2 - 1 = T_{k*2^i}(y)
+		T2[i] = ctx.EvalSquare(T2[i - 1]);
+		ctx.EvalAddInPlace(T2[i], T2[i]); // ×2
+		hazeModReduceInPlace(ctx, T2[i]);
+		ctx.EvalAddInPlace(T2[i], -1.0);
+
+		// T2km1 = 2*T2km1 * T2[i] - T2[0] = T_{k(2*m-1)}(y)
+		T2km1 = ctx.EvalMult(T2km1, T2[i]);
+		ctx.EvalAddInPlace(T2km1, T2km1); // ×2
+		hazeModReduceInPlace(ctx, T2km1);
+		ctx.EvalSubInPlace(T2km1, T2[0]);
+	}
+
+	return HazeChebyPS{ std::move(T), std::move(T2), std::move(T2km1), k, m };
+}
+
+// Port of internalEvalChebyshevSeriesPSWithPrecomp (ckksrns-advancedshe.cpp:844-861).
+static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesPSWithPrecomp(CryptoContextImpl<DCRTPoly>& ctx,
+  HazeChebyPS& poly,
+  const std::vector<double>& coefficients) {
+	auto& T	   = poly.T;
+	auto& T2   = poly.T2;
+	auto& T2km1 = poly.T2km1;
+	uint32_t k = poly.k;
+	uint32_t m = poly.m;
+
+	uint32_t k2m2k = k * (1u << (m - 1)) - k;
+
+	// f2 = coefficients extended + 1 at position 2*k2m2k+k (monic degree).
+	auto f2 = coefficients;
+	f2.resize(lbcrypto::Degree(f2) + 1);
+	f2.resize(2 * k2m2k + k + 1);
+	f2.back() = 1.0;
+
+	return ctx.EvalSub(hazeInnerEvalChebyshevPS(ctx, T[0], f2, k, m, T, T2), T2km1);
+}
+
+// Top-level port of EvalChebyshevSeries: dispatch on degree < 5 (linear) vs >= 5 (PS).
+// Port of AdvancedSHECKKSRNS::EvalChebyshevSeries (ckksrns-advancedshe.cpp:882-896).
+static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& ct,
+  std::vector<double>& coeffs,
+  double a, double b) {
+	uint32_t degree = lbcrypto::Degree(coeffs);
+	if (degree < 5) {
+		// Linear path.
+		auto T = hazeEvalChebyPolysLinear(ctx, ct, coeffs, a, b);
+		return hazeEvalChebyshevSeriesLinearWithPrecomp(ctx, T, coeffs);
+	} else {
+		// Paterson-Stockmeyer path.
+		auto poly = hazeEvalChebyPolysPS(ctx, ct, degree, a, b);
+		return hazeEvalChebyshevSeriesPSWithPrecomp(ctx, poly, coeffs);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Convolution transform — ported from cpuConvolutionTransform
+// (api/engine/cpu/OpenFheEngine.cpp:443-538) over the facade.
+// ---------------------------------------------------------------------------
+
+// kCpuInternalGStep must match INTERNAL_GSTEP in FIDESlib::CKKS::ConvolutionTransform
+// and the GetConvolutionTransformRotationIndices logic so key coverage aligns.
+constexpr uint32_t kHazeInternalGStep = 8;
+
+// Tree-reduce v[0..count) into v[0]: pairwise when even, linear when odd —
+// exact copy of cpuTreeAccumulate (OpenFheEngine.cpp:447-456) over the facade.
+static void hazeTreeAccumulate(CryptoContextImpl<DCRTPoly>& ctx,
+  std::vector<Ciphertext<DCRTPoly>>& v, uint32_t count) {
+	if (count % 2 == 0) {
+		for (uint32_t active = count; active > 1; active /= 2)
+			for (uint32_t j = 0; j < active / 2; ++j)
+				ctx.EvalAddInPlace(v[j], v[j + active / 2]);
+	} else {
+		for (uint32_t j = 1; j < count; ++j)
+			ctx.EvalAddInPlace(v[0], v[j]);
+	}
+}
+
+// Core convolution transform: hoisted baby steps, block giant steps,
+// tree-reduce per block, inter-block rotation, rescale. Ported from
+// cpuConvolutionTransform (OpenFheEngine.cpp:462-538). Plaintext pointers
+// stay as fideslib Plaintext values; ctx.EvalMult(ct, pt) handles loading.
+static Ciphertext<DCRTPoly> hazeConvolutionTransform(CryptoContextImpl<DCRTPoly>& ctx,
+  Ciphertext<DCRTPoly> ct,
+  const std::vector<Plaintext>& pts,
+  const std::vector<int>& indexes,
+  int bStep,
+  int gStep,
+  int stride,
+  int rowSize,
+  Plaintext* mask,
+  int maskRotationStride) {
+	if (rowSize == 0)
+		rowSize = bStep * gStep;
+
+	// Rescale a freshly-multiplied (NSD==2) input, matching the GPU path.
+	if (ct->GetNoiseScaleDeg() == 2)
+		ctx.RescaleInPlace(ct);
+
+	// Phase 1: hoisted baby-step rotations.
+	auto precomp			= ctx.EvalFastRotationPrecompute(ct);
+	uint32_t m				= ctx.GetCyclotomicOrder();
+	std::vector<Ciphertext<DCRTPoly>> fastRotation(bStep);
+	for (int i = 0; i < bStep; ++i)
+		fastRotation[i] = (indexes[i] == 0) ? std::make_shared<CiphertextImpl<DCRTPoly>>(*ct) : ctx.EvalFastRotation(ct, indexes[i], m, precomp);
+
+	// Phase 2: process blocks of kHazeInternalGStep giant steps.
+	uint32_t blockCount = (static_cast<uint32_t>(gStep) + kHazeInternalGStep - 1) / kHazeInternalGStep;
+	std::vector<Ciphertext<DCRTPoly>> blockResults;
+	blockResults.reserve(blockCount);
+
+	for (uint32_t blockIdx = 0; blockIdx < blockCount; ++blockIdx) {
+		uint32_t blockStart		   = blockIdx * kHazeInternalGStep;
+		uint32_t blockEnd		   = std::min(blockStart + kHazeInternalGStep, static_cast<uint32_t>(gStep));
+		uint32_t currentBlockGStep = blockEnd - blockStart;
+
+		std::vector<Ciphertext<DCRTPoly>> results(currentBlockGStep);
+		for (uint32_t j = 0; j < currentBlockGStep; ++j) {
+			uint32_t globalJ = blockStart + j;
+			// Dot product: results[j] = sum_i fastRotation[i] * pts[bStep*globalJ + i].
+			Plaintext pt0 = pts[static_cast<size_t>(bStep) * globalJ];
+			results[j]	  = ctx.EvalMult(fastRotation[0], pt0);
+			for (int i = 1; i < bStep; ++i) {
+				int ptIdx = bStep * static_cast<int>(globalJ) + i;
+				if (ptIdx < rowSize) {
+					Plaintext pti = pts[static_cast<size_t>(ptIdx)];
+					ctx.EvalAddInPlace(results[j], ctx.EvalMult(fastRotation[i], pti));
+				}
+			}
+
+			if (mask != nullptr) {
+				// temp = result + rot(result, s) + rot(result, 2s); result = temp * mask.
+				auto temp = std::make_shared<CiphertextImpl<DCRTPoly>>(*results[j]);
+				ctx.EvalAddInPlace(temp, ctx.EvalRotate(results[j], maskRotationStride));
+				ctx.EvalAddInPlace(temp, ctx.EvalRotate(results[j], 2 * maskRotationStride));
+				results[j] = ctx.EvalMult(temp, *mask);
+			}
+
+			// Intra-block rotation by stride * (currentBlockGStep - j).
+			int rotation = stride * static_cast<int>(currentBlockGStep - j);
+			if (rotation != 0)
+				results[j] = ctx.EvalRotate(results[j], rotation);
+		}
+
+		hazeTreeAccumulate(ctx, results, currentBlockGStep);
+		blockResults.push_back(results[0]);
+	}
+
+	// Phase 3: inter-block rotation and accumulation.
+	if (blockCount > 1) {
+		int baseRotation = static_cast<int>(kHazeInternalGStep) * stride;
+		for (uint32_t blockIdx = 0; blockIdx < blockCount - 1; ++blockIdx) {
+			int rotation = static_cast<int>(blockCount - 1 - blockIdx) * baseRotation;
+			if (rotation != 0)
+				blockResults[blockIdx] = ctx.EvalRotate(blockResults[blockIdx], rotation);
+		}
+		hazeTreeAccumulate(ctx, blockResults, blockCount);
+	}
+
+	return ctx.Rescale(blockResults[0]);
+}
+
+} // namespace
+
+// ---- EvalChebyshevSeries ----
+
+Ciphertext<DCRTPoly> HazeEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& ct,
+  std::vector<double>& coeffs,
+  double a, double b) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalChebyshevSeries");
+	beginNewProgramIfExecuted();
+	return hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
+}
+
+void HazeEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx,
+  Ciphertext<DCRTPoly>& ct,
+  std::vector<double>& coeffs,
+  double a, double b) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalChebyshevSeriesInPlace");
+	beginNewProgramIfExecuted();
+	ct = hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
+}
+
+// ---- ConvolutionTransform ----
+
+void HazeEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
+  Ciphertext<DCRTPoly>& ct,
+  int gStep,
+  int bStep,
+  const std::vector<Plaintext>& pts,
+  const std::vector<int>& indexes,
+  int stride,
+  int rowSize) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "ConvolutionTransformInPlace");
+	beginNewProgramIfExecuted();
+	ct = hazeConvolutionTransform(ctx, ct, pts, indexes, bStep, gStep, stride, rowSize, nullptr, 0);
+}
+
+void HazeEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
+  Ciphertext<DCRTPoly>& ct,
+  int gStep,
+  int bStep,
+  const std::vector<Plaintext>& pts,
+  Plaintext& mask,
+  const std::vector<int>& indexes,
+  int stride,
+  int maskRotationStride,
+  int rowSize) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "SpecialConvolutionTransformInPlace");
+	beginNewProgramIfExecuted();
+	ct = hazeConvolutionTransform(ctx, ct, pts, indexes, bStep, gStep, stride, rowSize, &mask, maskRotationStride);
 }
 
 } // namespace fideslib

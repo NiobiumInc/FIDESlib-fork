@@ -1,15 +1,15 @@
 // api-vs-OpenFHE parity suite.
 //
-// Drives the public fideslib api on the CUDA backend and asserts the resulting ciphertext is
-// bit-for-bit identical to the same computation run directly through OpenFHE (the oracle). This is
-// the api-level counterpart of the raw-GPU parity tests in OpenFheInterfaceTests.cu: instead of
+// Drives the public fideslib api on the CUDA or haze backend and asserts the resulting ciphertext
+// is bit-for-bit identical to the same computation run directly through OpenFHE (the oracle). This
+// is the api-level counterpart of the raw-GPU parity tests in OpenFheInterfaceTests.cu: instead of
 // hand-plumbing FIDESlib::CKKS device objects, every op goes through CryptoContextImpl, and the
 // result is recovered with CryptoContextImpl::RecoverHostCiphertext (the backend readback seam).
 //
 // Because it compares the active backend against OpenFHE, it is only meaningful on a non-CPU
 // backend: on the CPU backend the api *is* OpenFHE, so the comparison is trivial and the fixture
-// skips. Set FIDESLIB_TEST_BACKEND=cuda on a CUDA build to run it against the CUDA engine. The same
-// tests will exercise a future Haze backend (Haze == OpenFHE) unchanged, just by selecting it.
+// skips. Set FIDESLIB_TEST_BACKEND=cuda (CUDA build) or =haze (haze build) to run it against that
+// engine.
 //
 // Oracle note: when several ops are chained, the api runs them on the device and only the final
 // result is synced back, so intermediate host shadows are stale. The oracle therefore replays the
@@ -44,9 +44,25 @@ using namespace fideslib;
 		}                                                                                                                                                \
 	} while (0)
 
-static bool TestUseCuda() {
+// The api test fixtures run against any backend: set FIDESLIB_TEST_BACKEND=cuda (on a
+// CUDA build) or =haze (on a haze build) to exercise that engine end-to-end. Builds
+// without the requested backend fall back to CPU, since IsBackendAvailable is false
+// when it is not compiled in.
+enum class TestBackend { CPU, CUDA, HAZE };
+static TestBackend GetTestBackend() {
 	const char* b = std::getenv("FIDESLIB_TEST_BACKEND");
-	return b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA);
+	if (b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA))
+		return TestBackend::CUDA;
+	if (b != nullptr && std::string(b) == "haze" && IsBackendAvailable(Backend::HAZE))
+		return TestBackend::HAZE;
+	return TestBackend::CPU;
+}
+static bool TestUseCuda() {
+	return GetTestBackend() == TestBackend::CUDA;
+}
+// Any device backend (CUDA or haze): gates SetBackend + LoadContext in the fixtures.
+static bool TestUseDevice() {
+	return GetTestBackend() != TestBackend::CPU;
 }
 
 // The OpenFHE context the api wraps (its CPU shadow). It holds the same keys the api generated, so
@@ -112,9 +128,9 @@ class ApiParityTest : public ::testing::Test {
 	const std::vector<double> vsq = { 0.93, 0.96, 0.99, 1.0, 1.01, 1.04, 1.07, 0.95 };
 
 	void SetUp() override {
-		if (!TestUseCuda())
+		if (GetTestBackend() == TestBackend::CPU)
 			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda on a CUDA build to run it.";
+							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(kDepth);
@@ -122,7 +138,10 @@ class ApiParityTest : public ::testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDAUTO);
-		params.SetBackend(Backend::CUDA);
+		if (TestUseCuda())
+			params.SetBackend(Backend::CUDA);
+		else if (GetTestBackend() == TestBackend::HAZE)
+			params.SetBackend(Backend::HAZE);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -380,8 +399,9 @@ class ApiParityBootstrapTest : public ::testing::Test {
 	const std::vector<double> v1 = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
 
 	void SetUp() override {
-		if (!TestUseCuda())
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend.";
+		if (GetTestBackend() == TestBackend::CPU)
+			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
+							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(kDepth);
 		params.SetScalingModSize(50);
@@ -390,7 +410,10 @@ class ApiParityBootstrapTest : public ::testing::Test {
 		params.SetScalingTechnique(FIXEDAUTO);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		params.SetBackend(Backend::CUDA);
+		if (TestUseCuda())
+			params.SetBackend(Backend::CUDA);
+		else if (GetTestBackend() == TestBackend::HAZE)
+			params.SetBackend(Backend::HAZE);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

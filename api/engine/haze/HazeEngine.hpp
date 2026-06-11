@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fideslib {
@@ -104,11 +105,47 @@ class HazeEngine final : public Engine {
 	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) override;
 	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) override;
 
-	// ---- Bootstrap setup hooks (the compute itself lands in a later change) ----
+	// ---- Chebyshev series ----
+	/// @brief Port of OpenFHE's EvalChebyshevSeries (linear/PS split) over the facade.
+	/// Degree < 5: linear path (internalEvalChebyPolysLinear + LinearWithPrecomp).
+	/// Degree >= 5: Paterson-Stockmeyer path (internalEvalChebyPolysPS + PSWithPrecomp).
+	/// Coefficients and (a,b) interval handling ported exactly from
+	/// deps/openfhe-src/src/pke/lib/scheme/ckksrns/ckksrns-advancedshe.cpp.
+	Ciphertext<DCRTPoly> evalChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) override;
+	void evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) override;
+
+	// ---- Convolution transform ----
+	/// @brief Port of cpuConvolutionTransform (OpenFheEngine.cpp:443-538) over the facade.
+	/// kCpuInternalGStep=8, hoisted baby steps, block giant steps, cpuTreeAccumulate.
+	void convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
+	  Ciphertext<DCRTPoly>& ct,
+	  int gStep,
+	  int bStep,
+	  const std::vector<Plaintext>& pts,
+	  const std::vector<int>& indexes,
+	  int stride,
+	  int rowSize) override;
+	/// @brief Masked variant: each giant-step result is folded with two mask rotations before
+	/// the intra-block rotation (mask != nullptr path in cpuConvolutionTransform).
+	void specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
+	  Ciphertext<DCRTPoly>& ct,
+	  int gStep,
+	  int bStep,
+	  const std::vector<Plaintext>& pts,
+	  Plaintext& mask,
+	  const std::vector<int>& indexes,
+	  int stride,
+	  int maskRotationStride,
+	  int rowSize) override;
+
+	// ---- Bootstrap ----
 	/// @brief Replicates the CPU policy verbatim (OpenFheEngine.cpp:400-408), including its
 	/// flagged pre-existing arg-slot quirk — the host setup must match the CPU oracle.
 	BootstrapSetupPolicy bootstrapSetupPolicy(bool precompute, bool btsfirstboot, int32_t modEvalLevels) const override;
 	void evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) override;
+	Ciphertext<DCRTPoly>
+	evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) override;
+	void evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) override;
 
 	// ---- Context backend state ----
 	bool isContextLoaded() const override;
@@ -232,8 +269,10 @@ class HazeEngine final : public Engine {
 	void adjustForMult(Operand& a, Operand& b);
 	/// @brief Rotation (ops.cpp rotate): hybridKeyswitch(c1) against the step's
 	/// automorphism key, c0' = c0 + ks.b / c1' = ks.a, then AutomorphMrp BOTH (keyswitch
-	/// first, automorphism last — OpenFHE EvalAtIndex order). Metadata unchanged.
-	Operand rotateCore(const Operand& x, int32_t step);
+	/// first, automorphism last — OpenFHE EvalAtIndex order). Metadata unchanged. Steps
+	/// without a pre-extracted key fall back to FindAutomorphismIndex + the lazy auto-key
+	/// cache (bootstrap rotations).
+	Operand rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step);
 	/// @brief ct×pt with the multPt adjust rules (Ciphertext.cpp:356-421): full polynomial
 	/// MulMrp of both components against the pt chain (never the slot-constant shortcut).
 	Operand multPtCore(const Operand& ct, const hazebk::HazePtPayload& pt);
@@ -246,6 +285,49 @@ class HazeEngine final : public Engine {
 		KsKey key;
 	};
 	std::map<int32_t, RotKey> rotKeys_; // slot step -> key
+	/// @brief Lazily-extracted automorphism keys by raw automorphism index (bootstrap
+	/// rotations, conjugation 2N−1, and any rotation step not in rotKeys_).
+	std::map<uint32_t, KsKey> autoKeys_;
+	std::string keyTag_;
+	/// @brief Resolve (extract + cache) the automorphism key for autoIndex from the host
+	/// context's key map.
+	KsKey& autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint32_t autoIndex);
+	/// @brief Keyswitch+automorph by raw automorphism index (rotateCore generalization;
+	/// conjugation = autoIndex 2N−1).
+	Operand rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t autoIndex);
+
+	// ---- bootstrap precomputation (extracted at loadContext per slots_bootstrap) ----
+	struct BootPrecom {
+		uint32_t slots = 0;
+		bool isLT	   = false; // levelBudget {1,1} (the acceptance path)
+		uint32_t bStep = 0;		// m_dim1 / m_paramsEnc.g; 0 -> ceil(sqrt(slots))
+		uint32_t correctionFactor = 0;
+		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts
+		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts
+		std::vector<double> coefficients; // Chebyshev table for the key distribution
+		double k		 = 0.0;
+		uint32_t numIter = 0; // double-angle iterations
+	};
+	std::unordered_map<uint32_t, BootPrecom> boot_;
+	uint64_t plaintextModulus_ = 0;
+
+	/// @brief Host-only extraction of the OpenFHE bootstrap precomputation for `slots`
+	/// (m_bootPrecomMap fields + Chebyshev config; ExtractBootPrecom).
+	void extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t slots);
+
+	// ---- bootstrap cores (HazeBootstrap.cpp) ----
+	/// @brief ModRaise: from the level-0 limb, INTT@{q0} → hazeBasisConvert({q0}→Q) →
+	/// NTT@Q on both components; towers = |Q|, NSD/sf unchanged (OpenFHE raise semantics).
+	Operand modRaiseCore(const Operand& x);
+	/// @brief Integer scalar multiply (OpenFHE MultByIntegerInPlace): scalar mod q_i per
+	/// limb, metadata unchanged.
+	Operand multIntCore(const Operand& x, uint64_t scalar);
+	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
+	/// of OpenFHE EvalLinearTransform).
+	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);
+	/// @brief Shared staged bootstrap (sparse path; OpenFHE FHECKKSRNS::EvalBootstrap is
+	/// the oracle).
+	Ciphertext<DCRTPoly> bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
 
 	// ---- context state ----
 	bool loaded_	  = false;

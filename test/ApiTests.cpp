@@ -671,6 +671,8 @@ class CKKSBootstrapTest : public ::testing::Test {
 		params.SetSecurityLevel(HEStd_NotSet);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
+		else if (GetTestBackend() == TestBackend::HAZE)
+			params.SetBackend(Backend::HAZE);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -681,12 +683,15 @@ class CKKSBootstrapTest : public ::testing::Test {
 		cc->EvalMultKeyGen(keys.secretKey);
 		// FIXEDAUTO EvalBootstrapSetup({1,1}) segfaults on GPU (pre-existing on main, tracked
 		// separately); the tests below skip on GPU, so set up bootstrap only on the CPU backend.
+		// Under haze the setup runs (the segfault is CUDA-specific).
 		if (!TestUseCuda()) {
 			// correctionFactor=11 ensures it exceeds deg=10 (round(log2(q0/2^50))
 			// with the default firstModSize=60 used by OpenFHE for FIXEDAUTO).
 			cc->EvalBootstrapSetup({ 1, 1 }, { 0, 0 }, kSlots, 11);
 			cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
 		}
+		if (GetTestBackend() == TestBackend::HAZE)
+			cc->LoadContext(keys.publicKey);
 	}
 };
 
@@ -746,6 +751,8 @@ class CKKSFlexBootstrapTest : public ::testing::Test {
 		params.SetSecurityLevel(HEStd_NotSet);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
+		else if (GetTestBackend() == TestBackend::HAZE)
+			params.SetBackend(Backend::HAZE);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -756,7 +763,7 @@ class CKKSFlexBootstrapTest : public ::testing::Test {
 		cc->EvalMultKeyGen(keys.secretKey);
 		cc->EvalBootstrapSetup({ 1, 1 }, { 0, 0 }, kSlots, 0);
 		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
-		if (TestUseCuda())
+		if (TestUseDevice())
 			cc->LoadContext(keys.publicKey);
 	}
 };
