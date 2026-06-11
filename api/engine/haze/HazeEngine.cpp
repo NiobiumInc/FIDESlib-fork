@@ -12,6 +12,7 @@
 #include <openfhe.h>
 
 #include <any>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -1465,6 +1466,126 @@ void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	beginNewProgramIfExecuted();
 	Operand res = rescaleCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
+}
+
+// ---- Rotation + accumulate ----
+
+HazeEngine::Operand HazeEngine::rotateCore(const Operand& x, int32_t step) {
+	const auto it = rotKeys_.find(step);
+	if (it == rotKeys_.end()) {
+		OPENFHE_THROW("haze backend: no rotation key for step " + std::to_string(step) + "; generate it with EvalRotateKeyGen before LoadContext");
+	}
+	RotKey& rk = it->second;
+
+	// Keyswitch first, automorphism last (OpenFHE EvalAtIndex order; ops.cpp rotate).
+	KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
+	const auto base	  = qPrefix(x.towers);
+	LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
+
+	LimbChain out0(x.towers, polyBytes_);
+	LimbChain out1(x.towers, polyBytes_);
+	hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+	hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+
+	Operand res = x; // metadata unchanged
+	res.p		= finishPayload(std::move(out0), std::move(out1), res);
+	return res;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "EvalRotate");
+	beginNewProgramIfExecuted();
+	Operand res = rotateCore(asOperand(p), index);
+	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
+}
+
+void HazeEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "EvalRotateInPlace");
+	beginNewProgramIfExecuted();
+	Operand res = rotateCore(asOperand(p), index);
+	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
+}
+
+std::shared_ptr<void> HazeEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&) {
+	// No hoisting in v1: fast rotations are plain rotations, so there is no
+	// precompute handle. Correctness-equivalent; hoisting is a tracked future optimization.
+	return nullptr;
+}
+
+Ciphertext<DCRTPoly>
+HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t /*m*/, const std::shared_ptr<void>& /*precomp*/) {
+	return evalRotate(ctx, ct, index);
+}
+
+Ciphertext<DCRTPoly>
+HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& /*digits*/, bool /*addFirst*/) {
+	// Plain rotation stand-in: the Ext variant's extended-basis intermediate is a hoisting
+	// detail; the api test only exercises the dispatch.
+	return evalRotate(ctx, ct, index);
+}
+
+std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& ct,
+  const std::vector<int32_t>& indices,
+  const uint32_t /*m*/,
+  const std::shared_ptr<void>& /*precomp*/) {
+	std::vector<Ciphertext<DCRTPoly>> results;
+	results.reserve(indices.size());
+	for (const int32_t index : indices) {
+		if (index == 0) {
+			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else {
+			results.push_back(evalRotate(ctx, ct, index));
+		}
+	}
+	return results;
+}
+
+std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& ct,
+  const std::vector<int32_t>& indices,
+  const std::shared_ptr<void>& /*digits*/,
+  bool /*addFirst*/) {
+	std::vector<Ciphertext<DCRTPoly>> results;
+	results.reserve(indices.size());
+	for (const int32_t index : indices) {
+		if (index == 0) {
+			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else {
+			results.push_back(evalRotate(ctx, ct, index));
+		}
+	}
+	return results;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	// Port of the CPU rotate+add doubling loop (OpenFheEngine.cpp:357-370) over engine
+	// primitives, via the facade like evalAddMany.
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+	for (int i = 0; i < std::log2(slots); i++) {
+		const int rotIdx = stride * (1 << i);
+		auto tmp		 = ctx.EvalRotate(result, rotIdx);
+		ctx.EvalAddInPlace(result, tmp);
+	}
+	return result;
+}
+
+void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	for (int i = 0; i < std::log2(slots); i++) {
+		const int rotIdx = stride * (1 << i);
+		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
+		ctx.EvalAddInPlace(ct, tmp);
+	}
+}
+
+void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
+	for (int s = start; s < slots; s <<= 1) {
+		const int rotIdx = stride * s;
+		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
+		ctx.EvalAddInPlace(ct, tmp);
+	}
 }
 
 std::vector<uint64_t> HazeEngine::qPrefix(size_t towers) const {

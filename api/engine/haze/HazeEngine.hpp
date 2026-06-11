@@ -88,6 +88,22 @@ class HazeEngine final : public Engine {
 	Ciphertext<DCRTPoly> rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) override;
 	void rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) override;
 
+	// ---- Rotation + accumulate ----
+	Ciphertext<DCRTPoly> evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) override;
+	void evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, int32_t index) override;
+	std::shared_ptr<void> evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
+	Ciphertext<DCRTPoly>
+	evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t m, const std::shared_ptr<void>& precomp) override;
+	Ciphertext<DCRTPoly>
+	evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) override;
+	std::vector<Ciphertext<DCRTPoly>>
+	evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, const uint32_t m, const std::shared_ptr<void>& precomp) override;
+	std::vector<Ciphertext<DCRTPoly>>
+	evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, const std::shared_ptr<void>& digits, bool addFirst) override;
+	Ciphertext<DCRTPoly> accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) override;
+	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) override;
+	void accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) override;
+
 	// ---- Context backend state ----
 	bool isContextLoaded() const override;
 	/// @brief No-op: haze records synchronously; hazeDeviceSynchronize is itself a no-op and
@@ -208,6 +224,10 @@ class HazeEngine final : public Engine {
 	/// @brief OpenFHE AdjustLevelsAndDepthToOneInPlace: adjustForAddOrSub, then rescale both
 	/// to NSD 1 when needed, so both enter the tensor product at depth 1.
 	void adjustForMult(Operand& a, Operand& b);
+	/// @brief Rotation (ops.cpp rotate): hybridKeyswitch(c1) against the step's
+	/// automorphism key, c0' = c0 + ks.b / c1' = ks.a, then AutomorphMrp BOTH (keyswitch
+	/// first, automorphism last — OpenFHE EvalAtIndex order). Metadata unchanged.
+	Operand rotateCore(const Operand& x, int32_t step);
 	/// @brief ct×pt with the multPt adjust rules (Ciphertext.cpp:356-421): full polynomial
 	/// MulMrp of both components against the pt chain (never the slot-constant shortcut).
 	Operand multPtCore(const Operand& ct, const hazebk::HazePtPayload& pt);
