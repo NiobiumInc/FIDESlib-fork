@@ -1,4 +1,5 @@
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <chrono>
 #include <iomanip>
@@ -126,7 +127,7 @@ void sparse_bootstrap() {
 	std::vector<uint32_t> bsgs		  = { 16, 16 };
 
 	CCParams<CryptoContextCKKSRNS> params;
-	params.SetBackend(Backend::CUDA);
+	params.SetBackend(BackendFromEnv());
 	params.SetSecurityLevel(SecurityLevel::HEStd_NotSet);
 	params.SetRingDim(ring_dim);
 	params.SetMultiplicativeDepth(multDepth);
@@ -196,7 +197,7 @@ void uniform_bootstrap() {
 	std::vector<uint32_t> bsgs		  = { 16, 16 };
 
 	CCParams<CryptoContextCKKSRNS> params;
-	params.SetBackend(Backend::CUDA);
+	params.SetBackend(BackendFromEnv());
 	params.SetSecurityLevel(SecurityLevel::HEStd_NotSet);
 	params.SetRingDim(ring_dim);
 	params.SetMultiplicativeDepth(multDepth);
@@ -275,7 +276,7 @@ int main() {
 		parameters.SetKeySwitchTechnique(HYBRID);
 		parameters.SetNumLargeDigits(dnum);
 		parameters.SetBatchSize(batchSize);
-		parameters.SetBackend(Backend::CUDA);
+		parameters.SetBackend(BackendFromEnv());
 		parameters.SetPlaintextAutoload(false);
 		parameters.SetCiphertextAutoload(true);
 

@@ -30,6 +30,7 @@
 //==================================================================================
 
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <iostream>
 
@@ -47,7 +48,7 @@ int main() {
 	parameters.SetMultiplicativeDepth(multDepth);
 	parameters.SetScalingModSize(scaleModSize);
 	parameters.SetBatchSize(batchSize);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
 
