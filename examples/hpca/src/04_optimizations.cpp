@@ -59,6 +59,11 @@ void accumulation_comparison(CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly
 	std::cout << "\tOptimized:  " << std::fixed << std::setprecision(4) << optimized.count() * 1000 << " ms" << std::endl;
 	std::cout << "\tSpeedup:    " << std::fixed << std::setprecision(2) << original.count() / optimized.count() << "x" << std::endl;
 
+	// Declare both results before the first readback: a record/replay backend (haze) records
+	// one program per context and executes it at the first Decrypt (no-op on CPU/CUDA).
+	cc->MarkOutput(ct1);
+	cc->MarkOutput(ct2);
+
 	// Verify results.
 	Plaintext result;
 	cc->Decrypt(keys.secretKey, ct1, &result);
@@ -280,26 +285,29 @@ int main() {
 		parameters.SetPlaintextAutoload(false);
 		parameters.SetCiphertextAutoload(true);
 
-		CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
-
-		cc->Enable(PKE);
-		cc->Enable(KEYSWITCH);
-		cc->Enable(LEVELEDSHE);
-		cc->Enable(ADVANCEDSHE);
-		cc->Enable(FHE);
-
-		std::cout << "CKKS scheme using ring dimension: " << cc->GetRingDimension() << std::endl << std::endl;
-
-		auto keys = cc->KeyGen();
-		cc->EvalMultKeyGen(keys.secretKey);
-
 		std::vector<int32_t> rotationIndices = { 1, -1, 2, -2, 3, 4, -4, 8, -8 };
-		cc->EvalRotateKeyGen(keys.secretKey, rotationIndices);
 
-		cc->LoadContext(keys.publicKey);
+		// Each benchmark runs on its own context: a record/replay backend (haze) records one
+		// program per context, so independent demos use independent contexts (on CPU/CUDA this
+		// is simply a fresh context per demo).
+		auto runDemo = [&](auto&& body) {
+			CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+			cc->Enable(PKE);
+			cc->Enable(KEYSWITCH);
+			cc->Enable(LEVELEDSHE);
+			cc->Enable(ADVANCEDSHE);
+			cc->Enable(FHE);
+			auto keys = cc->KeyGen();
+			cc->EvalMultKeyGen(keys.secretKey);
+			cc->EvalRotateKeyGen(keys.secretKey, rotationIndices);
+			cc->LoadContext(keys.publicKey);
+			body(cc, keys);
+		};
 
-		accumulation_comparison(cc, keys, batchSize);
-		hoisted_rotations(cc, keys, batchSize);
+		std::cout << "CKKS scheme using ring dimension: " << ring_dim << std::endl << std::endl;
+
+		runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) { accumulation_comparison(cc, keys, batchSize); });
+		runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) { hoisted_rotations(cc, keys, batchSize); });
 	}
 
 	// =====================================================

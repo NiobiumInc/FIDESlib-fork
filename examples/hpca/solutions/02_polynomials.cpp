@@ -153,22 +153,28 @@ int main() {
 	std::cout << "\t Input level: " << ctX->GetLevel() << std::endl;
 	std::cout << "\t Output level: " << ctManualResult->GetLevel() << std::endl;
 
-	Plaintext ptxtManualResult;
-	cc->Decrypt(keys.secretKey, ctManualResult, &ptxtManualResult);
-	ptxtManualResult->SetLength(numPoints);
-	auto manualResults = ptxtManualResult->GetRealPackedValue();
-
 	// =====================================================
 	// Step 8: Chebyshev polynomial evaluation.
 	// =====================================================
 
-	// Set degree of chebyshev polynomial. 
+	// Set degree of chebyshev polynomial.
 	// NOTE: You can try from 3 up to 25.
 	size_t chebyDegree = 9;
 	auto ctChebResult  = evaluateChebyshev(cc, ctX, lowerBound, upperBound, chebyDegree);
 	std::cout << "Chebyshev evaluation." << std::endl;
 	std::cout << "\t Input level: " << ctX->GetLevel() << std::endl;
 	std::cout << "\t Output level: " << ctChebResult->GetLevel() << std::endl;
+
+	// One program per context: a record/replay backend (haze) executes the recorded
+	// program once at the first readback, so declare both results as outputs up front
+	// and decrypt them afterwards (MarkOutput is a no-op on CPU/CUDA).
+	cc->MarkOutput(ctManualResult);
+	cc->MarkOutput(ctChebResult);
+
+	Plaintext ptxtManualResult;
+	cc->Decrypt(keys.secretKey, ctManualResult, &ptxtManualResult);
+	ptxtManualResult->SetLength(numPoints);
+	auto manualResults = ptxtManualResult->GetRealPackedValue();
 
 	Plaintext ptxtChebResult;
 	cc->Decrypt(keys.secretKey, ctChebResult, &ptxtChebResult);

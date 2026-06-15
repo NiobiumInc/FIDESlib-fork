@@ -105,22 +105,27 @@ void distribution(CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys, ui
 	// Create a ciphertext with only slot 0 having a value.
 	std::vector<double> singleValue = { 42.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 	Plaintext ptxtSingle			= cc->MakeCKKSPackedPlaintext(singleValue);
-	auto ctDistributed				= cc->Encrypt(keys.publicKey, ptxtSingle);
+	auto ctInitial					= cc->Encrypt(keys.publicKey, ptxtSingle);
 
-	Plaintext result;
-	std::cout << "\tInitial (slot 0 only): ";
-	cc->Decrypt(keys.secretKey, ctDistributed, &result);
-	result->SetLength(batchSize);
-	std::cout << result;
-
-	// Distribute using rotate-by-(-1) and add iteratively.
-	auto ctRotated = ctDistributed;
+	// Distribute using rotate-by-(-1) and add iteratively. A record/replay backend (haze)
+	// records one program per context and executes it at the first readback, so all compute
+	// precedes the first Decrypt; the initial state (an input, always readable) is read back
+	// afterwards rather than mid-program.
+	auto ctDistributed = ctInitial;
+	auto ctRotated	   = ctInitial;
 	for (uint32_t i = 1; i < batchSize; ++i) {
 		ctRotated	  = cc->EvalRotate(ctRotated, -1);
 		ctDistributed = cc->EvalAdd(ctDistributed, ctRotated);
 	}
+	cc->MarkOutput(ctDistributed);
 
-	// Decrypt and display.
+	// Decrypt and display: the initial slot-0 input, then the distributed result.
+	Plaintext result;
+	std::cout << "\tInitial (slot 0 only): ";
+	cc->Decrypt(keys.secretKey, ctInitial, &result);
+	result->SetLength(batchSize);
+	std::cout << result;
+
 	cc->Decrypt(keys.secretKey, ctDistributed, &result);
 	result->SetLength(batchSize);
 	std::cout << "\tAfter distribution:  " << result;
@@ -204,61 +209,57 @@ int main() {
 	// Step 2: Generate the CryptoContext.
 	// =====================================================
 
-	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+	// A record/replay backend (haze) records ONE program per context and executes it at the
+	// first readback, so each independent demo below runs on its own freshly-built context
+	// (on CPU/CUDA this is simply a new context per demo). runDemo builds + key-generates a
+	// context and hands cc/keys to one demo body.
+	auto runDemo = [&](auto&& body) {
+		CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		cc->Enable(FHE);
+		auto keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		// Rotation keys for step-by-1 rotations (both directions).
+		cc->EvalRotateKeyGen(keys.secretKey, { 1, -1 });
+		cc->LoadContext(keys.publicKey);
+		body(cc, keys);
+	};
 
-	cc->Enable(PKE);
-	cc->Enable(KEYSWITCH);
-	cc->Enable(LEVELEDSHE);
-	cc->Enable(ADVANCEDSHE);
-	cc->Enable(FHE);
-
-	std::cout << "CKKS scheme using ring dimension: " << cc->GetRingDimension() << std::endl;
+	std::cout << "CKKS scheme using ring dimension: " << ring_dim << std::endl;
 	std::cout << "Batch size (slots): " << batchSize << std::endl << std::endl;
 
 	// =====================================================
-	// Step 3: Key Generation.
+	// Run demos (each is its own program, hence its own context).
 	// =====================================================
-
-	auto keys = cc->KeyGen();
-	cc->EvalMultKeyGen(keys.secretKey);
-
-	// Generate rotation keys for step-by-1 rotations.
-	cc->EvalRotateKeyGen(keys.secretKey, { 1, -1 });
-
-	// =====================================================
-	// Step 4: Load the context on the GPU.
-	// =====================================================
-
-	cc->LoadContext(keys.publicKey);
-
-	// =====================================================
-	// Run demos.
-	// =====================================================
-
-	masking(cc, keys, batchSize);
-	accumulation(cc, keys, batchSize);
-	distribution(cc, keys, batchSize);
+	runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) { masking(cc, keys, batchSize); });
+	runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) { accumulation(cc, keys, batchSize); });
+	runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) { distribution(cc, keys, batchSize); });
 
 	// =====================================================
 	// Step 5: Task.
 	// =====================================================
+	runDemo([&](CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys) {
+		std::cout << std::endl << "==== Task ====" << std::endl;
 
-	std::cout << std::endl << "==== Task ====" << std::endl;
+		std::vector<double> values = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+		auto input = cc->MakeCKKSPackedPlaintext(values);
+		auto ct = cc->Encrypt(keys.publicKey, input);
 
-	std::vector<double> values = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
-	auto input = cc->MakeCKKSPackedPlaintext(values);
-	auto ct = cc->Encrypt(keys.publicKey, input);
+		auto ct_task = task(cc, keys, batchSize, ct);
+		cc->MarkOutput(ct_task);
 
-	auto ct_task = task(cc, keys, batchSize, ct);
+		Plaintext result;
+		cc->Decrypt(keys.secretKey, ct_task, &result);
+		result->SetLength(batchSize);
+		std::cout << "\tTask result: " << result;
 
-	Plaintext result;
-	cc->Decrypt(keys.secretKey, ct_task, &result);
-	result->SetLength(batchSize);
-	std::cout << "\tTask result: " << result;
-
-	std::vector<double> expected = { 40.0, 40.0, 40.0, 40.0, 4.0, 16.0, 4.0, 16.0 };
-	Plaintext expected_plaintext = cc->MakeCKKSPackedPlaintext(expected);
-	std::cout << "\tExpected result: " << expected_plaintext << std::endl;
+		std::vector<double> expected = { 40.0, 40.0, 40.0, 40.0, 4.0, 16.0, 4.0, 16.0 };
+		Plaintext expected_plaintext = cc->MakeCKKSPackedPlaintext(expected);
+		std::cout << "\tExpected result: " << expected_plaintext << std::endl;
+	});
 
 	return 0;
 }
