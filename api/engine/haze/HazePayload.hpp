@@ -49,12 +49,6 @@ class LimbChain {
 	/// @brief Pointer view for the `const void* const*` source arguments of the haze MRP ops.
 	std::vector<const void*> asConst() const;
 
-	/// @brief Engine epoch in which these limbs were last H2D-written. haze consumes an
-	/// uploaded shadow the first time it is computed on in an epoch AFTER the one that
-	/// uploaded it (lookup_or_create extracts the shadow; the epoch's flush destroys it),
-	/// so the engine re-deposits the shadow (D2H+H2D) before first use in a later epoch.
-	uint64_t epochStamp = 0;
-
   private:
 	void freeAll() noexcept;
 	std::vector<void*> ptrs_;
