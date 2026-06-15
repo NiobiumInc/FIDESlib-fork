@@ -265,10 +265,14 @@ TEST_F(ApiParityTest, EvalAddScalar) {
 	EncryptInputs(a1, a2);
 	auto lb1	 = LbCt(a1);
 	auto resP	 = cc->EvalAdd(a1, 2.0);
+	auto resN	 = cc->EvalAdd(a1, -2.0);
+	// One program per context: declare both outputs, then read them back. Computing
+	// resN after resP's readback would be compute-after-flush on the haze backend.
+	cc->MarkOutput(resP);
+	cc->MarkOutput(resN);
 	auto gotP	 = HostCt(cc, resP);
 	auto oracleP = LbCc(cc)->EvalAdd(lb1, 2.0);
 	ASSERT_EQ_CIPHERTEXT(oracleP, gotP);
-	auto resN	 = cc->EvalAdd(a1, -2.0);
 	auto gotN	 = HostCt(cc, resN);
 	auto oracleN = LbCc(cc)->EvalAdd(lb1, -2.0);
 	ASSERT_EQ_CIPHERTEXT(oracleN, gotN);
