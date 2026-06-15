@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,7 +32,7 @@ using hazebk::Residency;
 
 void hazeCheck(hazeError_t err, const char* what) {
 	if (err != HAZE_SUCCESS) {
-		OPENFHE_THROW(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
+		throw std::runtime_error(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
 	}
 }
 
@@ -64,11 +65,11 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 	auto& context = hostContext(ctx);
 	const auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
 	if (!fhe) {
-		OPENFHE_THROW("haze backend: context has no CKKS FHE scheme (EvalBootstrapSetup not run?)");
+		throw std::runtime_error("haze backend: context has no CKKS FHE scheme (EvalBootstrapSetup not run?)");
 	}
 	const auto precomIt = fhe->m_bootPrecomMap.find(slots);
 	if (precomIt == fhe->m_bootPrecomMap.end()) {
-		OPENFHE_THROW("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup before LoadContext)");
+		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup before LoadContext)");
 	}
 	const auto& precom = precomIt->second;
 
@@ -242,7 +243,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	}
 	const auto bpIt = boot_.find(slots);
 	if (bpIt == boot_.end()) {
-		OPENFHE_THROW("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
+		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
 	}
 	const BootPrecom& bp = bpIt->second;
 	if (!bp.isLT) {
@@ -255,7 +256,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
 	if (deg > static_cast<int32_t>(bp.correctionFactor)) {
-		OPENFHE_THROW("haze backend: bootstrap degree " + std::to_string(deg) + " exceeds the correction factor " + std::to_string(bp.correctionFactor));
+		throw std::runtime_error("haze backend: bootstrap degree " + std::to_string(deg) + " exceeds the correction factor " + std::to_string(bp.correctionFactor));
 	}
 	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
@@ -298,7 +299,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	{
 		auto p = devicePayload(work);
 		if ((L0 - p->towers) + (p->noiseScaleDeg - 1) > expectedLevel) {
-			OPENFHE_THROW("haze backend: not enough levels to perform bootstrapping");
+			throw std::runtime_error("haze backend: not enough levels to perform bootstrapping");
 		}
 		toDepthOne(work);
 		p = devicePayload(work);

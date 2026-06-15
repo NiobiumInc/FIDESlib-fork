@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -53,10 +54,10 @@ static bool extractDcrtpolyLimbs(
 /// of both A and B vectors.  @p out is overwritten only on full success.
 ///
 /// Identical extraction math to haze test/openfhe_key_extract.hpp
-/// detail::extract_keyswitch_key_into, ported to throw via OPENFHE_THROW instead
+/// detail::extract_keyswitch_key_into, ported to throw via std::runtime_error instead
 /// of returning hazeError_t.
 ///
-/// @throws (OPENFHE_THROW) on invalid crypto parameters, non-HYBRID technique,
+/// @throws (std::runtime_error) on invalid crypto parameters, non-HYBRID technique,
 ///         or tower/dimension mismatch.
 static void extractKeyswitchKeyInto(
 	const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
@@ -66,31 +67,31 @@ static void extractKeyswitchKeyInto(
 	const auto cryptoParams =
 		std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(cc->GetCryptoParameters());
 	if (!cryptoParams)
-		OPENFHE_THROW("haze backend: failed to cast CryptoParameters to CryptoParametersRNS");
+		throw std::runtime_error("haze backend: failed to cast CryptoParameters to CryptoParametersRNS");
 
 	if (cryptoParams->GetKeySwitchTechnique() != lbcrypto::HYBRID)
-		OPENFHE_THROW("haze backend: keyswitch technique is not HYBRID");
+		throw std::runtime_error("haze backend: keyswitch technique is not HYBRID");
 
 	if (!evalKey)
-		OPENFHE_THROW("haze backend: EvalKey pointer is null");
+		throw std::runtime_error("haze backend: EvalKey pointer is null");
 
 	const auto elementParams = cryptoParams->GetElementParams();
 	const auto paramsP       = cryptoParams->GetParamsP();
 	if (!elementParams || !paramsP)
-		OPENFHE_THROW("haze backend: element params or P params are null");
+		throw std::runtime_error("haze backend: element params or P params are null");
 
 	const std::size_t ringDim = elementParams->GetRingDimension();
 	if (ringDim == 0)
-		OPENFHE_THROW("haze backend: ring dimension is zero");
+		throw std::runtime_error("haze backend: ring dimension is zero");
 
 	const std::uint32_t numPartQ = cryptoParams->GetNumPartQ();
 	if (numPartQ == 0)
-		OPENFHE_THROW("haze backend: numPartQ is zero");
+		throw std::runtime_error("haze backend: numPartQ is zero");
 
 	const auto& aVec = evalKey->GetAVector();
 	const auto& bVec = evalKey->GetBVector();
 	if (aVec.size() != numPartQ || bVec.size() != numPartQ)
-		OPENFHE_THROW("haze backend: A/B vector size does not match numPartQ");
+		throw std::runtime_error("haze backend: A/B vector size does not match numPartQ");
 
 	// Build into a local; move into out only on full success.
 	HybridKeyswitchLimbs tmp;
@@ -111,11 +112,11 @@ static void extractKeyswitchKeyInto(
 	tmp.b_limbs.resize(numPartQ);
 	for (std::uint32_t part = 0; part < numPartQ; ++part) {
 		if (!extractDcrtpolyLimbs(aVec[part], qpTowers, ringDim, tmp.a_limbs[part]))
-			OPENFHE_THROW("haze backend: A[" + std::to_string(part) +
+			throw std::runtime_error("haze backend: A[" + std::to_string(part) +
 				"] tower count or ring dimension mismatch (expected qpTowers=" +
 				std::to_string(qpTowers) + ", ringDim=" + std::to_string(ringDim) + ")");
 		if (!extractDcrtpolyLimbs(bVec[part], qpTowers, ringDim, tmp.b_limbs[part]))
-			OPENFHE_THROW("haze backend: B[" + std::to_string(part) +
+			throw std::runtime_error("haze backend: B[" + std::to_string(part) +
 				"] tower count or ring dimension mismatch (expected qpTowers=" +
 				std::to_string(qpTowers) + ", ringDim=" + std::to_string(ringDim) + ")");
 	}
@@ -134,7 +135,7 @@ HybridKeyswitchLimbs extractEvalMultKeyLimbs(
 	const std::string& keyTag)
 {
 	if (!cc)
-		OPENFHE_THROW("haze backend: CryptoContext is null in extractEvalMultKeyLimbs");
+		throw std::runtime_error("haze backend: CryptoContext is null in extractEvalMultKeyLimbs");
 
 	// GetEvalMultKeyVector throws when no key is registered for the tag; we let that
 	// exception propagate as-is after wrapping it with a descriptive message.
@@ -142,11 +143,11 @@ HybridKeyswitchLimbs extractEvalMultKeyLimbs(
 	try {
 		evalKeys = &lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalMultKeyVector(keyTag);
 	} catch (...) {
-		OPENFHE_THROW("haze backend: no EvalMult key registered for tag \"" + keyTag + "\"");
+		throw std::runtime_error("haze backend: no EvalMult key registered for tag \"" + keyTag + "\"");
 	}
 
 	if (!evalKeys || evalKeys->empty())
-		OPENFHE_THROW("haze backend: no EvalMult key registered for tag \"" + keyTag + "\"");
+		throw std::runtime_error("haze backend: no EvalMult key registered for tag \"" + keyTag + "\"");
 
 	HybridKeyswitchLimbs result;
 	detail::extractKeyswitchKeyInto(cc, (*evalKeys)[0], result);
@@ -159,22 +160,22 @@ HybridKeyswitchLimbs extractAutomorphismKeyLimbs(
 	uint32_t autoIndex)
 {
 	if (!cc)
-		OPENFHE_THROW("haze backend: CryptoContext is null in extractAutomorphismKeyLimbs");
+		throw std::runtime_error("haze backend: CryptoContext is null in extractAutomorphismKeyLimbs");
 
 	std::shared_ptr<std::map<uint32_t, std::shared_ptr<lbcrypto::EvalKeyImpl<lbcrypto::DCRTPoly>>>> keyMapPtr;
 	try {
 		keyMapPtr =
 			lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMapPtr(keyTag);
 	} catch (...) {
-		OPENFHE_THROW("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
+		throw std::runtime_error("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
 	}
 
 	if (!keyMapPtr)
-		OPENFHE_THROW("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
+		throw std::runtime_error("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
 
 	const auto it = keyMapPtr->find(autoIndex);
 	if (it == keyMapPtr->end())
-		OPENFHE_THROW("haze backend: automorphism index " + std::to_string(autoIndex) +
+		throw std::runtime_error("haze backend: automorphism index " + std::to_string(autoIndex) +
 			" not found in key map for tag \"" + keyTag + "\"");
 
 	HybridKeyswitchLimbs result;

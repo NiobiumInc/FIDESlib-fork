@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -32,7 +33,7 @@ using hazebk::Residency;
 
 void hazeCheck(hazeError_t err, const char* what) {
 	if (err != HAZE_SUCCESS) {
-		OPENFHE_THROW(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
+		throw std::runtime_error(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
 	}
 }
 
@@ -71,7 +72,7 @@ std::vector<std::vector<uint64_t>> extractRows(const lbcrypto::DCRTPoly& src, ui
 		const auto& np	 = elem.GetElementAtIndex(static_cast<usint>(t));
 		const auto& vals = np.GetValues();
 		if (vals.GetLength() != ringDim) {
-			OPENFHE_THROW("haze backend: polynomial length " + std::to_string(vals.GetLength()) + " does not match ring dimension " + std::to_string(ringDim));
+			throw std::runtime_error("haze backend: polynomial length " + std::to_string(vals.GetLength()) + " does not match ring dimension " + std::to_string(ringDim));
 		}
 		rows[t].resize(ringDim);
 		for (std::size_t i = 0; i < ringDim; ++i) {
@@ -106,7 +107,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	// the later increment are not atomic together — concurrent loadContext from two threads
 	// is not supported, matching haze's own single-threaded configuration model.)
 	if (liveEngines_.load() != 0) {
-		OPENFHE_THROW("haze backend: another haze context is already loaded in this process; "
+		throw std::runtime_error("haze backend: another haze context is already loaded in this process; "
 					  "haze configuration is process-global, so destroy the previous context first");
 	}
 
@@ -116,7 +117,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 	const auto cryptoParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters());
 	if (!cryptoParams) {
-		OPENFHE_THROW("haze backend: context does not carry CKKS-RNS crypto parameters");
+		throw std::runtime_error("haze backend: context does not carry CKKS-RNS crypto parameters");
 	}
 	scalingTech_ = static_cast<int>(cryptoParams->GetScalingTechnique());
 
@@ -127,7 +128,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		qBase_.push_back(p->GetModulus().template ConvertToInt<uint64_t>());
 	}
 	if (qBase_.empty()) {
-		OPENFHE_THROW("haze backend: context has an empty modulus chain");
+		throw std::runtime_error("haze backend: context has an empty modulus chain");
 	}
 	pBase_.clear();
 	if (const auto paramsP = cryptoParams->GetParamsP()) {
@@ -139,7 +140,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	}
 	// haze's ciphertext-modulus table caps at 64 entries (kMaxCiphertextModuli).
 	if (qBase_.size() + pBase_.size() > 64) {
-		OPENFHE_THROW("haze backend: |Q|+|P| = " + std::to_string(qBase_.size()) + "+" + std::to_string(pBase_.size()) + " exceeds haze's 64-moduli table");
+		throw std::runtime_error("haze backend: |Q|+|P| = " + std::to_string(qBase_.size()) + "+" + std::to_string(pBase_.size()) + " exceeds haze's 64-moduli table");
 	}
 
 	// Per-level scale-factor caches, OpenFHE level orientation.
@@ -213,7 +214,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		uint64_t picked = 0;
 		hazeCheck(hazeReplayBridgeInitCryptoContext(ringDim_, qBase_.front(), &picked), "hazeReplayBridgeInitCryptoContext");
 		if (picked == 0) {
-			OPENFHE_THROW("haze backend: replay bridge returned a zero modulus");
+			throw std::runtime_error("haze backend: replay bridge returned a zero modulus");
 		}
 
 		int modIdx = 0;
@@ -298,18 +299,18 @@ void HazeEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext
 		return;
 	}
 	if (!loaded_) {
-		OPENFHE_THROW("CryptoContext not loaded to any device");
+		throw std::runtime_error("CryptoContext not loaded to any device");
 	}
 	auto& host			 = hostCt(ct);
 	const auto& elements = host->GetElements();
 	if (elements.size() != 2) {
-		OPENFHE_THROW("haze backend: only degree-1 ciphertexts (2 components) are supported; got " + std::to_string(elements.size()));
+		throw std::runtime_error("haze backend: only degree-1 ciphertexts (2 components) are supported; got " + std::to_string(elements.size()));
 	}
 
 	auto rows0 = extractRows(elements[0], ringDim_);
 	auto rows1 = extractRows(elements[1], ringDim_);
 	if (rows0.size() != rows1.size()) {
-		OPENFHE_THROW("haze backend: ciphertext components disagree on tower count");
+		throw std::runtime_error("haze backend: ciphertext components disagree on tower count");
 	}
 
 	auto payload		   = std::make_shared<HazePayload>();
@@ -331,7 +332,7 @@ void HazeEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Plaintext& 
 		return;
 	}
 	if (!loaded_) {
-		OPENFHE_THROW("CryptoContext not loaded to any device");
+		throw std::runtime_error("CryptoContext not loaded to any device");
 	}
 	const auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->host);
 
@@ -364,7 +365,7 @@ void HazeEngine::markOutput(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext<DCR
 		return; // Uploaded/Flushed values are D2H-readable without a tag
 	}
 	if (executed_) {
-		OPENFHE_THROW("haze backend: value was a program-local; declare it with MarkOutput before the first Decrypt");
+		throw std::runtime_error("haze backend: value was a program-local; declare it with MarkOutput before the first Decrypt");
 	}
 	for (const auto& existing : outputs_) {
 		if (existing.lock() == payload) {
@@ -414,7 +415,7 @@ void HazeEngine::refreshChainIfStale(LimbChain& ch) {
 
 void HazeEngine::requireComputable(HazePayload& p, const char* op) {
 	if (executed_ && p.state != Residency::Uploaded) {
-		OPENFHE_THROW(std::string("haze backend: ") + op + ": compute after readback is a new epoch; restructure the program so all compute precedes the first Decrypt");
+		throw std::runtime_error(std::string("haze backend: ") + op + ": compute after readback is a new epoch; restructure the program so all compute precedes the first Decrypt");
 	}
 	if (p.state == Residency::Uploaded) {
 		refreshChainIfStale(p.c0);
@@ -441,7 +442,7 @@ void HazeEngine::recoverHostCiphertext(CryptoContextImpl<DCRTPoly>& ctx, Ciphert
 	auto payload = devicePayload(ct);
 	if (payload->state == Residency::Recorded) {
 		if (executed_) {
-			OPENFHE_THROW("haze backend: value was a program-local; declare it with MarkOutput before the first Decrypt");
+			throw std::runtime_error("haze backend: value was a program-local; declare it with MarkOutput before the first Decrypt");
 		}
 		markOutput(ctx, ct); // implicit declaration of the value being read (first-readback case)
 		materialize();		 // tags ALL declared outputs, ONE hazeFlush, sets executed_
@@ -564,11 +565,11 @@ void HazeEngine::setCiphertextLevel(CryptoContextImpl<DCRTPoly>& /*ctx*/, Cipher
 	}
 	auto payload = devicePayload(ct);
 	if (level > qBase_.size()) {
-		OPENFHE_THROW("haze backend: SetLevel(" + std::to_string(level) + ") exceeds the modulus chain length");
+		throw std::runtime_error("haze backend: SetLevel(" + std::to_string(level) + ") exceeds the modulus chain length");
 	}
 	const size_t targetTowers = qBase_.size() - level;
 	if (targetTowers > payload->towers) {
-		OPENFHE_THROW("haze backend: SetLevel can only drop levels (have " + std::to_string(qBase_.size() - payload->towers) + ", requested " + std::to_string(level) + ")");
+		throw std::runtime_error("haze backend: SetLevel can only drop levels (have " + std::to_string(qBase_.size() - payload->towers) + ", requested " + std::to_string(level) + ")");
 	}
 	// Level drop = truncation: hazeFree the tail limbs, no IR, no flush (OpenFHE's
 	// DropLastElements does no arithmetic either). Freeing recorded intermediates mid-epoch
@@ -592,7 +593,7 @@ LimbChain HazeEngine::rescaleChainOneTower(const LimbChain& src, size_t srcTower
 	// Port of ops.cpp rescale_chain_one_tower: INTT → ModDown dropping the trailing Q prime
 	// (centered lift + q_l^{-1}, matching OpenFHE ModReduce exactly) → NTT.
 	if (srcTowers < 2) {
-		OPENFHE_THROW("haze backend: rescale needs at least 2 towers");
+		throw std::runtime_error("haze backend: rescale needs at least 2 towers");
 	}
 	const size_t dstTowers = srcTowers - 1;
 	const auto srcBase	   = qPrefix(srcTowers);
@@ -639,7 +640,7 @@ HazeEngine::Operand HazeEngine::rescaleCore(const Operand& x) {
 	// OpenFHE ModReduceInternalInPlace (one level): towers−1, NSD−1,
 	// sf ÷= ModReduceFactor[oldTowers−1].
 	if (x.noiseScaleDeg < 1) {
-		OPENFHE_THROW("haze backend: rescale on noiseScaleDeg 0 would underflow");
+		throw std::runtime_error("haze backend: rescale on noiseScaleDeg 0 would underflow");
 	}
 	LimbChain out0 = rescaleChainOneTower(x.p->c0, x.towers);
 	LimbChain out1;
@@ -777,7 +778,7 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 			return;
 		}
 		if (ptOp.noiseScaleDeg == 1 && ct.noiseScaleDeg == 2) {
-			OPENFHE_THROW("haze backend: plaintext adjust failed — rescale the ciphertext first (depth-2 ct vs depth-1 pt)");
+			throw std::runtime_error("haze backend: plaintext adjust failed — rescale the ciphertext first (depth-2 ct vs depth-1 pt)");
 		}
 		return;
 	}
@@ -785,18 +786,18 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 		// Plaintext::adjustScaleAndLevel(c.NSD, c.level, c.sf): same generic adjust as
 		// ciphertext operands, including the equal-level depth bump.
 		if (ptOp.towers < ct.towers) {
-			OPENFHE_THROW("haze backend: plaintext is encoded deeper than the ciphertext (cannot raise a plaintext)");
+			throw std::runtime_error("haze backend: plaintext is encoded deeper than the ciphertext (cannot raise a plaintext)");
 		}
 		if (levelOf(ptOp) < levelOf(ct)) {
 			adjustOperandToward(ptOp, ct);
 		} else if (ptOp.noiseScaleDeg < ct.noiseScaleDeg) {
 			ptOp = multScalarCore(ptOp, 1.0);
 		} else if (ptOp.noiseScaleDeg > ct.noiseScaleDeg) {
-			OPENFHE_THROW("haze backend: plaintext adjust failed — pt depth exceeds ct depth at equal level");
+			throw std::runtime_error("haze backend: plaintext adjust failed — pt depth exceeds ct depth at equal level");
 		}
 		return;
 	}
-	OPENFHE_THROW("haze backend: adjustPtToward is meaningful only for the AUTO scaling modes");
+	throw std::runtime_error("haze backend: adjustPtToward is meaningful only for the AUTO scaling modes");
 }
 
 HazeEngine::Operand HazeEngine::multScalarWithPrecheck(const Operand& x, double scalar) {
@@ -894,7 +895,7 @@ HazeEngine::Operand HazeEngine::applyPt(const Operand& ct, const hazebk::HazePtP
 	}
 	adjustPtToward(ptOp, x);
 	if (ptOp.towers < x.towers || ptOp.noiseScaleDeg != x.noiseScaleDeg) {
-		OPENFHE_THROW("haze backend: internal error — pt/ct disagree after adjustPlaintextToCiphertext");
+		throw std::runtime_error("haze backend: internal error — pt/ct disagree after adjustPlaintextToCiphertext");
 	}
 
 	const auto base = qPrefix(x.towers);
@@ -956,7 +957,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const
 	Operand b = asOperand(p2);
 	adjustForAddOrSub(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 	const auto base = qPrefix(a.towers);
 	LimbChain out0(a.towers, polyBytes_);
@@ -981,7 +982,7 @@ void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	Operand b = asOperand(p2);
 	adjustForAddOrSub(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 	const auto base = qPrefix(a.towers);
 	LimbChain out0(a.towers, polyBytes_);
@@ -1006,7 +1007,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const
 	Operand b = asOperand(p2);
 	adjustForAddOrSub(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 	const auto base = qPrefix(a.towers);
 	LimbChain out0(a.towers, polyBytes_);
@@ -1031,7 +1032,7 @@ void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	Operand b = asOperand(p2);
 	adjustForAddOrSub(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 	const auto base = qPrefix(a.towers);
 	LimbChain out0(a.towers, polyBytes_);
@@ -1168,7 +1169,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalAddMany(CryptoContextImpl<DCRTPoly>& ctx, c
 	// Facade-level add tree, structurally from CudaEngine minus its up-front LoadCiphertext
 	// loop (each EvalAdd loads its operands lazily via ensureCt).
 	if (ciphertexts.empty()) {
-		OPENFHE_THROW("EvalAddMany: input ciphertext vector is empty");
+		throw std::runtime_error("EvalAddMany: input ciphertext vector is empty");
 	}
 	if (ciphertexts.size() == 1) {
 		return ciphertexts[0]; // the CudaEngine tree would read past an empty sum vector
@@ -1192,7 +1193,7 @@ void HazeEngine::evalAddManyInPlace(CryptoContextImpl<DCRTPoly>& ctx, std::vecto
 	// Facade-level pairwise reduction, structurally from CudaEngine minus its up-front
 	// LoadCiphertext loop (each EvalAddInPlace loads its operands lazily via ensureCt).
 	if (ciphertexts.empty()) {
-		OPENFHE_THROW("EvalAddManyInPlace: input ciphertext vector is empty");
+		throw std::runtime_error("EvalAddManyInPlace: input ciphertext vector is empty");
 	}
 
 	for (size_t j = 1; j < ciphertexts.size(); j = j * 2) {
@@ -1254,7 +1255,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	ensureKeyUploaded(key);
 	const size_t numPartQ = key.host.a_limbs.size();
 	if (numPartQ == 0) {
-		OPENFHE_THROW("haze backend: keyswitch key has no digits");
+		throw std::runtime_error("haze backend: keyswitch key has no digits");
 	}
 	const size_t sizeQ = qBase_.size();
 	const size_t alpha = (sizeQ + numPartQ - 1) / numPartQ;
@@ -1280,7 +1281,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	}
 	const size_t numDigits = digitBaseLens.size();
 	if (numDigits == 0) {
-		OPENFHE_THROW("haze backend: keyswitch digit decomposition is empty");
+		throw std::runtime_error("haze backend: keyswitch digit decomposition is empty");
 	}
 
 	const hazeModUpParams modupParams = {
@@ -1439,7 +1440,7 @@ HazeEngine::Operand HazeEngine::multPtCore(const Operand& ct, const hazebk::Haze
 		ptOp = rescaleCore(ptOp);
 	}
 	if (ptOp.towers < x.towers || ptOp.noiseScaleDeg != x.noiseScaleDeg) {
-		OPENFHE_THROW("haze backend: internal error — pt/ct disagree after adjustPlaintextToCiphertext");
+		throw std::runtime_error("haze backend: internal error — pt/ct disagree after adjustPlaintextToCiphertext");
 	}
 
 	const auto base = qPrefix(x.towers);
@@ -1461,14 +1462,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, cons
 	requireComputable(*p2, "EvalMult");
 	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
-		OPENFHE_THROW("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
+		throw std::runtime_error("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
 	}
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
 	adjustForMult(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 
 	// Tensor product (ops.cpp order): d0 = a0·b0, d1 = a0·b1 + a1·b0, d2 = a1·b1.
@@ -1497,14 +1498,14 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	requireComputable(*p2, "EvalMultInPlace");
 	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
-		OPENFHE_THROW("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
+		throw std::runtime_error("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
 	}
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
 	adjustForMult(a, b);
 	if (a.towers != b.towers) {
-		OPENFHE_THROW("haze backend: internal error — operands disagree on towers after adjust");
+		throw std::runtime_error("haze backend: internal error — operands disagree on towers after adjust");
 	}
 
 	const auto base = qPrefix(a.towers);
@@ -1530,7 +1531,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, co
 	requireComputable(*p, "EvalSquare");
 	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
-		OPENFHE_THROW("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
+		throw std::runtime_error("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
 	}
 
 	// OpenFHE EvalSquare: AUTO modes mod-reduce a depth-2 input first, then square.
@@ -1561,7 +1562,7 @@ void HazeEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 	requireComputable(*p, "EvalSquareInPlace");
 	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
-		OPENFHE_THROW("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
+		throw std::runtime_error("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
 	}
 
 	Operand a	  = asOperand(p);
@@ -1793,7 +1794,7 @@ BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool /*precompute*/, bool 
 
 void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
 	if (isContextLoaded()) {
-		OPENFHE_THROW("Context is already loaded");
+		throw std::runtime_error("Context is already loaded");
 	}
 	auto& skImpl  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
 	auto& context = hostContext(ctx);

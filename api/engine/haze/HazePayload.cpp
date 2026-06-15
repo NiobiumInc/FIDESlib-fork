@@ -4,8 +4,9 @@
 
 #include <haze/haze.h>
 
-#include <openfhe.h> // OPENFHE_THROW
+#include <openfhe.h>
 
+#include <stdexcept>
 #include <string>
 
 namespace fideslib::hazebk {
@@ -13,7 +14,7 @@ namespace fideslib::hazebk {
 namespace {
 void hazeCheck(hazeError_t err, const char* what) {
 	if (err != HAZE_SUCCESS) {
-		OPENFHE_THROW(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
+		throw std::runtime_error(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
 	}
 }
 } // namespace
