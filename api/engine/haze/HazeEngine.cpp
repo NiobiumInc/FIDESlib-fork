@@ -1557,11 +1557,11 @@ Ciphertext<DCRTPoly> HazeEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const
 
 void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) {
 	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "RescaleInPlace"); // guard before the no-op early-return, matching rescale()
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDMANUAL) {
 		return; // OpenFHE: ModReduceInPlace is a no-op outside FIXEDMANUAL
 	}
-	requireComputable(*p, "RescaleInPlace");
 	Operand res = rescaleCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
