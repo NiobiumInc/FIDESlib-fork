@@ -341,6 +341,41 @@ class HazeEngine final : public Engine {
 	/// the oracle).
 	Ciphertext<DCRTPoly> bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
 
+	// ---- Chebyshev Paterson-Stockmeyer cores (parity #12-#15; CUDA src/CKKS/ApproxModEval.cu
+	// + Ciphertext.cpp evalLinearWSumMutable are the spec). ----
+
+	/// @brief Fused weighted-sum producing a result Operand directly at `targetTowers` (NSD=2):
+	/// out = sum_i weights[i]*ops[i], computed via multScalar (bootstrap-prescale encoding,
+	/// towersIn = ops[i].towers) + add-accumulate, exactly reproducing CUDA
+	/// Ciphertext::evalLinearWSumMutable (Ciphertext.cpp:1168). CUDA grows a fresh ct to the
+	/// target level and fills it; haze cannot grow (setCiphertextLevel only drops), so this
+	/// produces the result at `targetTowers` directly. NoiseFactor = ScalingFactorReal[level]^2
+	/// where level = |Q| - targetTowers. All ops[i] must have towers >= targetTowers.
+	Operand evalLinearWSumMutableCore(size_t targetTowers,
+	  const std::vector<Operand>& ops,
+	  const std::vector<double>& weights);
+	/// @brief Facade wrapper: extract operands from `ctxs`, call evalLinearWSumMutableCore at the
+	/// CUDA target level, and wrap the result back into a value-type Ciphertext parented to ctx.
+	Ciphertext<DCRTPoly> evalLinearWSumMutableFacade(CryptoContextImpl<DCRTPoly>& ctx,
+	  size_t targetTowers,
+	  const std::vector<Ciphertext<DCRTPoly>>& ctxs,
+	  const std::vector<double>& weights);
+	/// @brief Port of CUDA innerEvalChebyshevPS (ApproxModEval.cu:138) — Paterson-Stockmeyer
+	/// recursion threading level_offset (q@level_offset, s@level_offset+1) and max_m (cu caching
+	/// when max_m-m<=1). Returns the recursive PS result; the caller subtracts T2km1.
+	Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+	  const std::vector<double>& coefficients,
+	  uint32_t k, uint32_t m,
+	  const std::vector<Ciphertext<DCRTPoly>>& T,
+	  const std::vector<Ciphertext<DCRTPoly>>& T2,
+	  int level_offset, int max_m);
+	/// @brief Port of CUDA evalChebyshevSeries (ApproxModEval.cu:370) — always PS (no degree
+	/// dispatch, #12), CUDA centering affine map (#13), T/T2/T2km1 build, then InnerEvalChebyshevPS.
+	Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
+	  const Ciphertext<DCRTPoly>& ct,
+	  std::vector<double>& coeffs,
+	  double a, double b);
+
 	// ---- context state ----
 	bool loaded_	  = false;
 	uint64_t ringDim_ = 0;
