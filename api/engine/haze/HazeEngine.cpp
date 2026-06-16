@@ -626,7 +626,13 @@ HazeEngine::Operand HazeEngine::rescaleCore(const Operand& x) {
 }
 
 HazeEngine::Operand HazeEngine::negateCore(const Operand& x) {
-	// Exact EvalNegate: per-limb scalar q_i − 1 (≡ −1 mod q_i); metadata unchanged.
+	// Degree-preserving EvalNegate: per-limb scalar q_i − 1 (≡ −1 mod q_i); metadata unchanged.
+	// CUDA's evalNegate is multScalar(-1.0) instead (CudaEngine.cpp:104-110): residues become the
+	// ElemForEvalMult(-1.0) scaled const, bumping NSD 1→2 and sf *= ScalingFactorReal[level] with a
+	// depth-2 precheck (known GPU fidelity gap, ApiParityTest.cpp:221) — NOT OpenFHE's q_i−1. We keep
+	// the q_i−1 multiply: component count is unchanged (per Ryan's rule, only a degree/component-count
+	// change forces literal CUDA reproduction), and it is not obvious CUDA's NSD 1→2 bump is safe for
+	// how FIDESlib consumes noiseScaleDeg downstream, so we deliberately do not replicate it.
 	std::vector<uint64_t> scalars(x.towers);
 	for (size_t i = 0; i < x.towers; ++i) {
 		scalars[i] = qBase_[i] - 1;
@@ -682,10 +688,15 @@ void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
 				const double scf  = sfReal_[c1lvl];
 				const double q1	  = modReduceFactor_[x.towers - 1];
 				x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
-				x				  = rescaleCore(x);
+				// CUDA does multScalar; dropToLevel(c2lvl+1); THEN rescale (Ciphertext.cpp:1393-1398):
+				// trim the extra top towers FIRST, then rescale the now-correct top tower. OpenFHE / the
+				// old Haze order rescaled first and folded the wrong top tower when operands were >1 level
+				// apart. (q1 still uses the Plaintext-rule modReduceFactor_[x.towers−1]; the Ciphertext-
+				// rule index is #5, a Stage 2 change.)
 				if (c1lvl + 1 < c2lvl) {
 					x.towers -= c2lvl - c1lvl - 1;
 				}
+				x				  = rescaleCore(x);
 				x.scalingFactor = tgt.scalingFactor;
 			} else {
 				if (c1lvl + 1 == c2lvl) {
@@ -797,7 +808,9 @@ HazeEngine::Operand HazeEngine::addScalarCore(const Operand& x, double scalar) {
 		auto factors = hazebk::elemForEvalAddOrSub(scalarParams(), x.towers, std::fabs(scalar), x.noiseScaleDeg);
 		if (scalar < 0.0) {
 			for (size_t i = 0; i < factors.size(); ++i) {
-				factors[i] = (factors[i] == 0) ? 0 : qBase_[i] - factors[i];
+				// CUDA flips unconditionally: elem[i] = prime.p − elem[i] (Ciphertext.cpp:786), so a
+				// 0 residue records the literal q_i, not 0. OpenFHE/old Haze guarded 0→0; we match CUDA.
+				factors[i] = qBase_[i] - factors[i];
 			}
 		}
 		const auto base = qPrefix(x.towers);
@@ -1053,8 +1066,12 @@ void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 }
 
 Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, double scalar, const Ciphertext<DCRTPoly>& ct) {
-	// scalar − ct = (−ct) + scalar via the exact negate (replaces CudaEngine's
-	// triple-multScalar trick, which bumps NSD).
+	// scalar − ct = (−ct) + scalar via the exact negate, honoring the oracle's s − ct contract
+	// (OpenFheEngine.cpp:174). CUDA's evalSub(scalar, ct) instead does multScalar(-1);addScalar(s);
+	// multScalar(-1) (CudaEngine.cpp:252-260), which actually computes ct − s (double-negate sign bug)
+	// plus an NSD bump and a dropped tower from the multScalar prechecks. The result stays 2-component,
+	// so per Ryan's rule we keep this correct s − ct and deliberately do NOT replicate CUDA's sign/level
+	// bug. (The negate primitive itself still differs per #1.)
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar, ct)");
 	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
@@ -1542,26 +1559,22 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 }
 
 Ciphertext<DCRTPoly> HazeEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
-	// OpenFHE public ModReduce mod-reduces only under FIXEDMANUAL; under the AUTO modes it
-	// is a clone (rescaling is deferred to the adjust steps). Matching that exactly keeps
-	// the level accounting identical to the CPU oracle.
+	// CUDA rescales eagerly under ALL scaling techniques (drop a limb, NoiseFactor /= ModReduceFactor,
+	// NoiseLevel −= 1; Ciphertext.cpp:428-442 via CudaEngine.cpp:459,466), unlike OpenFHE's public
+	// ModReduce which mod-reduces only under FIXEDMANUAL and clones under the AUTO modes. We match CUDA
+	// and always mod-reduce. (Task 02 #16's convolution special-exit rescale depends on this being
+	// unconditional.)
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "Rescale");
-	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	if (st != lbcrypto::FIXEDMANUAL) {
-		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext); // Clone (no-op rescale)
-	}
 	Operand res = rescaleCore(asOperand(p));
 	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
 }
 
 void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) {
+	// CUDA mod-reduces eagerly under every technique (see rescale() above), not OpenFHE's
+	// FIXEDMANUAL-only ModReduceInPlace.
 	auto p = ensureCt(ctx, ciphertext);
-	requireComputable(*p, "RescaleInPlace"); // guard before the no-op early-return, matching rescale()
-	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	if (st != lbcrypto::FIXEDMANUAL) {
-		return; // OpenFHE: ModReduceInPlace is a no-op outside FIXEDMANUAL
-	}
+	requireComputable(*p, "RescaleInPlace");
 	Operand res = rescaleCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }

@@ -329,7 +329,10 @@ TEST_F(ApiParityTest, EvalMultAllLevels) {
 		cc->MarkOutput(a);
 		perLevel.push_back(a);
 		lbA = LbCc(cc)->EvalMult(lbA, lbB);
-		LbCc(cc)->RescaleInPlace(lbA);
+		// The device backends (haze/CUDA) rescale eagerly under every technique (parity #3); OpenFHE's
+		// public RescaleInPlace defers under FIXEDAUTO, so force the eager internal ModReduce on the
+		// oracle to keep it level-aligned with the device for the decrypt comparison.
+		LbCc(cc)->GetScheme()->ModReduceInternalInPlace(lbA, lbcrypto::BASE_NUM_LEVELS_TO_DROP);
 		oracles.push_back(lbA);
 	}
 	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
@@ -378,7 +381,9 @@ TEST_F(ApiParityTest, EvalRotateAllLevels) {
 		a = cc->EvalMult(a, b);
 		cc->RescaleInPlace(a);
 		lbA = LbCc(cc)->EvalMult(lbA, lbB);
-		LbCc(cc)->RescaleInPlace(lbA);
+		// Eager device rescale (parity #3) vs OpenFHE's deferred public RescaleInPlace under FIXEDAUTO;
+		// force the eager internal ModReduce on the oracle so its level matches the rotated device ct.
+		LbCc(cc)->GetScheme()->ModReduceInternalInPlace(lbA, lbcrypto::BASE_NUM_LEVELS_TO_DROP);
 	}
 	for (uint32_t lvl = 0; lvl + 1 < kDepth; ++lvl) {
 		SCOPED_TRACE("level " + std::to_string(lvl));
