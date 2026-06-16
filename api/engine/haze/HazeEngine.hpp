@@ -293,6 +293,10 @@ class HazeEngine final : public Engine {
 		KsKey key;
 	};
 	std::map<int32_t, RotKey> rotKeys_; // slot step -> key
+	/// @brief CUDA-style normalized rotation index ((step mod N/2), made positive) -> the slot
+	/// step in rotKeys_. Built from rotKeys_; used by the slots-aware GetRotationKey port (#7,
+	/// incl. the alternate slot-compatible key search) so rotateCore can pick CUDA's actual_index.
+	std::map<int32_t, int32_t> rotKeyIndex_;
 	/// @brief Lazily-extracted automorphism keys by raw automorphism index (bootstrap
 	/// rotations, conjugation 2N−1, and any rotation step not in rotKeys_).
 	std::map<uint32_t, KsKey> autoKeys_;

@@ -182,6 +182,16 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, rk.autoIndex);
 		rotKeys_.emplace(step, std::move(rk));
 	}
+	// Index the registered keys by CUDA's normalized rotation index ((step mod N/2), positive),
+	// so rotateCore can replicate GetRotationKey's slots-aware actual_index selection (#7).
+	rotKeyIndex_.clear();
+	if (ringDim_ >= 2) {
+		const int32_t half = static_cast<int32_t>(ringDim_ / 2);
+		for (const auto& [step, rk] : rotKeys_) {
+			const int32_t idx = ((step % half) + half) % half;
+			rotKeyIndex_.emplace(idx, step); // first registered step wins for a given normalized index
+		}
+	}
 	// Bootstrap precomputation per registered slot count (host-only). The rotation
 	// and conjugation keys it needs resolve lazily through autoKeyFor at first use.
 	boot_.clear();
@@ -1661,10 +1671,37 @@ HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& c
 }
 
 HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
-	const auto it = rotKeys_.find(step);
-	if (it != rotKeys_.end()) {
-		// Pre-extracted EvalRotateKeyGen key (keyed by slot step).
-		RotKey& rk		  = it->second;
+	// Slots-aware rotation (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887): normalyzeIndex maps the
+	// logical step to a full-ring rotation given the ct's slot count, then GetRotationKey selects the
+	// actual_index — the registered key whose normalized index is slot-compatible (the alternate-key
+	// search adds multiples of `slots`, which are no-ops on slots-periodic sparse data). OpenFHE's
+	// EvalAtIndex (the old path) used 5^step with slots ignored, so steps > slots/2 picked the wrong key.
+	const int32_t half	= (ringDim_ >= 2) ? static_cast<int32_t>(ringDim_ / 2) : 1;
+	const int32_t slots = (x.slots > 0) ? static_cast<int32_t>(x.slots) : half;
+	// normalyzeIndex(step, slots, N) — Context.cu:1088-1095.
+	int32_t norm = step % slots;
+	if (norm < 0)
+		norm += slots;
+	if (norm > slots / 2)
+		norm += half - slots; // N/2 − slots
+	// GetRotationKey actual_index (Context.cu:562-589): reduce mod N/2, then the slot-compatible search.
+	const int32_t idx		 = ((norm % half) + half) % half;
+	const int32_t* foundStep = nullptr;
+	if (auto hit = rotKeyIndex_.find(idx); hit != rotKeyIndex_.end()) {
+		foundStep = &hit->second;
+	} else if (slots != half) {
+		for (int32_t i = 1; i < half / slots; ++i) {
+			const int32_t idx_ = (idx + i * slots) % half;
+			if (auto alt = rotKeyIndex_.find(idx_); alt != rotKeyIndex_.end()) {
+				foundStep = &alt->second;
+				break;
+			}
+		}
+	}
+	if (foundStep != nullptr) {
+		// Pre-extracted EvalRotateKeyGen key; rk.autoIndex is the OpenFHE automorphism for the
+		// found step, which is the key matching CUDA's 5^(2N − actual_index) for that index.
+		RotKey& rk		  = rotKeys_.at(*foundStep);
 		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
 		const auto base	  = qPrefix(x.towers);
 		LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
@@ -1678,8 +1715,9 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 		res.p		= finishPayload(std::move(out0), std::move(out1), res);
 		return res;
 	}
-	// Fallback (bootstrap rotations and any other keyed step): resolve the automorphism
-	// index on the host and extract the key lazily from the tag's automorphism key map.
+	// Fallback (bootstrap rotations and any step without a registered key): resolve the automorphism
+	// index on the host and extract the key lazily. This path is not slots-aware (kept for full-slot
+	// bootstrap); sparse-bootstrap rotation correctness is Task 05's scope.
 	auto& context			 = hostContext(ctx);
 	const uint32_t autoIndex = context->FindAutomorphismIndex(static_cast<uint32_t>(step));
 	return rotateByAutoIndex(ctx, x, autoIndex);
@@ -1751,32 +1789,49 @@ std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextI
 	return results;
 }
 
-Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	// Port of the CPU rotate+add doubling loop (OpenFheEngine.cpp:357-370) over engine
-	// primitives, via the facade like evalAddMany.
-	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-	for (int i = 0; i < std::log2(slots); i++) {
-		const int rotIdx = stride * (1 << i);
-		auto tmp		 = ctx.EvalRotate(result, rotIdx);
-		ctx.EvalAddInPlace(result, tmp);
+namespace {
+// Radix-4 reduction cascade — CUDA Accumulate / AccumulateCascadeImpl (AccumulateBroadcast.cu:9-113),
+// expressed over facade rotate+add (the CUDA rotate_hoisted/extend/modDown are the hoisting form of the
+// same rotate-then-add; hoisting itself is Task 06 #19). bStep=4 ⇒ logbStep=2: outer s <<= 2 from
+// startFactor, inner adds rot(snapshot, stride*s*k) for k in {1,2,3} while stride*s*k < stride*size.
+// Each step rotates the PRE-STEP snapshot (CUDA rotates ctxt for all indexes before any of the step's
+// adds), unlike the old radix-2 byte-copy of the OpenFHE doubling loop which rotated the running sum.
+void hazeAccumulateCascade(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int size, int stride, int startFactor) {
+	if (startFactor <= 0 || size <= 0)
+		return;
+	for (int s = startFactor; s < size; s <<= 2) {
+		Ciphertext<DCRTPoly> snapshot = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+		for (int idx = stride * s; idx < stride * size && idx < 4 * stride * s; idx += stride * s) {
+			ctx.EvalAddInPlace(ct, ctx.EvalRotate(snapshot, idx));
+		}
 	}
+}
+} // namespace
+
+Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	const size_t ctSlots		= ensureCt(ctx, ct)->slots;
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+	hazeAccumulateCascade(ctx, result, slots, stride, /*startFactor=*/1);
+	// Slots-shrink (CUDA Accumulate AccumulateBroadcast.cu:107-108): when the accumulate spans the
+	// whole packing, the result is a broadcast over `stride` slots. OpenFHE's loop leaves slots intact.
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		result->SetSlots(static_cast<size_t>(stride));
 	return result;
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	for (int i = 0; i < std::log2(slots); i++) {
-		const int rotIdx = stride * (1 << i);
-		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
-		ctx.EvalAddInPlace(ct, tmp);
-	}
+	const size_t ctSlots = ensureCt(ctx, ct)->slots;
+	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/1);
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		ct->SetSlots(static_cast<size_t>(stride));
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
-	for (int s = start; s < slots; s <<= 1) {
-		const int rotIdx = stride * s;
-		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
-		ctx.EvalAddInPlace(ct, tmp);
-	}
+	const size_t ctSlots = ensureCt(ctx, ct)->slots;
+	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/start);
+	// Cascade slots-shrink (AccumulateBroadcast.cu:41-42): result is a broadcast over stride*startFactor.
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		ct->SetSlots(static_cast<size_t>(stride) * static_cast<size_t>(start));
 }
 
 // ---- Bootstrap setup hooks (staged compute lands in a later change) ----
