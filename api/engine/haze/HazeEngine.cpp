@@ -652,16 +652,54 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st == lbcrypto::FIXEDMANUAL) {
 		// OpenFHE AdjustLevelsInPlace: level-align by dropping towers of the fresher operand
-		// (pure truncation — a view change here, no IR).
+		// (pure truncation — a view change here, no IR). FIXEDMANUAL never auto-rescales, so the
+		// depth-fix below is not applied (CUDA does not call adjustForAddOrSub for FIXEDMANUAL).
 		const size_t towers = std::min(a.towers, b.towers);
 		a.towers			= towers;
 		b.towers			= towers;
 		return;
 	}
-	// Port of OpenFHE LeveledSHECKKSRNS::AdjustLevelsAndDepthInPlace (compositeDegree == 1;
-	// one shared implementation for FIXEDAUTO and the FLEXIBLE modes), in towers-space:
-	// OpenFHE level = |Q| − towers; LevelReduceInternal is a view truncation. The "fresher"
-	// operand (more towers / lower level) is adjusted toward the other.
+	if (st == lbcrypto::FIXEDAUTO) {
+		// CUDA Ciphertext::adjustForAddOrSub FIXEDAUTO branch (Ciphertext.cpp:1473-1488): a SIMPLE
+		// depth-fix only — rescale a depth-2 operand or multScalar(1.0)-bump a depth-1 operand so both
+		// reach a common depth — and the level alignment is PURE TRUNCATION in the add/sub tail
+		// (:187-195, dropToLevel@1140 drops the fresher/more-towers operand). NOT OpenFHE's generic
+		// AdjustLevelsAndDepth (the FIXEDAUTO scale tables degenerate to a constant, so its
+		// multScalar(~1/S)+rescale is wasted work that perturbs NSD); that generic path is reserved for
+		// the FLEXIBLE modes below. The depth-adjusted-level comparison mirrors CUDA's
+		// getLevel()-NoiseLevel (getLevel = towers−1, so the −1 cancels): towers − noiseScaleDeg.
+		auto depthFix = [&](Operand& x, const Operand& y) -> bool {
+			const long dlx = static_cast<long>(x.towers) - static_cast<long>(x.noiseScaleDeg);
+			const long dly = static_cast<long>(y.towers) - static_cast<long>(y.noiseScaleDeg);
+			if (dlx > dly) {
+				if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
+					x = rescaleCore(x);
+				} else if (y.noiseScaleDeg == 2 && x.noiseScaleDeg == 1) {
+					x = multScalarCore(x, 1.0);
+				}
+				return true;
+			} else if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
+				x = rescaleCore(x);
+				return true;
+			} else if (x.noiseScaleDeg == 1 && y.noiseScaleDeg == 2) {
+				return false; // ask the caller to adjust the other operand instead (CUDA's swap+retry)
+			}
+			return true;
+		};
+		if (!depthFix(a, b)) {
+			if (!depthFix(b, a)) {
+				throw std::runtime_error("haze backend: FIXEDAUTO add/sub adjust failed to reconcile depth");
+			}
+		}
+		// Tail: pure truncation of the fresher (more-towers) operand to the other's tower count.
+		const size_t towers = std::min(a.towers, b.towers);
+		a.towers			= towers;
+		b.towers			= towers;
+		return;
+	}
+	// FLEXIBLEAUTO / FLEXIBLEAUTOEXT: OpenFHE/CUDA AdjustScaleAndLevel via the generic ciphertext
+	// helper (towers-space; OpenFHE level = |Q| − towers). The "fresher" operand (more towers / lower
+	// level) is adjusted toward the other; equal level only needs a depth bump.
 	if (levelOf(a) < levelOf(b)) {
 		adjustOperandToward(a, b);
 	} else if (levelOf(a) > levelOf(b)) {
@@ -675,7 +713,7 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 	}
 }
 
-void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
+void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt, bool ctRule) {
 	{
 		const size_t c1lvl	 = levelOf(x);
 		const size_t c2lvl	 = levelOf(tgt);
@@ -686,17 +724,28 @@ void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
 				const double scf1 = x.scalingFactor;
 				const double scf2 = tgt.scalingFactor;
 				const double scf  = sfReal_[c1lvl];
-				const double q1	  = modReduceFactor_[x.towers - 1];
-				x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
-				// CUDA does multScalar; dropToLevel(c2lvl+1); THEN rescale (Ciphertext.cpp:1393-1398):
-				// trim the extra top towers FIRST, then rescale the now-correct top tower. OpenFHE / the
-				// old Haze order rescaled first and folded the wrong top tower when operands were >1 level
-				// apart. (q1 still uses the Plaintext-rule modReduceFactor_[x.towers−1]; the Ciphertext-
-				// rule index is #5, a Stage 2 change.)
-				if (c1lvl + 1 < c2lvl) {
-					x.towers -= c2lvl - c1lvl - 1;
+				if (ctRule) {
+					// Ciphertext rule (CUDA Ciphertext::adjustScaleAndLevel, Ciphertext.cpp:1388-1400):
+					// q1 = ModReduceFactor[c2lvl+1] = modReduceFactor_[tgt.towers] (tower-indexed, matches
+					// CUDA param.ModReduceFactor), and TRIM the extra top towers BEFORE rescale (dropToLevel
+					// then rescale) so the correct top tower is folded when operands are >1 level apart.
+					const double q1 = modReduceFactor_[tgt.towers];
+					x				= multScalarCore(x, scf2 * q1 / scf1 / scf);
+					if (c1lvl + 1 < c2lvl) {
+						x.towers -= c2lvl - c1lvl - 1;
+					}
+					x = rescaleCore(x);
+				} else {
+					// Plaintext rule (CUDA Plaintext::adjustScaleAndLevel, Plaintext.cu:119-134): q1 =
+					// ModReduceFactor[c1lvl] = modReduceFactor_[x.towers−1], and rescale BEFORE trim. Kept
+					// only for adjustPtToward (the pt operand), per parity #5.
+					const double q1 = modReduceFactor_[x.towers - 1];
+					x				= multScalarCore(x, scf2 / scf1 * q1 / scf);
+					x				= rescaleCore(x);
+					if (c1lvl + 1 < c2lvl) {
+						x.towers -= c2lvl - c1lvl - 1;
+					}
 				}
-				x				  = rescaleCore(x);
 				x.scalingFactor = tgt.scalingFactor;
 			} else {
 				if (c1lvl + 1 == c2lvl) {
@@ -764,12 +813,13 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	}
 	if (st == lbcrypto::FLEXIBLEAUTO || st == lbcrypto::FLEXIBLEAUTOEXT) {
 		// Plaintext::adjustScaleAndLevel(c.NSD, c.level, c.sf): same generic adjust as
-		// ciphertext operands, including the equal-level depth bump.
+		// ciphertext operands, including the equal-level depth bump. ctRule=false keeps the
+		// Plaintext-rule depth2/depth2 branch1 (parity #5).
 		if (ptOp.towers < ct.towers) {
 			throw std::runtime_error("haze backend: plaintext is encoded deeper than the ciphertext (cannot raise a plaintext)");
 		}
 		if (levelOf(ptOp) < levelOf(ct)) {
-			adjustOperandToward(ptOp, ct);
+			adjustOperandToward(ptOp, ct, /*ctRule=*/false);
 		} else if (ptOp.noiseScaleDeg < ct.noiseScaleDeg) {
 			ptOp = multScalarCore(ptOp, 1.0);
 		} else if (ptOp.noiseScaleDeg > ct.noiseScaleDeg) {
@@ -2245,7 +2295,14 @@ static Ciphertext<DCRTPoly> hazeConvolutionTransform(CryptoContextImpl<DCRTPoly>
 		hazeTreeAccumulate(ctx, blockResults, blockCount);
 	}
 
-	return ctx.Rescale(blockResults[0]);
+	// Exit rescale: only the SPECIAL (mask) path eager-rescales (NSD 2→1) at its end, matching CUDA
+	// SpecialConvolutionTransform's trailing ctxt.rescale() (LinearTransform.cu:648); the regular
+	// ConvolutionTransform has NO exit rescale (LinearTransform.cu:436 just copies). Now that Rescale is
+	// unconditionally eager (parity #3), gating on the mask reproduces both paths' level/NSD exactly —
+	// an unconditional Rescale here would over-drop the regular path a level.
+	if (mask != nullptr)
+		return ctx.Rescale(blockResults[0]);
+	return blockResults[0];
 }
 
 } // namespace
