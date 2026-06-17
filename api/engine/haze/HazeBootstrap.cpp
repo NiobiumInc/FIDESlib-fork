@@ -205,14 +205,19 @@ HazeEngine::Operand HazeEngine::multIntCore(const Operand& x, uint64_t scalar) {
 
 Ciphertext<DCRTPoly> HazeEngine::linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep) {
 	// result = sum_j rot_{bStep*j}( sum_i rot_i(ct) * A[bStep*j + i] ) — identical math to
-	// OpenFHE's hoisted-Ext implementation, with plain rotations (no hoisting in v1).
+	// OpenFHE's hoisted-Ext implementation. #19: the baby steps all rotate the SAME input ct, so
+	// route them through one shared EvalFastRotationPrecompute handle (CUDA hoists the ModUp once
+	// across the baby steps, LinearTransform.cu:301). EvalFastRotation reuses the handle when a
+	// rotation key is registered and is byte-identical to EvalRotate otherwise.
 	const uint32_t slots = static_cast<uint32_t>(a.size());
 	const uint32_t gStep = static_cast<uint32_t>(std::ceil(static_cast<double>(slots) / bStep));
+	const uint32_t m	 = static_cast<uint32_t>(ctx.GetCyclotomicOrder());
 
+	auto precomp = ctx.EvalFastRotationPrecompute(ct);
 	std::vector<Ciphertext<DCRTPoly>> rot(bStep);
 	rot[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
 	for (uint32_t i = 1; i < bStep; ++i) {
-		rot[i] = ctx.EvalRotate(ct, static_cast<int32_t>(i));
+		rot[i] = ctx.EvalFastRotation(ct, static_cast<int32_t>(i), m, precomp);
 	}
 
 	Ciphertext<DCRTPoly> result;
@@ -364,10 +369,16 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 		const uint32_t b = rem ? p.bRem : p.b;
 		const uint32_t numRot = rem ? p.numRotationsRem : p.numRotations;
 
-		// Baby-step rotations (rot_in): plain EvalRotate (hoisted in Task 06).
+		// Baby-step rotations (rot_in): all rotate the SAME stage input `result`, so hoist them
+		// through one shared precompute handle (#19; CUDA hoists ModUp across the CtS/StC baby
+		// steps, CoeffsToSlots.cu:75-151). EvalFastRotation is byte-identical to EvalRotate per
+		// index (per-index ModDown; the giant steps below rotate distinct `inner` values and stay
+		// plain). A registered key reuses the handle; an unregistered (lazy) key falls back.
+		const uint32_t M = static_cast<uint32_t>(ctx.GetCyclotomicOrder());
+		auto precomp	 = ctx.EvalFastRotationPrecompute(result);
 		std::vector<Ciphertext<DCRTPoly>> fastRotation(g);
 		for (uint32_t j = 0; j < g; ++j) {
-			fastRotation[j] = (rot_in[s][j] != 0) ? ctx.EvalRotate(result, rot_in[s][j]) : std::make_shared<CiphertextImpl<DCRTPoly>>(*result);
+			fastRotation[j] = (rot_in[s][j] != 0) ? ctx.EvalFastRotation(result, rot_in[s][j], M, precomp) : std::make_shared<CiphertextImpl<DCRTPoly>>(*result);
 		}
 
 		Ciphertext<DCRTPoly> outer;

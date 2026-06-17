@@ -267,9 +267,35 @@ class HazeEngine final : public Engine {
 		hazebk::LimbChain b;
 		hazebk::LimbChain a;
 	};
+
+	/// @brief Hoisting handle (#19): the input-only prefix of hybridKeyswitch — the per-digit
+	/// ModUp+NTT decomposition of one degree-1 component (c1), in EVAL form over Q∥P. This is the
+	/// shared "ModUp once" of CUDA's rotate_hoisted (Ciphertext.cpp:965 c1.modupInto): it depends
+	/// ONLY on (c1, towers), NOT on any key, so it is computed once and reused across every rotation
+	/// index / key row (the per-key dot product is the cheap part). digitsEval holds numDigits
+	/// blocks of qpTowers limbs; the metadata mirrors the values hybridKeyswitch would recompute.
+	struct HoistedDigits {
+		hazebk::LimbChain digitsEval; // [numDigits * qpTowers] EVAL-form digits over Q∥P
+		size_t towers	= 0;		  // Q-prefix length the decomposition was built at
+		size_t numDigits = 0;
+		size_t qpTowers = 0;		  // towers + |P| (the Q∥P row count per digit)
+		std::vector<uint64_t> qpBase; // Q-prefix ∥ P moduli (the per-op MRP base for step 3)
+	};
+	/// @brief #19 step 1-2: factor the key-independent ModUp/per-digit-NTT prefix of
+	/// hybridKeyswitch out of the per-key work. `numPartQ` is the key's digit count (alpha
+	/// partition is keyed off it); the result is the reusable HoistedDigits handle.
+	HoistedDigits hoistedKeyswitchPrefix(const hazebk::LimbChain& src, size_t towers, size_t numPartQ);
+	/// @brief #19 step 3: per-key dot product of a precomputed HoistedDigits handle against
+	/// `key`, then (ext=false) ModDown(drop P)+NTT to base-Q, or (ext=true, #10) KEEP the
+	/// extended Q∥P basis and SKIP the ModDown (CUDA rotate_hoisted ext=true,
+	/// Ciphertext.cpp:994-998). The returned KsContribution chains are at `digits.towers` Q
+	/// primes (ext=false) or `digits.qpTowers` Q∥P rows in EVAL form (ext=true).
+	KsContribution hybridKeyswitchFromDigits(const HoistedDigits& digits, KsKey& key, bool ext = false);
 	/// @brief Hybrid keyswitch of `src` (degree-1 component, EVAL form, first `towers` Q
 	/// primes) against `key` — same math for relin (ct×ct) and automorphism (rotation)
-	/// keys. Returns the (b, a) contribution in EVAL form at `towers` Q primes.
+	/// keys. Returns the (b, a) contribution in EVAL form at `towers` Q primes. Now a thin
+	/// composition of hoistedKeyswitchPrefix + hybridKeyswitchFromDigits (so relin and
+	/// non-hoisted rotation callers stay byte-identical).
 	KsContribution hybridKeyswitch(const hazebk::LimbChain& src, size_t towers, KsKey& key);
 
 	/// @brief OpenFHE AdjustLevelsAndDepthToOneInPlace: adjustForAddOrSub, then rescale both
@@ -281,6 +307,22 @@ class HazeEngine final : public Engine {
 	/// without a pre-extracted key fall back to FindAutomorphismIndex + the lazy auto-key
 	/// cache (bootstrap rotations).
 	Operand rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step);
+	/// @brief Resolve the slots-aware rotation key + automorphism index for `step` (the
+	/// normalyzeIndex + rotKeyIndex_ alternate-key search from rotateCore, #7). Returns the
+	/// RotKey* and its autoIndex when a pre-extracted key matches (fast-rotation path); returns
+	/// nullptr when the step has no registered key (fast rotation has no host fallback — that is
+	/// the plain-rotate path's job).
+	struct RotKeyResolved {
+		KsKey* key		   = nullptr;
+		uint32_t autoIndex = 0;
+	};
+	RotKeyResolved resolveRotationKey(int32_t step, size_t slots);
+	/// @brief Fast rotation of `x` reusing a precomputed HoistedDigits handle (#19): per index
+	/// it does ONLY the cheap per-key step (hybridKeyswitchFromDigits) + the same c0+ks.b /
+	/// AutomorphMrp assembly as rotateCore, so the result is byte-identical to evalRotate(x,step)
+	/// while the expensive ModUp/NTT decomposition is shared across indexes. Requires a
+	/// pre-extracted key for `step` (resolveRotationKey); throws if absent.
+	Operand fastRotateFromDigits(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step, const HoistedDigits& digits);
 	/// @brief ct×pt with the multPt adjust rules (Ciphertext.cpp:356-421): full polynomial
 	/// MulMrp of both components against the pt chain (never the slot-constant shortcut).
 	Operand multPtCore(const Operand& ct, const hazebk::HazePtPayload& pt);
@@ -338,6 +380,10 @@ class HazeEngine final : public Engine {
 	};
 	std::unordered_map<uint32_t, BootPrecom> boot_;
 	uint64_t plaintextModulus_ = 0;
+	/// @brief Hybrid-keyswitch digit count (cryptoParams->GetNumPartQ()), a context constant
+	/// shared by every relin/rotation key. Captured at loadContext so the hoisting prefix (#19)
+	/// can build the shared digit decomposition without a specific key in hand.
+	size_t numPartQ_ = 0;
 
 	/// @brief Host-only extraction of the OpenFHE bootstrap precomputation for `slots`
 	/// (m_bootPrecomMap fields + Chebyshev config; ExtractBootPrecom).

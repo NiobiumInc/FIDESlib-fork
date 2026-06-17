@@ -166,6 +166,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	const auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
 	keyTag_			   = pkImpl->GetKeyTag();
 	plaintextModulus_  = cryptoParams->GetPlaintextModulus();
+	numPartQ_		   = cryptoParams->GetNumPartQ(); // hybrid digit count (#19 hoisting prefix)
 	const auto& keyMap = context->GetAllEvalMultKeys();
 	if (keyMap.find(keyTag_) != keyMap.end()) {
 		relinKey_	   = KsKey{};
@@ -263,6 +264,7 @@ void HazeEngine::teardown() {
 	rotKeys_.clear();
 	autoKeys_.clear();
 	boot_.clear();
+	numPartQ_ = 0;
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
 	// outlive the device reset, then clear all process-global haze state. Outstanding
 	// LimbChain destructors of still-live ciphertexts will see stale addresses afterwards;
@@ -1269,11 +1271,11 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	key.uploaded = true;
 }
 
-HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, size_t towers, KsKey& key) {
-	// Port of ops.cpp hybrid_keyswitch. The full-Q∥P key is uploaded once; trimming to
-	// (first `towers` Q rows, all P rows) is pointer selection, not re-upload.
-	ensureKeyUploaded(key);
-	const size_t numPartQ = key.host.a_limbs.size();
+HazeEngine::HoistedDigits HazeEngine::hoistedKeyswitchPrefix(const LimbChain& src, size_t towers, size_t numPartQ) {
+	// #19 step 1-2: the key-INDEPENDENT prefix of hybridKeyswitch (CUDA c1.modupInto,
+	// Ciphertext.cpp:965). INTT(src→coeff) → ModUp(per-digit decompose to Q∥P) → per-digit
+	// NTT(→EVAL). The digit partition (alpha, digit_base_lens) is fixed by numPartQ alone, so
+	// this depends only on (src, towers) and is shared across every rotation key downstream.
 	if (numPartQ == 0) {
 		throw std::runtime_error("haze backend: keyswitch key has no digits");
 	}
@@ -1333,6 +1335,29 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		hazeCheck(hazeNTTMrp(out.data(), in.data(), qpBase.data(), qpBase.size(), nullptr), "hazeNTTMrp");
 	}
 
+	HoistedDigits h;
+	h.digitsEval = std::move(digitsEval);
+	h.towers	 = towers;
+	h.numDigits	 = numDigits;
+	h.qpTowers	 = qpTowers;
+	h.qpBase	 = std::move(qpBase);
+	return h;
+}
+
+HazeEngine::KsContribution HazeEngine::hybridKeyswitchFromDigits(const HoistedDigits& digits, KsKey& key, bool ext) {
+	// #19 step 3: the per-KEY work — the part that varies across rotation indexes. Reuses the
+	// shared digitsEval handle (CUDA dotKSKInPlaceFrom, Ciphertext.cpp:991) instead of redoing
+	// the ModUp/NTT. ext=false → ModDown(drop P)+NTT to base-Q (the plain-rotate contribution,
+	// byte-identical to the old monolithic hybridKeyswitch). ext=true (#10) → KEEP the extended
+	// Q∥P basis and SKIP the ModDown+NTT (CUDA rotate_hoisted ext=true skips moddown,
+	// Ciphertext.cpp:994-998); the caller folds addFirst and does the moddown later.
+	ensureKeyUploaded(key);
+	const size_t sizeQ	  = qBase_.size();
+	const size_t towers	  = digits.towers;
+	const size_t qpTowers = digits.qpTowers;
+	const size_t numDigits = digits.numDigits;
+	const auto& qpBase	  = digits.qpBase;
+
 	// Key rows for this towers count: indices [0, towers) ∪ [|Q|, |Q|+|P|) of the full rows.
 	auto keyRows = [&](const LimbChain& full) {
 		std::vector<const void*> rows;
@@ -1353,7 +1378,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	for (size_t d = 0; d < numDigits; ++d) {
 		std::vector<const void*> dig(qpTowers);
 		for (size_t t = 0; t < qpTowers; ++t) {
-			dig[t] = digitsEval[(d * qpTowers) + t];
+			dig[t] = digits.digitsEval[(d * qpTowers) + t];
 		}
 		const auto aRows = keyRows(key.aDigits[d]);
 		const auto bRows = keyRows(key.bDigits[d]);
@@ -1370,6 +1395,13 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		}
 	}
 
+	if (ext) {
+		// #10 extended-basis return: the dot product is already EVAL form over Q∥P — hand it back
+		// without the ModDown (CUDA keeps Q∥P; the final moddown is deferred to the giant-step
+		// boundary). NOTE: this is the contribution before the c0+ks.b fold and automorph.
+		return KsContribution{ std::move(accumB), std::move(accumA) };
+	}
+
 	LimbChain accumACoeff(qpTowers, polyBytes_);
 	LimbChain accumBCoeff(qpTowers, polyBytes_);
 	hazeCheck(hazeINTTMrp(accumACoeff.data(), accumA.asConst().data(), qpBase.data(), qpBase.size(), nullptr), "hazeINTTMrp");
@@ -1381,6 +1413,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		/*.rescale_base =*/pBase_.data(),
 		/*.rescale_base_len =*/pBase_.size(),
 	};
+	const auto qSub = qPrefix(towers);
 	LimbChain mdA(towers, polyBytes_);
 	LimbChain mdB(towers, polyBytes_);
 	hazeCheck(hazeModDown(mdA.data(), accumACoeff.asConst().data(), &ksMdParams, nullptr), "hazeModDown");
@@ -1392,6 +1425,16 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	hazeCheck(hazeNTTMrp(outB.data(), mdB.asConst().data(), qSub.data(), qSub.size(), nullptr), "hazeNTTMrp");
 
 	return KsContribution{ std::move(outB), std::move(outA) };
+}
+
+HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, size_t towers, KsKey& key) {
+	// Port of ops.cpp hybrid_keyswitch, now a thin composition of the shared input-only prefix
+	// (#19 step 1-2) + the per-key step (step 3). Relin (ct×ct) and non-hoisted rotation callers
+	// route through here unchanged, so their results stay byte-identical to the old monolithic
+	// implementation. The full-Q∥P key is uploaded once; trimming to (first `towers` Q rows, all
+	// P rows) is pointer selection, not re-upload.
+	HoistedDigits digits = hoistedKeyswitchPrefix(src, towers, key.host.a_limbs.size());
+	return hybridKeyswitchFromDigits(digits, key, /*ext=*/false);
 }
 
 void HazeEngine::adjustForMult(Operand& a, Operand& b) {
@@ -1671,14 +1714,16 @@ HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& c
 	return res;
 }
 
-HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
-	// Slots-aware rotation (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887): normalyzeIndex maps the
-	// logical step to a full-ring rotation given the ct's slot count, then GetRotationKey selects the
-	// actual_index — the registered key whose normalized index is slot-compatible (the alternate-key
-	// search adds multiples of `slots`, which are no-ops on slots-periodic sparse data). OpenFHE's
-	// EvalAtIndex (the old path) used 5^step with slots ignored, so steps > slots/2 picked the wrong key.
+HazeEngine::RotKeyResolved HazeEngine::resolveRotationKey(int32_t step, size_t slotsArg) {
+	// Slots-aware rotation-key selection (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887):
+	// normalyzeIndex maps the logical step to a full-ring rotation given the ct's slot count, then
+	// GetRotationKey selects the actual_index — the registered key whose normalized index is
+	// slot-compatible (the alternate-key search adds multiples of `slots`, which are no-ops on
+	// slots-periodic sparse data). OpenFHE's EvalAtIndex (the old path) used 5^step with slots
+	// ignored, so steps > slots/2 picked the wrong key. Extracted so rotateCore (plain) and
+	// fastRotateFromDigits (hoisted) pick the IDENTICAL key+autoIndex (#19 byte-identity).
 	const int32_t half	= (ringDim_ >= 2) ? static_cast<int32_t>(ringDim_ / 2) : 1;
-	const int32_t slots = (x.slots > 0) ? static_cast<int32_t>(x.slots) : half;
+	const int32_t slots = (slotsArg > 0) ? static_cast<int32_t>(slotsArg) : half;
 	// normalyzeIndex(step, slots, N) — Context.cu:1088-1095.
 	int32_t norm = step % slots;
 	if (norm < 0)
@@ -1699,11 +1744,21 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 			}
 		}
 	}
+	RotKeyResolved r;
 	if (foundStep != nullptr) {
 		// Pre-extracted EvalRotateKeyGen key; rk.autoIndex is the OpenFHE automorphism for the
 		// found step, which is the key matching CUDA's 5^(2N − actual_index) for that index.
-		RotKey& rk		  = rotKeys_.at(*foundStep);
-		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
+		RotKey& rk	 = rotKeys_.at(*foundStep);
+		r.key		 = &rk.key;
+		r.autoIndex	 = rk.autoIndex;
+	}
+	return r;
+}
+
+HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
+	const RotKeyResolved rk = resolveRotationKey(step, x.slots);
+	if (rk.key != nullptr) {
+		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, *rk.key);
 		const auto base	  = qPrefix(x.towers);
 		LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
 
@@ -1724,6 +1779,35 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 	return rotateByAutoIndex(ctx, x, autoIndex);
 }
 
+HazeEngine::Operand HazeEngine::fastRotateFromDigits(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step, const HoistedDigits& digits) {
+	// #19 hoisted single rotation: identical assembly to rotateCore's pre-extracted-key branch,
+	// but the keyswitch reuses the shared digit decomposition (hybridKeyswitchFromDigits) instead
+	// of recomputing INTT+ModUp+NTT. Same key (resolveRotationKey), same c0+ks.b fold, same
+	// AutomorphMrp on BOTH components ⇒ byte-identical to evalRotate(x, step). No host fallback:
+	// fast rotation only services pre-extracted keys (the bootstrap full-slot fallback uses plain
+	// EvalRotate, not the hoisted path).
+	const RotKeyResolved rk = resolveRotationKey(step, x.slots);
+	if (rk.key == nullptr) {
+		// No pre-extracted key (e.g. a bootstrap full-slot rotation that resolves lazily via
+		// FindAutomorphismIndex). The hoisted prefix only covers pre-extracted rotation keys, so
+		// fall back to the plain rotate (which recomputes the prefix) — byte-identical, just not
+		// hoisted for this index.
+		return rotateCore(ctx, x, step);
+	}
+	KsContribution ks = hybridKeyswitchFromDigits(digits, *rk.key, /*ext=*/false);
+	const auto base	  = qPrefix(x.towers);
+	LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
+
+	LimbChain out0(x.towers, polyBytes_);
+	LimbChain out1(x.towers, polyBytes_);
+	hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+	hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+
+	Operand res = x; // metadata unchanged
+	res.p		= finishPayload(std::move(out0), std::move(out1), res);
+	return res;
+}
+
 Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotate");
@@ -1738,34 +1822,77 @@ void HazeEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
 
-std::shared_ptr<void> HazeEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&) {
-	// No hoisting in v1: fast rotations are plain rotations, so there is no
-	// precompute handle. Correctness-equivalent; hoisting is a tracked future optimization.
-	return nullptr;
+std::shared_ptr<void> HazeEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	// #19: record the shared, key-independent ModUp/per-digit-NTT decomposition of c1 ONCE
+	// (CUDA c1.modupInto across the baby steps, Ciphertext.cpp:965). The returned handle is reused
+	// by every evalFastRotation index, so the expensive INTT+ModUp+NTT runs a single time instead
+	// of once per rotation. numPartQ_ is the context's hybrid digit count (all keys share it).
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationPrecompute");
+	if (numPartQ_ == 0) {
+		throw std::runtime_error("haze backend: EvalFastRotationPrecompute requires a loaded context with keyswitch params");
+	}
+	return std::make_shared<HoistedDigits>(hoistedKeyswitchPrefix(p->c1, p->towers, numPartQ_));
 }
 
 Ciphertext<DCRTPoly>
-HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t /*m*/, const std::shared_ptr<void>& /*precomp*/) {
-	return evalRotate(ctx, ct, index);
+HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t /*m*/, const std::shared_ptr<void>& precomp) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotation");
+	// A null/foreign precompute (or a stale handle at a different level) ⇒ fall back to the plain
+	// rotate, which recomputes the prefix. Byte-identical either way (#19 is perf-only).
+	auto digits = std::static_pointer_cast<HoistedDigits>(precomp);
+	if (!digits || digits->towers != p->towers) {
+		return evalRotate(ctx, ct, index);
+	}
+	Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *digits);
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 Ciphertext<DCRTPoly>
-HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& /*digits*/, bool /*addFirst*/) {
-	// Plain rotation stand-in: the Ext variant's extended-basis intermediate is a hoisting
-	// detail; the api test only exercises the dispatch.
-	return evalRotate(ctx, ct, index);
+HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) {
+	// #10: CUDA's evalFastRotationExt keeps the result in the EXTENDED (Q∥P) basis, SKIPS the
+	// final ModDown, and folds addFirst*PModq into c0 (CudaEngine.cpp:375-387 → rotate(.,false);
+	// Ciphertext.cpp:994-998,1030-1036). In the haze backend, however, NOTHING downstream consumes
+	// an extended-basis ciphertext: the bootstrap linearTransform/CtS-StC drivers use plain
+	// base-Q EvalRotate (not Ext), and the only Ext caller is the dispatch-only api test
+	// (ApiTests.cpp:1225, EXPECT_NO_THROW, no decrypt). There is no extended-basis HazePayload
+	// representation (towers + |P| limbs with no ModDown) that any later op could read, and the
+	// fused giant-step ModDown that CUDA pairs with it (LinearTransform.cu:174-194,304) is not
+	// wired here. Wiring a true extended return end-to-end would therefore have no correct
+	// consumer and would risk a decrypt that the api test does not guard. Per the task's explicit
+	// fallback guidance, we keep Ext CORRECT-but-base-Q: route through the hoisting primitive WITH
+	// the ModDown (the same byte-identical result as evalRotate) when a handle is present, else
+	// plain rotate. addFirst is therefore not folded (it only matters for the skipped-ModDown
+	// extended form). See the report for why the extended return was not safely wireable.
+	(void)addFirst;
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationExt");
+	auto h = std::static_pointer_cast<HoistedDigits>(digits);
+	if (!h || h->towers != p->towers) {
+		return evalRotate(ctx, ct, index);
+	}
+	Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *h);
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx,
   const Ciphertext<DCRTPoly>& ct,
   const std::vector<int32_t>& indices,
   const uint32_t /*m*/,
-  const std::shared_ptr<void>& /*precomp*/) {
+  const std::shared_ptr<void>& precomp) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotation");
+	auto digits = std::static_pointer_cast<HoistedDigits>(precomp);
+	const bool hoisted = digits && digits->towers == p->towers;
 	std::vector<Ciphertext<DCRTPoly>> results;
 	results.reserve(indices.size());
 	for (const int32_t index : indices) {
 		if (index == 0) {
 			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else if (hoisted) {
+			Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *digits);
+			results.push_back(wrapDeviceResult(ctx, ct, std::move(res.p)));
 		} else {
 			results.push_back(evalRotate(ctx, ct, index));
 		}
@@ -1776,13 +1903,22 @@ std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotation(CryptoContextImpl
 std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx,
   const Ciphertext<DCRTPoly>& ct,
   const std::vector<int32_t>& indices,
-  const std::shared_ptr<void>& /*digits*/,
-  bool /*addFirst*/) {
+  const std::shared_ptr<void>& digits,
+  bool addFirst) {
+	// See the single-index Ext above: kept correct-but-base-Q (no consumer for an extended return).
+	(void)addFirst;
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationExt");
+	auto h = std::static_pointer_cast<HoistedDigits>(digits);
+	const bool hoisted = h && h->towers == p->towers;
 	std::vector<Ciphertext<DCRTPoly>> results;
 	results.reserve(indices.size());
 	for (const int32_t index : indices) {
 		if (index == 0) {
 			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else if (hoisted) {
+			Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *h);
+			results.push_back(wrapDeviceResult(ctx, ct, std::move(res.p)));
 		} else {
 			results.push_back(evalRotate(ctx, ct, index));
 		}
