@@ -74,8 +74,9 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 	const auto& precom = precomIt->second;
 
 	BootPrecom bp;
-	bp.slots = slots;
-	bp.isLT	 = (precom->m_paramsEnc.lvlb == 1) && (precom->m_paramsDec.lvlb == 1);
+	bp.slots			= slots;
+	bp.btSlotsEncoding	= precom->BTSlotsEncoding;
+	bp.isLT				= (precom->m_paramsEnc.lvlb == 1) && (precom->m_paramsDec.lvlb == 1);
 	bp.bStep = (precom->m_paramsEnc.g == 0) ? static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<double>(slots)))) : static_cast<uint32_t>(precom->m_paramsEnc.g);
 	bp.correctionFactor = fhe->GetCKKSBootCorrectionFactor();
 
@@ -98,6 +99,30 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 	if (bp.isLT) {
 		bp.u0hatTPre = wrapPts(precom->m_U0hatTPre);
 		bp.u0Pre	 = wrapPts(precom->m_U0Pre);
+	} else {
+		// Multi-stage FFT path (levelBudget != {1,1}): wrap m_U0hatTPreFFT / m_U0PreFFT per
+		// stage and copy the BSGS params, so evalCoeffsToSlotsFFT can iterate the per-stage LT
+		// vectors (Bootstrap.cu:261-296; CoeffsToSlots.cu:75-151). Plaintext shells stay
+		// default-constructed (no parent_context) for the same lifetime reason as above.
+		auto wrapStages = [&](const std::vector<std::vector<lbcrypto::ReadOnlyPlaintext>>& src) {
+			std::vector<std::vector<Plaintext>> out;
+			out.reserve(src.size());
+			for (const auto& stage : src) {
+				out.push_back(wrapPts(stage));
+			}
+			return out;
+		};
+		bp.u0hatTPreFFT = wrapStages(precom->m_U0hatTPreFFT);
+		bp.u0PreFFT		= wrapStages(precom->m_U0PreFFT);
+		auto copyParams = [](const lbcrypto::ckks_boot_params& s) {
+			BootPrecom::FFTParams d;
+			d.lvlb = s.lvlb, d.layersCollapse = s.layersCollapse, d.remCollapse = s.remCollapse;
+			d.numRotations = s.numRotations, d.b = s.b, d.g = s.g;
+			d.numRotationsRem = s.numRotationsRem, d.bRem = s.bRem, d.gRem = s.gRem;
+			return d;
+		};
+		bp.paramsEnc = copyParams(precom->m_paramsEnc);
+		bp.paramsDec = copyParams(precom->m_paramsDec);
 	}
 
 	// Chebyshev configuration by secret-key distribution (mirrors EvalBootstrap's table
@@ -222,6 +247,152 @@ int bootDebugStage() {
 } // namespace
 
 Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
+	// CUDA parity (#9): the Engine-dispatched bootstrap is ALWAYS the ModRaise-first (normal)
+	// variant (FIDESlib::CKKS::Bootstrap, Bootstrap.cu:169) — the precom's BTSlotsEncoding flag
+	// (forwarded from btsfirstboot, default false) only steers OpenFHE's host setup, not the
+	// runtime variant. We select ModRaise-first for BTSlotsEncoding=false (CUDA-matching, the
+	// path the parity oracle also runs) and keep the StC-first port for BTSlotsEncoding=true.
+	auto pIn = ensureCt(ctx, ciphertext);
+	requireComputable(*pIn, "EvalBootstrap");
+	const uint32_t slots = static_cast<uint32_t>(pIn->slots);
+	const auto bpIt		 = boot_.find(slots);
+	if (bpIt == boot_.end()) {
+		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
+	}
+	if (bpIt->second.btSlotsEncoding) {
+		return bootstrapStCFirst(ctx, ciphertext); // BTSlotsEncoding=true (CPU-oracle slim path)
+	}
+	return bootstrapModRaiseFirst(ctx, ciphertext); // BTSlotsEncoding=false (CUDA Engine path)
+}
+
+// Multi-stage FFT CoeffsToSlots / SlotsToCoeffs (levelBudget != {1,1}; #11). Plain-rotation port
+// of OpenFHE EvalCoeffsToSlots / EvalSlotsToCoeffs (ckksrns-fhe.cpp:1885-2200) — mathematically the
+// non-hoisted form of CUDA EvalCoeffsToSlots (CoeffsToSlots.cu:75-151), iterating the per-stage LT
+// vectors. Hoisting is Task 06; here every baby/giant step is a plain EvalRotate.
+Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, uint32_t slots, bool decode) {
+	const BootPrecom& bp = boot_.at(slots);
+	const auto& p		 = decode ? bp.paramsDec : bp.paramsEnc;
+	const auto& A		 = decode ? bp.u0PreFFT : bp.u0hatTPreFFT;
+	const uint32_t M4	 = static_cast<uint32_t>(ringDim_) / 2; // cyclotomicOrder/4 = N/2
+
+	auto reduceRot = [](int32_t index, uint32_t mod) { return static_cast<int32_t>(lbcrypto::ReduceRotation(index, mod)); };
+
+	// Per-stage inner (baby, rot_in) and outer (giant, rot_out) rotation tables — ckksrns-fhe.cpp:1892.
+	std::vector<std::vector<int32_t>> rot_in(p.lvlb), rot_out(p.lvlb);
+	int32_t stop	= -1;
+	int32_t flagRem = 0;
+	if (p.remCollapse != 0) {
+		stop	= 0;
+		flagRem = 1;
+	}
+	for (int32_t s = 0; s < static_cast<int32_t>(p.lvlb); ++s) {
+		rot_in[s].assign(p.g, 0);
+		rot_out[s].assign(p.b, 0);
+	}
+	if (decode) {
+		// EvalSlotsToCoeffs ordering (ckksrns-fhe.cpp:2042+): stage s ascending, scale 1<<(s*layersColl).
+		int32_t offset = static_cast<int32_t>((p.numRotations + 1) / 2) - 1;
+		for (int32_t s = 0; s < static_cast<int32_t>(p.lvlb) - flagRem; ++s) {
+			int32_t scale = (1 << (s * static_cast<int32_t>(p.layersCollapse)));
+			for (uint32_t i = 0; i < p.b; ++i)
+				rot_out[s][i] = reduceRot(scale * static_cast<int32_t>(p.g) * static_cast<int32_t>(i), M4);
+			for (uint32_t j = 0; j < p.g; ++j)
+				rot_in[s][j] = reduceRot(scale * (static_cast<int32_t>(j) - offset), M4);
+		}
+		if (flagRem == 1) {
+			int32_t s	  = static_cast<int32_t>(p.lvlb) - flagRem;
+			int32_t scale = (1 << (s * static_cast<int32_t>(p.layersCollapse)));
+			rot_out[s].assign(p.bRem, 0);
+			rot_in[s].assign(p.gRem, 0);
+			offset = static_cast<int32_t>((p.numRotationsRem + 1) / 2) - 1;
+			for (uint32_t i = 0; i < p.bRem; ++i)
+				rot_out[s][i] = reduceRot(scale * static_cast<int32_t>(p.gRem) * static_cast<int32_t>(i), M4);
+			for (uint32_t j = 0; j < p.gRem; ++j)
+				rot_in[s][j] = reduceRot(scale * (static_cast<int32_t>(j) - offset), M4);
+		}
+	} else {
+		// EvalCoeffsToSlots ordering (ckksrns-fhe.cpp:1909): stage s descending from lvlb-1.
+		int32_t offset = static_cast<int32_t>((p.numRotations + 1) / 2) - 1;
+		for (int32_t s = static_cast<int32_t>(p.lvlb) - 1; s > stop; --s) {
+			int32_t scale = (1 << ((s - flagRem) * static_cast<int32_t>(p.layersCollapse) + static_cast<int32_t>(p.remCollapse)));
+			for (uint32_t i = 0; i < p.b; ++i)
+				rot_out[s][i] = reduceRot(scale * static_cast<int32_t>(p.g) * static_cast<int32_t>(i), M4);
+			for (uint32_t j = 0; j < p.g; ++j)
+				rot_in[s][j] = reduceRot(scale * (static_cast<int32_t>(j) - offset), static_cast<uint32_t>(slots));
+		}
+		if (flagRem == 1) {
+			rot_out[stop].assign(p.bRem, 0);
+			rot_in[stop].assign(p.gRem, 0);
+			offset = static_cast<int32_t>((p.numRotationsRem + 1) / 2) - 1;
+			for (uint32_t i = 0; i < p.bRem; ++i)
+				rot_out[stop][i] = reduceRot(static_cast<int32_t>(p.gRem) * static_cast<int32_t>(i), M4);
+			for (uint32_t j = 0; j < p.gRem; ++j)
+				rot_in[stop][j] = reduceRot(static_cast<int32_t>(j) - offset, static_cast<uint32_t>(slots));
+		}
+	}
+
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+
+	// Iterate the stages in evaluation order: CtS descends s = lvlb-1..stop+1 then remainder@stop;
+	// StC ascends s = 0..lvlb-1. A[stage] is the per-stage plaintext block; OpenFHE's A index runs
+	// 0..lvlb-1 in storage order, matching paramsEnc/Dec's s here (CUDA reverses CtS storage, but
+	// it reads the SAME mathematical stage — we keep OpenFHE's storage order with OpenFHE's pts).
+	std::vector<int32_t> stageOrder;
+	if (decode) {
+		for (int32_t s = 0; s < static_cast<int32_t>(p.lvlb); ++s)
+			stageOrder.push_back(s);
+	} else {
+		for (int32_t s = static_cast<int32_t>(p.lvlb) - 1; s > stop; --s)
+			stageOrder.push_back(s);
+		if (flagRem == 1)
+			stageOrder.push_back(stop);
+	}
+
+	bool first = true;
+	for (int32_t s : stageOrder) {
+		if (!first) {
+			auto pr = devicePayload(result);
+			if (pr->noiseScaleDeg > 1) {
+				Operand r = rescaleCore(asOperand(pr));
+				rebindPayload(*pr, std::move(r.p->c0), std::move(r.p->c1), r);
+			}
+		}
+		first = false;
+
+		const bool rem	 = (flagRem == 1) && ((decode && s == static_cast<int32_t>(p.lvlb) - 1) || (!decode && s == stop));
+		const uint32_t g = rem ? p.gRem : p.g;
+		const uint32_t b = rem ? p.bRem : p.b;
+		const uint32_t numRot = rem ? p.numRotationsRem : p.numRotations;
+
+		// Baby-step rotations (rot_in): plain EvalRotate (hoisted in Task 06).
+		std::vector<Ciphertext<DCRTPoly>> fastRotation(g);
+		for (uint32_t j = 0; j < g; ++j) {
+			fastRotation[j] = (rot_in[s][j] != 0) ? ctx.EvalRotate(result, rot_in[s][j]) : std::make_shared<CiphertextImpl<DCRTPoly>>(*result);
+		}
+
+		Ciphertext<DCRTPoly> outer;
+		for (uint32_t i = 0; i < b; ++i) {
+			const uint32_t G = g * i;
+			Ciphertext<DCRTPoly> inner = ctx.EvalMult(fastRotation[0], const_cast<Plaintext&>(A[s][G]));
+			for (uint32_t j = 1; j < g; ++j) {
+				if ((G + j) != numRot) {
+					auto term = ctx.EvalMult(fastRotation[j], const_cast<Plaintext&>(A[s][G + j]));
+					ctx.EvalAddInPlace(inner, term);
+				}
+			}
+			if (i == 0) {
+				outer = inner;
+			} else {
+				auto rotated = (rot_out[s][i] != 0) ? ctx.EvalRotate(inner, rot_out[s][i]) : inner;
+				ctx.EvalAddInPlace(outer, rotated);
+			}
+		}
+		result = outer;
+	}
+	return result;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
 	// Port of OpenFHE FHECKKSRNS::EvalBootstrapStCFirst (the path the CPU policy's
 	// BTSlotsEncoding=true selects), single iteration, REAL data, sparse packing,
 	// levelBudget {1,1}: deplete -> SlotsToCoeffs -> raise -> CoeffsToSlots -> EvalMod ->
@@ -229,7 +400,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	// clone (the suite's full-level inputs take exactly that path on CPU too).
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDAUTO && st != lbcrypto::FLEXIBLEAUTO && st != lbcrypto::FLEXIBLEAUTOEXT) {
-		notImplemented("EvalBootstrap under FIXEDMANUAL");
+		notImplemented("EvalBootstrapStCFirst under FIXEDMANUAL");
 	}
 
 	auto pIn = ensureCt(ctx, ciphertext);
@@ -238,7 +409,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	const uint32_t slots = static_cast<uint32_t>(pIn->slots);
 	const uint32_t N	 = static_cast<uint32_t>(ringDim_);
 	if (slots == N / 2) {
-		notImplemented("fully-packed EvalBootstrap (slots == N/2)");
+		notImplemented("fully-packed EvalBootstrapStCFirst (slots == N/2)");
 	}
 	const auto bpIt = boot_.find(slots);
 	if (bpIt == boot_.end()) {
@@ -246,7 +417,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	}
 	const BootPrecom& bp = bpIt->second;
 	if (!bp.isLT) {
-		notImplemented("EvalBootstrap with levelBudget != {1,1} (EvalCoeffsToSlots FFT path)");
+		notImplemented("EvalBootstrapStCFirst with levelBudget != {1,1}");
 	}
 
 	// Constants (ckksrns-fhe.cpp:940-954, 64-bit branch).
@@ -254,9 +425,6 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	const double qDouble = static_cast<double>(qBase_.front());
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
-	if (deg > static_cast<int32_t>(bp.correctionFactor)) {
-		throw std::runtime_error("haze backend: bootstrap degree " + std::to_string(deg) + " exceeds the correction factor " + std::to_string(bp.correctionFactor));
-	}
 	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
 	const double pre		  = 1.0 / post;
@@ -438,6 +606,176 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
 	}
 	return ctxtEnc;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
+	// CUDA-matching ModRaise-first (normal) bootstrap: FIDESlib::CKKS::Bootstrap (Bootstrap.cu:169),
+	// the variant CudaEngine::evalBootstrap always runs. Cross-ref OpenFHE FHECKKSRNS::EvalBootstrap
+	// (ckksrns-fhe.cpp:430, BTSlotsEncoding=false branch): ModReduce(NSD-1) -> AdjustCiphertext ->
+	// ModRaise -> scale by pre/(k*N) -> [sparse partial sum] -> ModReduce -> CtS -> +Conjugate ->
+	// approxMod (Chebyshev + double-angle + scalar) -> StC -> [sparse rotate+add] -> *2^correction.
+	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
+	const bool fixedManual = (st == lbcrypto::FIXEDMANUAL);
+
+	auto pIn = ensureCt(ctx, ciphertext);
+	requireComputable(*pIn, "EvalBootstrap");
+
+	const uint32_t slots = static_cast<uint32_t>(pIn->slots);
+	const uint32_t N	 = static_cast<uint32_t>(ringDim_);
+	if (slots == N / 2) {
+		// Fully-packed COMPLEX path (Bootstrap.cu:268-278, ApproxModEval.cu:24-92) needs
+		// MultByMonomial (ctxtEncI = (ct-conj) * X^{3N/2}). haze CAN express this via
+		// hazeRotAutomorphCoeffMrp (mult by X^{-offset} in coeff form, with the X^N=-1 sign flip),
+		// so it is not a hard primitive gap — but the path is untestable in this environment
+		// (slots==N/2==32768 OOMs the in-process simulator, multi-GB), so it is deliberately
+		// deferred rather than shipped unvalidated. The CUDA-correct sequence is the COMPLEX
+		// branch of approxModReduction.
+		notImplemented("fully-packed ModRaise-first EvalBootstrap (slots == N/2): COMPLEX path deferred (untestable in-process)");
+	}
+	const BootPrecom& bp = boot_.at(slots);
+
+	// Constants (Bootstrap.cu:182-210; OpenFHE ckksrns-fhe.cpp:533-547, 64-bit branch).
+	const uint32_t L0	 = static_cast<uint32_t>(qBase_.size());
+	const double qDouble = static_cast<double>(qBase_.front());
+	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
+	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
+	// CUDA leaves the deg>correctionFactor throw commented out (Bootstrap.cu:53-58); match it (#11).
+	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
+	const double post		  = std::pow(2.0, static_cast<double>(deg));
+	const double pre		  = 1.0 / post;
+	const uint64_t scalar	  = static_cast<uint64_t>(std::llround(post));
+
+	const size_t initTowers = pIn->towers;
+
+	auto rescaleHard = [&](Ciphertext<DCRTPoly>& c) {
+		auto p	  = devicePayload(c);
+		Operand r = rescaleCore(asOperand(p));
+		rebindPayload(*p, std::move(r.p->c0), std::move(r.p->c1), r);
+	};
+	auto toDepthOne = [&](Ciphertext<DCRTPoly>& c) {
+		while (devicePayload(c)->noiseScaleDeg > 1)
+			rescaleHard(c);
+	};
+	auto multInt = [&](Ciphertext<DCRTPoly>& c, uint64_t s) {
+		auto p	  = devicePayload(c);
+		Operand r = multIntCore(asOperand(p), s);
+		rebindPayload(*p, std::move(r.p->c0), std::move(r.p->c1), r);
+	};
+
+	Ciphertext<DCRTPoly> raised = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+
+	// ---- ModReduce(NSD-1), then AdjustCiphertext(2^-correction, lvl) (Bootstrap.cu:510-572) ----
+	toDepthOne(raised);
+	if (st == lbcrypto::FIXEDAUTO || fixedManual) {
+		ctx.EvalMultInPlace(raised, std::pow(2.0, -static_cast<double>(correction)));
+		// FIXEDMANUAL rescale gating (#11; Bootstrap.cu:122-125,274-277): under FIXEDMANUAL the
+		// rescale is the explicit ModReduce after the public mult; FIXEDAUTO rescales eagerly too
+		// (parity #3 — haze rescale is unconditional, unlike OpenFHE's technique gate).
+		rescaleHard(raised);
+	} else { // FLEXIBLE* (Bootstrap.cu:428-509 / ckksrns AdjustCiphertext)
+		auto p				   = devicePayload(raised);
+		const uint32_t lvl	   = (st == lbcrypto::FLEXIBLEAUTOEXT) ? 1 : 0;
+		const double targetSF  = sfReal_[lvl];
+		const double sourceSF  = p->scalingFactor;
+		const double modToDrop = modReduceFactor_[p->towers - 1];
+		const double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / sourceSF) * std::pow(2.0, -static_cast<double>(correction));
+		ctx.EvalMultInPlace(raised, adjustmentFactor);
+		rescaleHard(raised);
+		devicePayload(raised)->scalingFactor = targetSF;
+	}
+
+	// ---- RAISE THE MODULUS to Q (Bootstrap.cu:380-710 ModRaise; OpenFHE :592-602) ----
+	{
+		auto p					 = devicePayload(raised);
+		const size_t raiseTowers = L0 - (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0);
+		Operand r				 = modRaiseCore(asOperand(p), raiseTowers);
+		rebindPayload(*p, std::move(r.p->c0), std::move(r.p->c1), r);
+	}
+	if (bootDebugStage() == 1) {
+		return raised;
+	}
+
+	// ---- Scale before CoeffsToSlots (Bootstrap.cu:225,235; OpenFHE :639) ----
+	ctx.EvalMultInPlace(raised, pre * (1.0 / (bp.k * static_cast<double>(N))));
+
+	// ---- Sparse partial sum (Bootstrap.cu sparse Accumulate; OpenFHE :744-746) ----
+	const uint32_t limit = N / (2 * slots);
+	for (uint32_t j = 1; j < limit; j <<= 1) {
+		auto rotated = ctx.EvalRotate(raised, static_cast<int32_t>(j * slots));
+		ctx.EvalAddInPlace(raised, rotated);
+	}
+	// ModReduceInternal before CoeffsToSlots (OpenFHE :756). Unconditional (eager) — CUDA rescale.
+	rescaleHard(raised);
+	if (bootDebugStage() == 2) {
+		return raised;
+	}
+
+	// ---- CoeffsToSlots (Bootstrap.cu:261-265; isLT -> EvalLinearTransform, else FFT) ----
+	Ciphertext<DCRTPoly> ctxtEnc = bp.isLT ? linearTransform(ctx, bp.u0hatTPre, raised, bp.bStep) : evalCoeffsToSlotsFFT(ctx, raised, slots, /*decode=*/false);
+
+	// ctxtEnc += Conjugate(ctxtEnc) (Bootstrap.cu:280-281; OpenFHE :762).
+	{
+		auto pEnc	 = devicePayload(ctxtEnc);
+		Operand conj = rotateByAutoIndex(ctx, asOperand(pEnc), 2 * N - 1);
+		auto conjCt	 = wrapDeviceResult(ctx, ctxtEnc, std::move(conj.p));
+		ctx.EvalAddInPlace(ctxtEnc, conjCt);
+	}
+	// FIXEDMANUAL: drain to depth 1; else rescale only if NSD==2 (Bootstrap.cu:282-283 / OpenFHE :764-773).
+	if (fixedManual) {
+		toDepthOne(ctxtEnc);
+	} else if (devicePayload(ctxtEnc)->noiseScaleDeg == 2) {
+		rescaleHard(ctxtEnc);
+	}
+	if (bootDebugStage() == 3) {
+		return ctxtEnc;
+	}
+
+	// ---- Approximate modular reduction (sparse; ApproxModEval.cu:94-129) ----
+	std::vector<double> coeffs = bp.coefficients;
+	ctx.EvalChebyshevSeriesInPlace(ctxtEnc, coeffs, -1.0, 1.0);
+	if (!fixedManual) {
+		toDepthOne(ctxtEnc); // ModReduceInternal after Chebyshev (OpenFHE :790-791)
+	}
+	{
+		constexpr double twoPi = 2.0 * M_PI;
+		for (int32_t i = 1 - static_cast<int32_t>(bp.numIter); i <= 0; ++i) {
+			const double angleScalar = -std::pow(twoPi, -std::pow(2.0, static_cast<double>(i)));
+			ctx.EvalSquareInPlace(ctxtEnc);
+			auto shifted = ctx.EvalAdd(ctxtEnc, angleScalar);
+			ctx.EvalAddInPlace(ctxtEnc, shifted);
+			ctx.RescaleInPlace(ctxtEnc); // eager (parity #3); FIXEDAUTO no-op on OpenFHE, eager here
+		}
+	}
+	multInt(ctxtEnc, scalar); // scale message back up after Chebyshev (Bootstrap.cu:119 / OpenFHE :798)
+	if (bootDebugStage() == 4) {
+		return ctxtEnc;
+	}
+
+	// ModReduceInternal before SlotsToCoeffs (OpenFHE :814-815). Skipped under FIXEDMANUAL.
+	if (!fixedManual) {
+		toDepthOne(ctxtEnc);
+	}
+
+	// ---- SlotsToCoeffs (Bootstrap.cu:293-296; isLT -> EvalLinearTransform, else FFT) ----
+	Ciphertext<DCRTPoly> ctxtDec = bp.isLT ? linearTransform(ctx, bp.u0Pre, ctxtEnc, bp.bStep) : evalCoeffsToSlotsFFT(ctx, ctxtEnc, slots, /*decode=*/true);
+
+	// Sparse fold (Bootstrap.cu:299-301; OpenFHE :819).
+	{
+		auto rotated = ctx.EvalRotate(ctxtDec, static_cast<int32_t>(slots));
+		ctx.EvalAddInPlace(ctxtDec, rotated);
+	}
+	if (bootDebugStage() == 5) {
+		return ctxtDec;
+	}
+
+	// ---- 64-bit correction scale-back (Bootstrap.cu:304-305; OpenFHE :824-825) ----
+	multInt(ctxtDec, static_cast<uint64_t>(1) << correction);
+
+	// If bootstrapping did not gain levels, return the input clone (OpenFHE :835).
+	if (devicePayload(ctxtDec)->towers <= initTowers) {
+		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	}
+	return ctxtDec;
 }
 
 Ciphertext<DCRTPoly>

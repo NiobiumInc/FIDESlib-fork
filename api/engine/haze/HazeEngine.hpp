@@ -312,10 +312,26 @@ class HazeEngine final : public Engine {
 	struct BootPrecom {
 		uint32_t slots = 0;
 		bool isLT	   = false; // levelBudget {1,1} (the acceptance path)
+		// OpenFHE precom->BTSlotsEncoding (ckksrns-fhe.cpp:125). CUDA's Engine path is ALWAYS
+		// ModRaise-first (Bootstrap.cu:169) and forwards btsfirstboot into this flag (default
+		// false). bootstrapStaged selects the ModRaise-first port when false (CUDA-matching) and
+		// keeps the StC-first port when true (the CPU oracle's BTSlotsEncoding=true configs).
+		bool btSlotsEncoding = false;
 		uint32_t bStep = 0;		// m_dim1 / m_paramsEnc.g; 0 -> ceil(sqrt(slots))
 		uint32_t correctionFactor = 0;
-		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts
-		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts
+		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts (isLT)
+		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts (isLT)
+		// Multi-stage FFT precom (levelBudget != {1,1}, !isLT). Per-stage plaintext vectors
+		// (m_U0hatTPreFFT / m_U0PreFFT) plus the BSGS params (m_paramsEnc / m_paramsDec). The
+		// driver iterates stages with plain EvalRotate (Task 06 hoists). decode (StC) uses Dec.
+		struct FFTParams {
+			uint32_t lvlb = 0, layersCollapse = 0, remCollapse = 0;
+			uint32_t numRotations = 0, b = 0, g = 0;
+			uint32_t numRotationsRem = 0, bRem = 0, gRem = 0;
+		};
+		FFTParams paramsEnc, paramsDec;
+		std::vector<std::vector<Plaintext>> u0hatTPreFFT; // CtS per-stage plaintexts (!isLT)
+		std::vector<std::vector<Plaintext>> u0PreFFT;	  // StC per-stage plaintexts (!isLT)
 		std::vector<double> coefficients; // Chebyshev table for the key distribution
 		double k		 = 0.0;
 		uint32_t numIter = 0; // double-angle iterations
@@ -337,9 +353,19 @@ class HazeEngine final : public Engine {
 	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
 	/// of OpenFHE EvalLinearTransform).
 	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);
-	/// @brief Shared staged bootstrap (sparse path; OpenFHE FHECKKSRNS::EvalBootstrap is
-	/// the oracle).
+	/// @brief Shared staged bootstrap dispatcher. Selects the CUDA-matching ModRaise-first
+	/// variant (Bootstrap.cu:169) when bp.btSlotsEncoding is false — the path the Engine always
+	/// runs — and the StC-first variant (EvalBootstrapStCFirst port) when true.
 	Ciphertext<DCRTPoly> bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief ModRaise-first (normal) bootstrap — CUDA FIDESlib::CKKS::Bootstrap (Bootstrap.cu:169);
+	/// the variant CudaEngine::evalBootstrap always dispatches. Selected for btSlotsEncoding=false.
+	Ciphertext<DCRTPoly> bootstrapModRaiseFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief StC-first (slim) bootstrap — OpenFHE EvalBootstrapStCFirst port; kept for the
+	/// CPU-oracle's btSlotsEncoding=true configs (CUDA never selects this through the Engine).
+	Ciphertext<DCRTPoly> bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief Multi-stage FFT CoeffsToSlots / SlotsToCoeffs driver (levelBudget != {1,1}),
+	/// iterating the per-stage LTstep vectors (CoeffsToSlots.cu:75-151). decode=false → CtS.
+	Ciphertext<DCRTPoly> evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, uint32_t slots, bool decode);
 
 	// ---- Chebyshev Paterson-Stockmeyer cores (parity #12-#15; CUDA src/CKKS/ApproxModEval.cu
 	// + Ciphertext.cpp evalLinearWSumMutable are the spec). ----

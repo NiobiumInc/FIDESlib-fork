@@ -410,12 +410,13 @@ TEST_F(ApiParityTest, EvalRotateAllLevels) {
 	}
 }
 
-// ---- Bootstrap parity (DISABLED) ----
-// EvalBootstrap on GPU vs OpenFHE. DISABLED until the GPU FIXEDAUTO bootstrap precision defect is
-// fixed (the open "Bootstrap FIXEDAUTO" item; see the plan/gpu-results notes) — enabling it now would
-// only re-report that known failure. Drop the DISABLED_ prefix once that fix lands. Bootstrap is
-// heavily approximate, so it compares decrypted values within the bootstrap precision (~1e-2).
-class ApiParityBootstrapTest : public ::testing::Test {
+// ---- Bootstrap parity ----
+// EvalBootstrap on GPU/haze vs the OpenFHE host oracle (LbCc(cc) shares the api context's precom).
+// Bootstrap is heavily approximate, so it compares decrypted values within the bootstrap precision
+// (~1e-2). With the CUDA-matching policy (btsfirstboot forwarded -> BTSlotsEncoding=false) BOTH the
+// api backend and the oracle run the ModRaise-first variant, so they stay in lockstep.
+// Parametrized over levelBudget: {1,1} (isLT single BSGS), {2,2}, {3,3} (multi-stage FFT CtS/StC).
+class ApiParityBootstrapTest : public ::testing::TestWithParam<std::vector<uint32_t>> {
   protected:
 	static constexpr uint32_t kDepth   = 25;
 	static constexpr uint32_t kRingDim = 1u << 16;
@@ -449,13 +450,13 @@ class ApiParityBootstrapTest : public ::testing::Test {
 		cc->Enable(FHE);
 		keys = cc->KeyGen();
 		cc->EvalMultKeyGen(keys.secretKey);
-		cc->EvalBootstrapSetup({ 1, 1 }, { 0, 0 }, kSlots, 11);
+		cc->EvalBootstrapSetup(GetParam(), { 0, 0 }, kSlots, 11);
 		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
 		cc->LoadContext(keys.publicKey);
 	}
 };
 
-TEST_F(ApiParityBootstrapTest, DISABLED_EvalBootstrap) {
+TEST_P(ApiParityBootstrapTest, EvalBootstrap) {
 	auto pt		   = cc->MakeCKKSPackedPlaintext(v1);
 	auto ct		   = cc->Encrypt(pt, keys.publicKey);
 	auto lbCt	   = LbCt(ct);
@@ -464,3 +465,9 @@ TEST_F(ApiParityBootstrapTest, DISABLED_EvalBootstrap) {
 	auto oracle	   = LbCc(cc)->EvalBootstrap(lbCt);
 	ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-2);
 }
+
+INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityBootstrapTest,
+  ::testing::Values(std::vector<uint32_t>{ 1, 1 }, std::vector<uint32_t>{ 2, 2 }, std::vector<uint32_t>{ 3, 3 }),
+  [](const ::testing::TestParamInfo<std::vector<uint32_t>>& info) {
+	  return "lvlb" + std::to_string(info.param[0]) + "_" + std::to_string(info.param[1]);
+  });

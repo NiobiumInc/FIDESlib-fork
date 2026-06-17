@@ -1837,10 +1837,18 @@ void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 
 // ---- Bootstrap setup hooks (staged compute lands in a later change) ----
 
-BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool /*precompute*/, bool /*btsfirstboot*/, int32_t modEvalLevels) const {
-	// Verbatim CPU policy (OpenFheEngine.cpp:400-408): haze's host setup must match the CPU
-	// oracle, including the pre-existing modall-lands-in-BTSlotsEncoding quirk flagged there.
-	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/modEvalLevels != 0, /*modEvalLevels=*/-1 };
+BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool precompute, bool btsfirstboot, int32_t modEvalLevels) const {
+	// CUDA parity (#9): mirror CudaEngine::bootstrapSetupPolicy (CudaEngine.cpp:489-493) —
+	// forward {precompute, btsfirstboot, modEvalLevels} verbatim, instead of the CPU oracle's
+	// hard-coded {true, modall!=0, -1} (OpenFheEngine.cpp:400-408). The Engine-dispatched
+	// CUDA bootstrap (FIDESlib::CKKS::Bootstrap, Bootstrap.cu:169) is ALWAYS ModRaise-first
+	// regardless of this flag; BTSlotsEncoding here only steers OpenFHE's host setup (correction
+	// factor + StC encode level lDec, ckksrns-fhe.cpp:108-216), and for REAL data the precom
+	// LAYOUT is identical either way (the `REAL || !BTSlotsEncoding` guards at :234,257 fire on
+	// REAL). With btsfirstboot=false (the EvalBootstrap default), the OpenFHE host oracle the
+	// parity test compares against also dispatches the normal ModRaise-first EvalBootstrap, so
+	// haze's ModRaise-first port and the oracle stay in lockstep.
+	return BootstrapSetupPolicy{ precompute, btsfirstboot, modEvalLevels };
 }
 
 void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
