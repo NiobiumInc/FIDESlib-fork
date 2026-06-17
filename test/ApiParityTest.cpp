@@ -140,8 +140,10 @@ class ApiParityTest : public ::testing::Test {
 		params.SetScalingTechnique(FIXEDAUTO);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (GetTestBackend() == TestBackend::HAZE) {
 			params.SetBackend(Backend::HAZE);
+			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+		}
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -440,8 +442,10 @@ class ApiParityBootstrapTest : public ::testing::TestWithParam<std::vector<uint3
 		params.SetSecurityLevel(HEStd_NotSet);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (GetTestBackend() == TestBackend::HAZE) {
 			params.SetBackend(Backend::HAZE);
+			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+		}
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

@@ -35,6 +35,16 @@ namespace fideslib {
 /// allocation per RNS limb.
 class HazeEngine final : public Engine {
   public:
+	/// @param reducedNoise  Use the centered (ReducedNoise) FBC variant, matching an OpenFHE
+	///                      reference built with WITH_REDUCED_NOISE — required for bit-exact parity.
+	/// @param montgomery    Record in the Montgomery hardware data format (selects the 4-op
+	///                      SwitchModulus FBC center shape). Only valid against a hardware/transport
+	///                      target; the local simulator rejects Montgomery-form traces.
+	/// Both default off so a bare HazeEngine matches the libhaze defaults; the facade selects them
+	/// from CCParams (SetReducedNoise / SetMontgomery) at GenCryptoContext.
+	explicit HazeEngine(bool reducedNoise = false, bool montgomery = false)
+		: reducedNoise_(reducedNoise), montgomery_(montgomery) {}
+
 	const char* name() const override {
 		return "haze (FHETCH)";
 	}
@@ -447,6 +457,10 @@ class HazeEngine final : public Engine {
 	  const Ciphertext<DCRTPoly>& ct,
 	  std::vector<double>& coeffs,
 	  double a, double b);
+
+	// ---- FBC mode (constructor-selected, forwarded to libhaze at bring-up) ----
+	bool reducedNoise_ = false;
+	bool montgomery_   = false;
 
 	// ---- context state ----
 	bool loaded_	  = false;

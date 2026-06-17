@@ -53,6 +53,15 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	void SetPlaintextAutoload(bool autoload);
 	void SetCiphertextAutoload(bool autoload);
 
+	/// @brief haze backend only: enable the reduced-noise (centered) FBC variant, matching an
+	/// OpenFHE reference built with WITH_REDUCED_NOISE. Required for bit-exact parity on haze;
+	/// off by default. Ignored by the CPU/CUDA backends.
+	void SetReducedNoise(bool enable);
+	/// @brief haze backend only: record in the Montgomery hardware data format, which selects the
+	/// 4-op SwitchModulus-recognizable FBC center shape. Off by default; only valid against a
+	/// hardware/transport target (the local simulator rejects Montgomery-form traces).
+	void SetMontgomery(bool enable);
+
 	// ---- Getters ----
 	SecretKeyDist GetSecretKeyDist() const;
 	uint32_t GetMultiplicativeDepth() const;
@@ -65,6 +74,8 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	SecretKeyDist keyDist	= UNIFORM_TERNARY;
 	bool plaintextAutoload	= false;
 	bool ciphertextAutoload = true;
+	bool reducedNoise		= false;
+	bool montgomery			= false;
 };
 
 } // namespace fideslib

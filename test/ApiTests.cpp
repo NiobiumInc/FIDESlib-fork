@@ -87,8 +87,10 @@ class CKKSTest : public ::testing::Test {
 		params.SetScalingTechnique(FIXEDAUTO);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (GetTestBackend() == TestBackend::HAZE) {
 			params.SetBackend(Backend::HAZE);
+			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+		}
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -671,8 +673,10 @@ class CKKSBootstrapTest : public ::testing::Test {
 		params.SetSecurityLevel(HEStd_NotSet);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (GetTestBackend() == TestBackend::HAZE) {
 			params.SetBackend(Backend::HAZE);
+			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+		}
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -751,8 +755,10 @@ class CKKSFlexBootstrapTest : public ::testing::Test {
 		params.SetSecurityLevel(HEStd_NotSet);
 		if (TestUseCuda())
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (GetTestBackend() == TestBackend::HAZE) {
 			params.SetBackend(Backend::HAZE);
+			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+		}
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

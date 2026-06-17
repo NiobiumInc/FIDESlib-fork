@@ -208,6 +208,14 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	try {
 		hazeCheck(hazeSetProgramInfo("fideslib", "1.0", "FIDESlib HazeEngine"), "hazeSetProgramInfo");
 
+		// FBC mode (constructor-selected), latched at bring-up before the first compute:
+		// reduced-noise selects the centered FBC matching a WITH_REDUCED_NOISE OpenFHE reference
+		// (bit-exact parity); Montgomery selects the 4-op SwitchModulus center shape. Montgomery
+		// is rejected by the local simulator at first compute, so it is only valid against a
+		// hardware/transport target.
+		hazeCheck(hazeSetReducedNoise(reducedNoise_ ? 1 : 0), "hazeSetReducedNoise");
+		hazeCheck(hazeSetMontgomery(montgomery_ ? 1 : 0), "hazeSetMontgomery");
+
 		// Program directory: <FIDESLIB_HAZE_RUNS_DIR | /tmp/fideslib-haze-runs>/<pid>/ctx<N>.
 		// Each flush writes a multi-hundred-MB project dir, so (a) keep it off slow shared
 		// filesystems and (b) clean it up at teardown unless FIDESLIB_HAZE_KEEP_RUNS is set.
