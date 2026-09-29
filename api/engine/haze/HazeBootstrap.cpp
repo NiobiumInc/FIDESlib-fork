@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,7 +32,7 @@ using hazebk::Residency;
 
 void hazeCheck(hazeError_t err, const char* what) {
 	if (err != HAZE_SUCCESS) {
-		OPENFHE_THROW(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
+		throw std::runtime_error(std::string("haze backend: ") + what + " failed: " + hazeGetErrorString(err));
 	}
 }
 
@@ -64,11 +65,11 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 	auto& context = hostContext(ctx);
 	const auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
 	if (!fhe) {
-		OPENFHE_THROW("haze backend: context has no CKKS FHE scheme (EvalBootstrapSetup not run?)");
+		throw std::runtime_error("haze backend: context has no CKKS FHE scheme (EvalBootstrapSetup not run?)");
 	}
 	const auto precomIt = fhe->m_bootPrecomMap.find(slots);
 	if (precomIt == fhe->m_bootPrecomMap.end()) {
-		OPENFHE_THROW("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup before LoadContext)");
+		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup before LoadContext)");
 	}
 	const auto& precom = precomIt->second;
 
@@ -124,19 +125,20 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 
 // ---- device cores ----
 
-HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x) {
-	// OpenFHE raise: only the level-0 limb is used; it is reinterpreted at the full chain
-	// (DCRTPoly(tmp, elementParamsRaised)). Device-side: INTT@{q0} -> hazeBasisConvert
-	// ({q0} -> Q) -> NTT@Q on both components. Metadata (NSD/sf) carries through; the
-	// level becomes 0 (towers = |Q|).
-	const std::vector<uint64_t> base1 = { qBase_.front() };
+HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x, size_t targetTowers) {
+	// OpenFHE raise: only the level-0 limb is used; it is reinterpreted at the raised chain
+	// (DCRTPoly(tmp, elementParamsRaised); FLEXIBLEAUTOEXT pops the extra modulus, hence
+	// the parameterized target). Device-side: INTT@{q0} -> hazeBasisConvert ({q0} -> Q') ->
+	// NTT@Q' on both components. Metadata (NSD/sf) carries through.
+	const std::vector<uint64_t> base1	  = { qBase_.front() };
+	const std::vector<uint64_t> raisedBase = qPrefix(targetTowers);
 	const hazeBasisConvertParams convParams = {
 		/*.src_base =*/base1.data(),
 		/*.src_base_len =*/base1.size(),
-		/*.dst_base =*/qBase_.data(),
-		/*.dst_base_len =*/qBase_.size(),
+		/*.dst_base =*/raisedBase.data(),
+		/*.dst_base_len =*/raisedBase.size(),
 	};
-	const size_t fullTowers = qBase_.size();
+	const size_t fullTowers = targetTowers;
 
 	auto raiseChain = [&](const LimbChain& src) {
 		LimbChain intt(1, polyBytes_);
@@ -144,7 +146,7 @@ HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x) {
 		LimbChain conv(fullTowers, polyBytes_);
 		hazeCheck(hazeBasisConvert(conv.data(), intt.asConst().data(), &convParams, nullptr), "hazeBasisConvert");
 		LimbChain ntt(fullTowers, polyBytes_);
-		hazeCheck(hazeNTTMrp(ntt.data(), conv.asConst().data(), qBase_.data(), qBase_.size(), nullptr), "hazeNTTMrp");
+		hazeCheck(hazeNTTMrp(ntt.data(), conv.asConst().data(), raisedBase.data(), raisedBase.size(), nullptr), "hazeNTTMrp");
 		return ntt;
 	};
 
@@ -226,8 +228,8 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	// scale-back. Like the oracle, an input that would not gain levels is returned as a
 	// clone (the suite's full-level inputs take exactly that path on CPU too).
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	if (st != lbcrypto::FIXEDAUTO) {
-		notImplemented("EvalBootstrap outside FIXEDAUTO");
+	if (st != lbcrypto::FIXEDAUTO && st != lbcrypto::FLEXIBLEAUTO && st != lbcrypto::FLEXIBLEAUTOEXT) {
+		notImplemented("EvalBootstrap under FIXEDMANUAL");
 	}
 
 	auto pIn = ensureCt(ctx, ciphertext);
@@ -241,7 +243,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	}
 	const auto bpIt = boot_.find(slots);
 	if (bpIt == boot_.end()) {
-		OPENFHE_THROW("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
+		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
 	}
 	const BootPrecom& bp = bpIt->second;
 	if (!bp.isLT) {
@@ -254,7 +256,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
 	if (deg > static_cast<int32_t>(bp.correctionFactor)) {
-		OPENFHE_THROW("haze backend: bootstrap degree " + std::to_string(deg) + " exceeds the correction factor " + std::to_string(bp.correctionFactor));
+		throw std::runtime_error("haze backend: bootstrap degree " + std::to_string(deg) + " exceeds the correction factor " + std::to_string(bp.correctionFactor));
 	}
 	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
@@ -291,22 +293,41 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 		rebindPayload(*p, std::move(r.p->c0), std::move(r.p->c1), r);
 	};
 
-	// ---- Dropping unnecessary towers (deplete; ckksrns-fhe.cpp:995-1015) ----
+	// ---- Dropping unnecessary towers (deplete; ckksrns-fhe.cpp:995-1033) ----
 	Ciphertext<DCRTPoly> work = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
-	const size_t expectedLevel = L0 - (/*lvlbDec=*/1 + 2);
+	const size_t expectedLevel = L0 - (/*lvlbDec=*/1 + 2 + (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0));
 	{
 		auto p = devicePayload(work);
 		if ((L0 - p->towers) + (p->noiseScaleDeg - 1) > expectedLevel) {
-			OPENFHE_THROW("haze backend: not enough levels to perform bootstrapping");
+			throw std::runtime_error("haze backend: not enough levels to perform bootstrapping");
 		}
 		toDepthOne(work);
 		p = devicePayload(work);
-		if (L0 - p->towers < expectedLevel) {
-			// LevelReduceInternalInPlace: pure truncation, no IR.
-			const size_t targetTowers = L0 - expectedLevel;
-			p->c0.truncate(targetTowers);
-			p->c1.truncate(targetTowers);
-			p->towers = targetTowers;
+		const size_t ctxtLevel = L0 - p->towers;
+		if (st == lbcrypto::FIXEDAUTO) {
+			if (ctxtLevel < expectedLevel) {
+				// LevelReduceInternalInPlace: pure truncation, no IR.
+				const size_t targetTowers = L0 - expectedLevel;
+				p->c0.truncate(targetTowers);
+				p->c1.truncate(targetTowers);
+				p->towers = targetTowers;
+			}
+		} else if (ctxtLevel < expectedLevel) {
+			// FLEXIBLE deplete (oracle :1016-1029): scale to the expected level's factor,
+			// level-reduce, mod-reduce, then pin the scaling factor.
+			const double scf2 = p->scalingFactor;
+			const double scf1 = sfRealBig_[ctxtLevel - 1 + (p->noiseScaleDeg - 1)];
+			const double scf  = sfReal_[expectedLevel];
+			ctx.EvalMultInPlace(work, scf1 / scf2 / scf);
+			p = devicePayload(work);
+			if ((L0 - p->towers) + (p->noiseScaleDeg - 1) < expectedLevel) {
+				const size_t drop = expectedLevel - ctxtLevel - (p->noiseScaleDeg - 1);
+				p->c0.truncate(p->towers - drop);
+				p->c1.truncate(p->towers - drop);
+				p->towers -= drop;
+			}
+			toDepthOne(work);
+			devicePayload(work)->scalingFactor = scf;
 		}
 	}
 	if (bootDebugStage() == 1) {
@@ -325,13 +346,28 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 
 	// ---- Raising the modulus ----
 	toDepthOne(work); // ModReduceInternalInPlace(NSD-1)
-	// AdjustCiphertext(work, 2^-correction): FIXEDAUTO = public EvalMult + ModReduce
-	// (the modReduce=true default), so the raise is entered at depth 1.
-	ctx.EvalMultInPlace(work, std::pow(2.0, -static_cast<double>(correction)));
-	rescaleHard(work);
+	// AdjustCiphertext(work, 2^-correction, lvl) with the modReduce=true default, so the
+	// raise is entered at depth 1. FIXED modes: public EvalMult by the correction scale.
+	// FLEXIBLE modes (oracle ckksrns-fhe.cpp:2237-2260): scale to the target level's
+	// factor folded with the correction, then pin the scaling factor.
+	if (st == lbcrypto::FIXEDAUTO) {
+		ctx.EvalMultInPlace(work, std::pow(2.0, -static_cast<double>(correction)));
+		rescaleHard(work);
+	} else {
+		auto p				   = devicePayload(work);
+		const uint32_t lvl	   = (st == lbcrypto::FLEXIBLEAUTOEXT) ? 1 : 0;
+		const double targetSF  = sfReal_[lvl];
+		const double sourceSF  = p->scalingFactor;
+		const double modToDrop = modReduceFactor_[p->towers - 1]; // double(q_{towers-1}) under FLEXIBLE
+		const double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / sourceSF) * std::pow(2.0, -static_cast<double>(correction));
+		ctx.EvalMultInPlace(work, adjustmentFactor);
+		rescaleHard(work);
+		devicePayload(work)->scalingFactor = targetSF;
+	}
 	{
-		auto p	  = devicePayload(work);
-		Operand r = modRaiseCore(asOperand(p));
+		auto p					  = devicePayload(work);
+		const size_t raiseTowers  = L0 - (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0);
+		Operand r				  = modRaiseCore(asOperand(p), raiseTowers);
 		rebindPayload(*p, std::move(r.p->c0), std::move(r.p->c1), r);
 	}
 	if (bootDebugStage() == 3) {

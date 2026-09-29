@@ -40,6 +40,13 @@ void masking(CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys, uint32_
 	auto ctFirstHalfOnly = cc->EvalMult(ctData, ptxtFirstHalfMask);
 	auto ctSingleSlot	 = cc->EvalMult(ctData, ptxtSingleSlotMask);
 
+	// Declare every masked result before the first decryption: a record/replay backend
+	// (haze) executes the recorded program once at the first readback (no-op on CPU/CUDA).
+	cc->MarkOutput(ctEvenSlots);
+	cc->MarkOutput(ctOddSlots);
+	cc->MarkOutput(ctFirstHalfOnly);
+	cc->MarkOutput(ctSingleSlot);
+
 	// Decrypt and display.
 	Plaintext result;
 

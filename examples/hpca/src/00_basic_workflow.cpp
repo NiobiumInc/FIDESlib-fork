@@ -212,6 +212,9 @@ int main() {
 		auto cRot2 = cc->EvalRotate(c1, -2);
 		std::cout << "\tcRot1 levels: " << cRot1->GetLevel() << std::endl;
 		std::cout << "\tcRot2 levels: " << cRot2->GetLevel() << std::endl;
+		// Both rotations are read back from one device program: declare them up front.
+		cc->MarkOutput(cRot1);
+		cc->MarkOutput(cRot2);
 
 		// Decrypt the result.
 		Plaintext result;

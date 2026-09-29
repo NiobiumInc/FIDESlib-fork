@@ -168,10 +168,18 @@ class HazeEngine final : public Engine {
 	/// executed is the one-program hard error. Ops whose device operands are all freshly Uploaded
 	/// legitimately start a new program (host-in-the-loop re-encryption) — the caller resets
 	/// executed_ via beginNewProgramIfExecuted() after guarding every operand.
-	void requireComputable(const hazebk::HazePayload& p, const char* op) const;
+	void requireComputable(hazebk::HazePayload& p, const char* op);
 	/// @brief After all operands of an op passed requireComputable while executed_ was set,
 	/// the op starts a legitimately new program over fresh inputs only.
 	void beginNewProgramIfExecuted();
+
+	/// @brief Re-deposit an uploaded chain's shadow before its first use in the current epoch.
+	/// haze's lookup_or_create EXTRACTS an uploaded shadow when the addr has no binding (i.e.
+	/// in any epoch after the H2D that eager-bound it), and the epoch's flush then destroys
+	/// it — so a value H2D'd once would survive exactly one post-flush program of reuse. A
+	/// D2H+H2D round-trip refreshes the shadow and eager-binds the addr in the current epoch,
+	/// keeping uploaded inputs (ciphertexts, plaintexts, key digits) reusable across programs.
+	void refreshChainIfStale(hazebk::LimbChain& ch);
 
 	/// @brief Ensure ct is device-resident (lazy load) and return its payload.
 	std::shared_ptr<hazebk::HazePayload> ensureCt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
@@ -216,10 +224,19 @@ class HazeEngine final : public Engine {
 	/// @brief Exact EvalNegate into a fresh payload: per-limb scalar q_i − 1; metadata
 	/// unchanged (do not copy CUDA's multScalar(-1.0), which bumps NSD).
 	Operand negateCore(const Operand& x);
-	/// @brief OpenFHE AdjustLevelsAndDepthInPlace port (FIXEDAUTO; compositeDegree == 1):
-	/// equalize (level, NSD) of the two views via recorded compute + view truncation.
-	/// FIXEDMANUAL: level-align by truncation only. FLEXIBLE modes: notImplemented.
+	/// @brief OpenFHE AdjustLevelsAndDepthInPlace port (all AUTO modes share one
+	/// implementation; compositeDegree == 1): equalize (level, NSD) of the two views via
+	/// recorded compute + view truncation. FIXEDMANUAL: level-align by truncation only.
 	void adjustForAddOrSub(Operand& a, Operand& b);
+	/// @brief Adjust `x` toward `tgt` (the c1lvl<c2lvl branch body of
+	/// AdjustLevelsAndDepthInPlace). Works on 1-component operands too (morphed
+	/// plaintexts: empty c1 chains are skipped by the cores).
+	void adjustOperandToward(Operand& x, const Operand& tgt);
+	/// @brief GPU Plaintext::adjustPlaintextToCiphertext port: adjust a plaintext operand
+	/// (single chain) toward the ciphertext's (level, NSD, scalingFactor). FIXEDAUTO uses
+	/// the drop/rescale rules from src/CKKS/Plaintext.cu:195-225; FLEXIBLE modes reuse
+	/// adjustOperandToward. Throws when the pt is deeper than the ct (cannot raise).
+	void adjustPtToward(Operand& ptOp, const Operand& ct);
 	/// @brief FIXEDAUTO multScalar precheck (Ciphertext.cpp:761-775): rescale first when
 	/// NSD == 2, then multScalarCore.
 	Operand multScalarWithPrecheck(const Operand& x, double scalar);
@@ -318,7 +335,7 @@ class HazeEngine final : public Engine {
 	// ---- bootstrap cores (HazeBootstrap.cpp) ----
 	/// @brief ModRaise: from the level-0 limb, INTT@{q0} → hazeBasisConvert({q0}→Q) →
 	/// NTT@Q on both components; towers = |Q|, NSD/sf unchanged (OpenFHE raise semantics).
-	Operand modRaiseCore(const Operand& x);
+	Operand modRaiseCore(const Operand& x, size_t targetTowers);
 	/// @brief Integer scalar multiply (OpenFHE MultByIntegerInPlace): scalar mod q_i per
 	/// limb, metadata unchanged.
 	Operand multIntCore(const Operand& x, uint64_t scalar);
@@ -344,6 +361,9 @@ class HazeEngine final : public Engine {
 	std::vector<std::weak_ptr<hazebk::HazePayload>> outputs_;
 	/// @brief The in-flight program has executed (its single flush happened).
 	bool executed_ = false;
+	/// @brief Monotonic epoch counter, bumped at every flush (materialize). Compared against
+	/// LimbChain::epochStamp to decide when an uploaded shadow must be re-deposited.
+	uint64_t epochSeq_ = 0;
 	/// @brief Program directory of this context (cleaned up at teardown unless kept).
 	std::string programDir_;
 
