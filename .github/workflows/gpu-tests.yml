@@ -8,18 +8,15 @@ name: GPU tests
 on:
   pull_request:
     branches: [nb_main]
-    # edited: a stacked pull request retargeted to nb_main gets its checks then.
     # ready_for_review: draft pull requests skip this check until then.
-    types: [opened, synchronize, reopened, ready_for_review, edited]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # An edit that leaves the base alone runs in a group of its own, so it
-  # cannot cancel a run in progress.
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'edited' && !github.event.changes.base && format('-{0}', github.run_id) || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -30,11 +27,8 @@ env:
 jobs:
   gpu:
     name: GPU test suite (RTX PRO 6000)
-    # Each run rents a GPU VM, so drafts and edits that leave the base alone skip it.
-    if: >-
-      github.event_name != 'pull_request' ||
-      (!github.event.pull_request.draft &&
-       (github.event.action != 'edited' || github.event.changes.base))
+    # Each run rents a GPU VM, so draft pull requests skip it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
     timeout-minutes: 150
     steps:
