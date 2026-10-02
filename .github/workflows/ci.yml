@@ -86,9 +86,11 @@ jobs:
           persist-credentials: false
 
       # Only the CUDA components FIDESlib compiles and links against: nvcc, the
-      # runtime and driver API headers and stubs, and libcu++ (cuda/atomic,
-      # cuda/barrier, cuda/pipeline). The keyring package is checked against
-      # its known hash before apt trusts NVIDIA's repository.
+      # runtime and driver API headers and stubs, libcu++ (cuda/atomic,
+      # cuda/barrier, cuda/pipeline), and NCCL, whose header the GPU test suite
+      # includes. NCCL is pinned to its CUDA 13.2 build; the unpinned package
+      # follows the newest CUDA. The keyring package is checked against its
+      # known hash before apt trusts NVIDIA's repository.
       - name: Install CUDA 13.2
         run: |
           curl -fsSLo cuda-keyring.deb \
@@ -97,7 +99,8 @@ jobs:
           sudo dpkg -i cuda-keyring.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-driver-dev-13-2 cuda-cccl-13-2
+            cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-driver-dev-13-2 cuda-cccl-13-2 \
+            libnccl2=2.30.4-1+cuda13.2 libnccl-dev=2.30.4-1+cuda13.2
           "$CUDA_PATH/bin/nvcc" --version | tail -2
           gcc --version | head -1
           cmake --version | head -1
