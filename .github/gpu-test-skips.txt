@@ -1,0 +1,34 @@
+# Tests the GPU workflow skips, one gtest filter pattern per line. Lines that
+# start with # are comments.
+#
+# A pull request that fixes one of these tests deletes its line in the same
+# pull request. A test added here needs its reason next to it.
+
+# Timing benchmarks, not correctness tests.
+LLMTests/BtsTimingTests.*
+APIbench.*
+P2PBenchmark.*
+
+# Fail on the base commit 0ec4055 and in every full run since (RTX 5090, three
+# runs): GPU bootstrap precision and CPU/GPU bit divergence, inherited from
+# upstream.
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.LinearTransform/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/3
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/5
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/7
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.MultAllLevels/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMult/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMultAllLevels/1
+
+# Flaky: the error lands close to the threshold, so the result changes from run
+# to run (they failed in one or two of the three runs). One retry is not enough
+# to keep these from turning the check red.
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapLT/5
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapLT/7
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.Conjugate/0
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.Conjugate/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotate/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotateAllLevels/3

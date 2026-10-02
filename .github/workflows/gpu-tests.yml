@@ -1,0 +1,132 @@
+# Builds FIDESlib with CUDA and runs its GPU test suite on a cloud GPU runner
+# from the gcp-ephemeral pool: one VM per job, deleted afterwards, with no route
+# to the internal network. Tests listed in .github/gpu-test-skips.txt are
+# skipped; any other test that fails twice fails the check.
+
+name: GPU tests
+
+on:
+  pull_request:
+    branches: [nb_main]
+    # edited: a stacked pull request retargeted to nb_main gets its checks then.
+    # ready_for_review: draft pull requests skip this check until then.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # An edit that leaves the base alone runs in a group of its own, so it
+  # cannot cancel a run in progress.
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'edited' && !github.event.changes.base && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+env:
+  # Patched OpenFHE, installed by deps/build.sh when CMake runs with
+  # FIDESLIB_INSTALL_OPENFHE=ON, and cached per OS and compiler.
+  OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
+
+jobs:
+  gpu:
+    name: GPU test suite (RTX PRO 6000)
+    # Each run rents a GPU VM, so drafts and edits that leave the base alone skip it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+       (github.event.action != 'edited' || github.event.changes.base))
+    runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain and GPU
+        id: env
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+          nvcc --version | tail -2
+          gcc --version | head -1
+          cmake --version | head -1
+          . /etc/os-release
+          {
+            echo "cuda=$(nvcc --version | sed -nE 's/.*release ([0-9]+\.[0-9]+).*/\1/p')"
+            echo "cuda_path=$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+            echo "distro=ubuntu${VERSION_ID//./}"
+            echo "toolchain=${ID}${VERSION_ID}-gcc$(gcc -dumpversion)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The GPU test suite includes nccl.h. Install the NCCL build for the
+      # runner's CUDA version from NVIDIA's apt repository, after checking the
+      # keyring package's hash.
+      - name: Install NCCL
+        env:
+          CUDA_VERSION: ${{ steps.env.outputs.cuda }}
+          DISTRO: ${{ steps.env.outputs.distro }}
+        run: |
+          case "$DISTRO" in
+            ubuntu2404) sum=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba ;;
+            ubuntu2204) sum=d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df ;;
+            *) echo "::error::no known hash for NVIDIA's keyring package on $DISTRO"; exit 1 ;;
+          esac
+          curl -fsSLo cuda-keyring.deb \
+            "https://developer.download.nvidia.com/compute/cuda/repos/$DISTRO/x86_64/cuda-keyring_1.1-1_all.deb"
+          echo "$sum  cuda-keyring.deb" | sha256sum -c -
+          sudo dpkg -i cuda-keyring.deb
+          sudo apt-get update
+          suffix="+cuda$CUDA_VERSION"
+          ver=$(apt-cache madison libnccl-dev |
+                awk -v s="$suffix" 'substr($3, length($3) - length(s) + 1) == s { print $3; exit }')
+          if [ -z "$ver" ]; then
+            echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION"
+            exit 1
+          fi
+          sudo apt-get install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
+
+      - name: Restore OpenFHE
+        id: openfhe
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      # FIDESlib resolves ../deps relative to the directory CMake runs in, so
+      # configure from build/.
+      - name: Configure
+        env:
+          CUDA_PATH: ${{ steps.env.outputs.cuda_path }}
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_PATH="$CUDA_PATH" \
+            -DFIDESLIB_ARCH=120-real \
+            -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
+            -DFIDESLIB_INSTALL_OPENFHE=${{ steps.openfhe.outputs.cache-hit == 'true' && 'OFF' || 'ON' }} \
+            -DOPENFHE_INSTALL_PREFIX="$OPENFHE_DIR"
+
+      # Saved before the build and tests, so a failing test does not throw away
+      # a finished OpenFHE build.
+      - name: Save OpenFHE
+        if: steps.openfhe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)" --target fideslib-test
+
+      - name: Test
+        working-directory: build
+        run: ../.github/scripts/run-gpu-suite.sh ./fideslib-test ../.github/gpu-test-skips.txt gpu-results
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gpu-test-reports
+          path: build/gpu-results/
+          retention-days: 14
+          if-no-files-found: ignore
