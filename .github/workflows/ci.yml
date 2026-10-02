@@ -1,0 +1,133 @@
+# Builds FIDESlib and runs the tests that need no GPU, on GitHub-hosted runners.
+# Every pull request gets these checks, forks included: each runner is discarded
+# after its job, and the token can only read the repository.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [nb_main]
+  push:
+    branches: [nb_main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Patched OpenFHE, installed by deps/build.sh when CMake runs with
+  # FIDESLIB_INSTALL_OPENFHE=ON. build.sh pins the OpenFHE tag and the patch,
+  # so those files key the cache. Both jobs build it with the runner's gcc.
+  OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
+
+jobs:
+  cpu:
+    name: CPU build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain versions
+        run: |
+          gcc --version | head -1
+          cmake --version | head -1
+
+      - name: Restore OpenFHE
+        id: openfhe
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-ubuntu-24.04-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      # FIDESlib resolves ../deps relative to the directory CMake runs in, so
+      # configure from build/.
+      - name: Configure
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFIDESLIB_ENABLE_CUDA=OFF \
+            -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
+            -DFIDESLIB_INSTALL_OPENFHE=${{ steps.openfhe.outputs.cache-hit == 'true' && 'OFF' || 'ON' }} \
+            -DOPENFHE_INSTALL_PREFIX="$OPENFHE_DIR"
+
+      # Saved here, before the build and tests, so a failing test does not
+      # throw away a finished OpenFHE build.
+      - name: Save OpenFHE
+        if: steps.openfhe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-ubuntu-24.04-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)" --target fideslib-cpu-test
+
+      - name: Test
+        working-directory: build
+        run: ./fideslib-cpu-test
+
+  cuda-compile:
+    name: CUDA compile (sm_120, no GPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CUDA_PATH: /usr/local/cuda-13.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Only the CUDA components FIDESlib compiles and links against: nvcc, the
+      # runtime and driver API headers and stubs, and libcu++ (cuda/atomic,
+      # cuda/barrier, cuda/pipeline). The keyring package is checked against
+      # its known hash before apt trusts NVIDIA's repository.
+      - name: Install CUDA 13.2
+        run: |
+          curl -fsSLo cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  cuda-keyring.deb" | sha256sum -c -
+          sudo dpkg -i cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-driver-dev-13-2 cuda-cccl-13-2
+          "$CUDA_PATH/bin/nvcc" --version | tail -2
+          gcc --version | head -1
+          cmake --version | head -1
+
+      - name: Restore OpenFHE
+        id: openfhe
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-ubuntu-24.04-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      - name: Configure
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_PATH="$CUDA_PATH" \
+            -DFIDESLIB_ARCH=120-real \
+            -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
+            -DFIDESLIB_INSTALL_OPENFHE=${{ steps.openfhe.outputs.cache-hit == 'true' && 'OFF' || 'ON' }} \
+            -DOPENFHE_INSTALL_PREFIX="$OPENFHE_DIR"
+
+      - name: Save OpenFHE
+        if: steps.openfhe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-ubuntu-24.04-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      # Compiles and links the library and the GPU test suite. Running the
+      # suite needs a GPU, so it runs on a GPU runner instead.
+      - name: Build
+        run: cmake --build build -j "$(nproc)" --target fideslib-test
