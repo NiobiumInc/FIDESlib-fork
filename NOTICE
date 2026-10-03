@@ -2,7 +2,7 @@ THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 ============================================================
 
 Project: FIDESlib-fork
-Generated: 2026-09-30
+Generated: 2026-10-03
 Tool: SCANOSS (snippet detection with License dataset)
 Components: 104
 
@@ -285,10 +285,11 @@ COMPONENT ATTRIBUTIONS
   Source: https://github.com/uscilab/cereal
   PURL: pkg:github/uscilab/cereal
   Copyright:
+    Copyright 2004-2008 Ren   Nyffenegger
+    Copyright 2006 Marcin Kalicinski
+    Copyright 2006-2013 Alexander Chemeris
     Copyright 2013-2022 Randolph Voorhies Shane Grant
-    Copyright (C) 2004-2008 Ren   Nyffenegger
-    Copyright (C) 2015 THL A29 Limited; a Tencent company; and Milo Yip-> All rights reserved->
-    Copyright (c) 2006-2013 Alexander Chemeris
+    Copyright 2015 THL A29 Limited a Tencent company and Milo Yip. All rights reserved
     Copyright (c) 2006; 2007 Marcin Kalicinski
     Copyright (c) 2014; 2017; Randolph Voorhies; Shane Grant; Juan Pedro
     Copyright (c) 2014; Randolph Voorhies; Shane Grant
@@ -497,6 +498,7 @@ COMPONENT ATTRIBUTIONS
   Copyright:
     Copyright 2000-2001 ; University of Notre Dame.
     Copyright 2002-2003 ; Trustees of Indiana University.
+    Copyright 2008 Google Inc
     Copyright 2014 Grav
     Copyright 2014 fqiang
     Copyright 2015-2016 Barrett Adair
@@ -522,6 +524,8 @@ COMPONENT ATTRIBUTIONS
   Source: https://github.com/caps-umu/fideslib
   PURL: pkg:github/caps-umu/fideslib
   Copyright:
+    Copyright 2020 Joe Wong
+    Copyright 2023 Lorenzo Rovida
     Copyright 2025 Universidad de Murcia
     Copyright (c) 2020-2022; NVIDIA CORPORATION.
   License: MIT
@@ -607,6 +611,7 @@ COMPONENT ATTRIBUTIONS
     Copyright 2019 Google LLC. All Rights Reserved
     Copyright 2020 Google Inc. All Rights Reserved
     Copyright 2021 Google Inc. All Rights Reserved
+    Copyright 2024 Google Inc
     Copyright 2005 Google Inc.
     Copyright 2006; Google Inc.
     Copyright 2007; Google Inc.
@@ -695,11 +700,12 @@ COMPONENT ATTRIBUTIONS
   PURL: pkg:nuget/google-testmock
   Copyright:
     Copyright 2005; Google Inc.
+    Copyright 2007; Google Inc.
     Copyright 2008; Google Inc.
   License: BSD-3-Clause
 
   googletest
-  Version: v1.17.0
+  Version: e15c5a5
   Source: https://github.com/google/googletest
   PURL: pkg:github/google/googletest
   Copyright:
@@ -740,13 +746,40 @@ COMPONENT ATTRIBUTIONS
   License: BSD-3-Clause
 
   gperftools
+  Version: a81b2eb
+  Source: https://github.com/alk/gperftools
+  PURL: pkg:github/alk/gperftools
+  Copyright:
+    Copyright 2005 Google Inc
+    Copyright 2008 Google Inc
+    Copyright 2012-2016 Free Software Foundation Inc
+    Copyright 2023 gperftools Contributors
+    Copyright (c) 2000; Google Inc.
+    Copyright (c) 2003; Google Inc.
+    Copyright (c) 2004; Google Inc.
+    Copyright (c) 2007; Google Inc.
+    Copyright (c) 2008-2009; Google Inc.
+    Copyright (c) 2011; Google Inc.
+    Copyright (c) 2013; Google Inc.
+    Copyright (c) 2014; 2024; gperftools Contributors
+    Copyright (c) 2014; gperftools Contributors
+    Copyright (c) 2024; gperftools Contributors
+    Copyright 1994; 1995; 1996; 1999; 2000; 2001; 2002 Free Software
+    Copyright 1994; 1995; 1996; 1999; 2000; 2001; 2002 Free Software Foundation; Inc.
+    Copyright 2009 Google Inc.
+    Copyright 2009 Google Inc. All Rights Reserved.
+  License: BSD-3-Clause
+
+  gperftools
   Version: gperftools-2.17.2
   Source: https://github.com/gperftools/gperftools
   PURL: pkg:github/gperftools/gperftools
   Copyright:
     Copyright 2005 ; Google Inc.
     Copyright 2008 ; Google Inc.
+    Copyright 2012-2016 Free Software Foundation Inc
     Copyright 2014 gperftools Contributors
+    Copyright 2026 gperftools Contributors
     Copyright (c) 2003; Google Inc.
     Copyright (c) 2004; Google Inc.
     Copyright (c) 2006; Google Inc.
@@ -761,27 +794,8 @@ COMPONENT ATTRIBUTIONS
     Copyright (c) 2021; gperftools Contributors
     Copyright (c) 2023; gperftools Contributors
     Copyright (c) 2024; gperftools Contributors
-  License: BSD-3-Clause
-
-  gperftools
-  Version: a81b2eb
-  Source: https://github.com/alk/gperftools
-  PURL: pkg:github/alk/gperftools
-  Copyright:
-    Copyright 2005 Google Inc
-    Copyright 2023 gperftools Contributors
-    Copyright (c) 2000; Google Inc.
-    Copyright (c) 2003; Google Inc.
-    Copyright (c) 2004; Google Inc.
-    Copyright (c) 2007; Google Inc.
-    Copyright (c) 2008-2009; Google Inc.
-    Copyright (c) 2008; Google Inc.
-    Copyright (c) 2011; Google Inc.
-    Copyright (c) 2014; 2024; gperftools Contributors
-    Copyright (c) 2014; gperftools Contributors
-    Copyright (c) 2024; gperftools Contributors
-    Copyright 2009 Google Inc.
-    Copyright 2009 Google Inc. All Rights Reserved.
+    Copyright 1994; 1995; 1996; 1999; 2000; 2001; 2002 Free Software
+    Copyright 1994; 1995; 1996; 1999; 2000; 2001; 2002 Free Software Foundation; Inc.
   License: BSD-3-Clause
 
   gperftools
@@ -968,6 +982,7 @@ COMPONENT ATTRIBUTIONS
     Copyright 1995-1996 Guy Eric Schalnat Group 42  Inc
     Copyright 1995-1998 Eric Young  eay@cryptsoft.com)
     Copyright 1995-2022 Jean-loup Gailly and Mark Adler
+    Copyright 1995-2024 Jean-loup Gailly and Mark Adler
     Copyright 1995-2026 Jean-loup Gailly and Mark Adler
     Copyright 1996-1997 Andreas Dilger
     Copyright 1996-2010 the NASM Authors - All rights reserved
@@ -1008,6 +1023,7 @@ COMPONENT ATTRIBUTIONS
     Copyright 2011 The LibYuv Project Authors. All rights reserved
     Copyright 2013 Brian Eugene Wilson Robert Martin Campbell
     Copyright 2013 Julien Pommier   pommier@modartt.com )
+    Copyright 2014 The Bazel Authors
     Copyright 2015 The Chromium Authors
     Copyright 2015 The Chromium Authors. All rights reserved
     Copyright 2015 Viktor Szathm  ry.  All Rights Reserved.
@@ -1020,9 +1036,12 @@ COMPONENT ATTRIBUTIONS
     Copyright 2017 ; The Android Open Source Project
     Copyright 2017 ; The CRC32C Authors.
     Copyright 2017 Roman Lebedev. All rights reserved
+    Copyright 2019 Yibo Cai
     Copyright 2019 Zenichi Amano
     Copyright 2022 ; Google Inc.
+    Copyright 2022 Google LLC
     Copyright 2023 The Chromium Authors
+    Copyright 2024 The Bazel Authors
     Copyright 2005; Google Inc.
     Copyright 2006; Google Inc.
     Copyright 2016 Ismael Jimenez Martinez
@@ -1034,25 +1053,28 @@ COMPONENT ATTRIBUTIONS
   Source: https://github.com/heterosys/llvm-nightly
   PURL: pkg:github/heterosys/llvm-nightly
   Copyright:
+    Copyright 1992 Henry Spencer. All rights reserved
     Copyright 1997-2019 Intel Corporation
+    Copyright 2002-2009 Michael J. Fromberger
     Copyright 2003-2019 University of Illinois at Urbana-Champaign
     Copyright 2006 Kirill Simonov
-    Copyright 2007-2019 University of Illinois at Urbana-Champaign.
+    Copyright 2007-2018 University of Illinois at Urbana-Champaign
+    Copyright 2007-2019 University of Illinois at Urbana-Champaign
     Copyright 2008 ; Google Inc.
     Copyright 2009-2014 by the contributors listed in CREDITS.TXT
     Copyright 2009-2015 by the contributors listed in CREDITS.TXT
     Copyright 2009-2019 Polly Team
     Copyright 2009-2019 by the contributors listed in CREDITS.TXT
-    Copyright 2010 Apple Inc.
+    Copyright 2010 Apple Inc
     Copyright 2011-2014 by the contributors listed in CREDITS.TXT
     Copyright 2011-2019 by the contributors listed in CREDITS.TXT
     Copyright 2012 ; Noah Spurrier <noah@noah.org>
     Copyright 2013-2014 ; Pexpect development team
+    Copyright 2013-2016 Pexpect development team
     Copyright 2017-2019 by the contributors listed in CREDITS.TXT
-    Copyright 2019 Intel Corporation. All rights reserved.
+    Copyright 2019 Intel Corporation. All rights reserved
     Copyright 2019 Jack O Connor and Samuel Neves
     Copyright COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM; DAMAGES OR OTHER
-    Copyright    2002-2009 Michael J. Fromberger
     Copyright (c) 2010-2015 Benjamin Peterson
     Copyright copyright owner or entity authorized by
   License: Apache-2.0 WITH LLVM-exception
@@ -1062,31 +1084,38 @@ COMPONENT ATTRIBUTIONS
   Source: https://github.com/chapuni/llvm-project
   PURL: pkg:github/chapuni/llvm-project
   Copyright:
+    Copyright 1991 Todd A. Proebsting
+    Copyright 1991 by the Massachusetts Institute of Technology
+    Copyright 1992 Henry Spencer. All rights reserved
+    Copyright 1997-2016 Intel Corporation
     Copyright 1997-2019 Intel Corporation
+    Copyright 2003 University of Illinois at Urbana-Champaign. All rights
+    Copyright 2003-2016 University of Illinois at Urbana-Champaign
     Copyright 2003-2019 University of Illinois at Urbana-Champaign.
-    Copyright 2004 eXtensible Systems; Inc.
+    Copyright 2004 Free Software Foundation Inc
+    Copyright 2004 eXtensible Systems Inc
     Copyright 2006 Kirill Simonov
+    Copyright 2007-2016 University of Illinois at Urbana-Champaign
     Copyright 2007-2019 University of Illinois at Urbana-Champaign.
     Copyright 2008 ; Google Inc.
+    Copyright 2008 Noah Spurrier
     Copyright 2009 The Go Authors. All rights reserved.
     Copyright 2009-2014 by the contributors listed in CREDITS.TXT
     Copyright 2009-2015 by the contributors listed in CREDITS.TXT
+    Copyright 2009-2016 Polly Team
     Copyright 2009-2016 by the contributors listed in CREDITS.TXT
     Copyright 2009-2019 Polly Team
     Copyright 2009-2019 by the contributors listed in CREDITS.TXT
-    Copyright 2010 Apple Inc.
+    Copyright 2010 Apple Inc
     Copyright 2010-2015 Benjamin Peterson
     Copyright 2011-2014 by the contributors listed in CREDITS.TXT
+    Copyright 2011-2016 by the contributors listed in CREDITS.TXT
     Copyright 2011-2019 by the contributors listed in CREDITS.TXT
     Copyright 2012 ; Noah Spurrier <noah@noah.org>
     Copyright 2013-2014 ; Pexpect development team
     Copyright 2017-2019 by the contributors listed in CREDITS.TXT
     Copyright 2019 The LLVM Developers
     Copyright COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM; DAMAGES OR OTHER
-    Copyright (c) 2003-2016 University of Illinois at Urbana-Champaign.
-    Copyright (c) 2007-2016 University of Illinois at Urbana-Champaign.
-    Copyright (c) 2009-2016 Polly Team
-    Copyright (c) 2011-2016 by the contributors listed in CREDITS.TXT
     Copyright copyright patent holders of the
   License: Apache-2.0, Apache-2.0 WITH LLVM-exception, Apache-2.0 WITH LLVM-exception AND NCSA, Apache-2.0 WITH LLVM-exception AND NCSA AND NCSA OR MIT AND NCSA AND MIT, BSD-3-Clause, ISC, MIT, NCSA
 
@@ -1158,6 +1187,7 @@ COMPONENT ATTRIBUTIONS
   Source: https://pypi.org/project/nurikit
   PURL: pkg:pypi/nurikit
   Copyright:
+    Copyright 2017 Google Inc
     Copyright 2007; Google Inc.
   License: Apache-2.0
 
