@@ -1,0 +1,5 @@
+# Timing benchmarks. They measure speed and assert nothing about results, so
+# the GPU workflow never runs them. One gtest filter pattern per line.
+LLMTests/BtsTimingTests.*
+APIbench.*
+P2PBenchmark.*
