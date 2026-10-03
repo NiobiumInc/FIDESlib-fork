@@ -20,8 +20,11 @@ for dir in examples/*/; do
   name=$(basename "$dir")
   [ -f "$dir/CMakeLists.txt" ] || continue
   echo "::group::Example $name"
-  if cmake -S "$dir" -B "$out/$name" -DCMAKE_BUILD_TYPE=Release \
-       -DCMAKE_PREFIX_PATH="$prefix" "$@" &&
+  # The prefix goes through the environment: an example that changes its
+  # compiler after project() makes CMake drop its cache and configure again,
+  # which loses a -DCMAKE_PREFIX_PATH but not the environment variable.
+  if CMAKE_PREFIX_PATH="$prefix" cmake -S "$dir" -B "$out/$name" \
+       -DCMAKE_BUILD_TYPE=Release "$@" &&
      cmake --build "$out/$name" -j "$(nproc)"; then
     built+=("$name")
   else
