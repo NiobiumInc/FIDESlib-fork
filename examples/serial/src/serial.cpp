@@ -33,6 +33,7 @@
 #include <random>
 
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 #include <vector>
 #include <iostream>
 #include <fstream>
@@ -52,7 +53,7 @@ CCParams<CryptoContextCKKSRNS> parameters;
 	parameters.SetRingDim(1 << 12);
 	parameters.SetNumLargeDigits(3);
 	parameters.SetKeySwitchTechnique(HYBRID);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 #if NATIVEINT == 128 && !defined(__EMSCRIPTEN__)
 	ScalingTechnique rescaleTech = FIXEDAUTO;
