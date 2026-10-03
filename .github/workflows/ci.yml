@@ -63,7 +63,7 @@ jobs:
             --jq '.[] | .filename, (.previous_filename // empty)' > changed.txt
           python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt \
             --always .github/workflows/ci.yml .github/scripts/needs_tests.py .github/no-test-paths.txt \
-              .github/scripts/build-examples.sh
+              .github/scripts/build-examples.sh .github/examples-skip.txt
 
   cpu:
     name: CPU build and tests

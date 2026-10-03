@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds every example under examples/ as a standalone CMake project against an
 # installed FIDESlib, the way a user consumes the library, and reports which
-# ones built. Each example is tried even after another fails. Exits 1 when any
-# example fails to configure or build.
+# ones built. Each example is tried even after another fails. Examples listed
+# in .github/examples-skip.txt are reported as skipped, with their reason.
+# Exits 1 when any other example fails to configure or build.
 #
 # Usage: build-examples.sh <FIDESlib install prefix> <build dir> [cmake args...]
 set -uo pipefail
@@ -15,10 +16,26 @@ prefix=$1 out=$2
 shift 2
 mkdir -p "$out"
 
-built=() failed=()
+trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$1"; }
+
+# Example name -> reason, from the skip list.
+declare -A skip_reason=()
+while IFS= read -r line; do
+  name=$(trim "${line%%#*}")
+  [ -n "$name" ] || continue
+  reason=""
+  [[ "$line" == *"#"* ]] && reason=$(trim "${line#*#}")
+  skip_reason[$name]=$reason
+done < .github/examples-skip.txt
+
+built=() failed=() skipped=()
 for dir in examples/*/; do
   name=$(basename "$dir")
   [ -f "$dir/CMakeLists.txt" ] || continue
+  if [ -n "${skip_reason[$name]+set}" ]; then
+    skipped+=("$name")
+    continue
+  fi
   echo "::group::Example $name"
   # The prefix goes through the environment: an example that changes its
   # compiler after project() makes CMake drop its cache and configure again,
@@ -40,6 +57,7 @@ done
   echo "|---|---|"
   for name in "${built[@]}"; do echo "| \`$name\` | built |"; done
   for name in "${failed[@]}"; do echo "| \`$name\` | **failed** |"; done
+  for name in "${skipped[@]}"; do echo "| \`$name\` | skipped: ${skip_reason[$name]} |"; done
 } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
 if [ ${#failed[@]} -gt 0 ]; then
