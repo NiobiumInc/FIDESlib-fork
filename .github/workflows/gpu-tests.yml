@@ -1,7 +1,8 @@
 # Builds FIDESlib with CUDA and runs its GPU test suite on a cloud GPU runner
 # from the gcp-ephemeral pool: one VM per job, deleted afterwards, with no route
-# to the internal network. Tests listed in .github/gpu-test-skips.txt are
-# skipped; any other test that fails twice fails the check.
+# to the internal network. .github/gpu-tests/ lists the tests the check leaves
+# out and why; any other test that fails twice fails the check. The job summary
+# reports what failed, including the flaky tests, which run as a report only.
 
 name: GPU tests
 
@@ -11,6 +12,11 @@ on:
     # ready_for_review: draft pull requests skip this check until then.
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      known_failures:
+        description: Also run the known failures, as a report that never fails the check
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -114,7 +120,12 @@ jobs:
 
       - name: Test
         working-directory: build
-        run: ../.github/scripts/run-gpu-suite.sh ./fideslib-test ../.github/gpu-test-skips.txt gpu-results
+        env:
+          KNOWN_FAILURES: ${{ inputs.known_failures }}
+        run: |
+          args=()
+          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results "${args[@]}"
 
       - name: Upload test reports
         if: always()

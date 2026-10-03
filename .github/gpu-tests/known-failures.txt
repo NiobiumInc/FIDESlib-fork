@@ -1,0 +1,21 @@
+# Tests that fail on the base commit 0ec4055 and in every full run since,
+# inherited from upstream: GPU bootstrap precision and CPU/GPU bit divergence.
+# The check skips them. A manual run with "known_failures" runs them as a
+# report that never fails the check.
+#
+# A pull request that fixes one of these deletes its line in the same pull
+# request. One gtest filter pattern per line.
+
+# GPU bootstrap precision.
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.LinearTransform/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/*
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/3
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/5
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/7
+
+# CPU and GPU results differ bit for bit.
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.MultAllLevels/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMult/1
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMultAllLevels/1
