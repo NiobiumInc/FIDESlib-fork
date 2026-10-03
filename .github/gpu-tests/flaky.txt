@@ -3,14 +3,18 @@
 #
 # ASSERT_ERROR_OK (test/ParametrizedTest.cuh) compares the GPU result with
 # OpenFHE's and allows 2^(4 - p), where p is the precision OpenFHE estimates for
-# its own result in that run. OpenFHE seeds its random generator on every run,
-# so p, and with it the limit, moves from run to run. One gtest filter pattern
-# per line.
+# its own result in that run. OpenFHE seeds its random generator on every run
+# and no test fixes a seed, so p, and with it the limit, moves from run to run.
+# One gtest filter pattern per line.
 
 # LT/3, LT/5 and LT/7 have each failed; LT/3 failed twice in a row on the CI GPU.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapLT/*
-# Conjugate/0, /1 and /2 have each failed.
+# These four families flip with no source change on the base commit and with
+# this fork's changes applied, over repeated runs on an RTX 5090. On the CI GPU,
+# Conjugate/2 passed only on retry and HoistedRotateAllLevels/1 failed twice.
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.AccumAllLevels/*
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.Conjugate/*
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotateAllLevels/*
+OpenFHEInterfaceTests/OpenFHEInterfaceTest.RotateAllLevels/*
 # Failed in one of three full runs on an RTX 5090.
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotate/1
-OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotateAllLevels/3

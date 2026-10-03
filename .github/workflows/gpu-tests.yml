@@ -1,8 +1,9 @@
 # Builds FIDESlib with CUDA and runs its GPU test suite on a cloud GPU runner
 # from the gcp-ephemeral pool: one VM per job, deleted afterwards, with no route
 # to the internal network. .github/gpu-tests/ lists the tests the check leaves
-# out and why; any other test that fails twice fails the check. The job summary
-# reports what failed, including the flaky tests, which run as a report only.
+# out and why; any other test that fails all three attempts fails the check.
+# The job summary reports what failed, including the flaky tests, which run as
+# a report only.
 
 name: GPU tests
 

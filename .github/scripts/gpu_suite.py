@@ -4,9 +4,9 @@
 Three passes, each with its own gtest XML report:
 
 1. Gate: every test except those in benchmarks.txt, known-failures.txt and
-   flaky.txt. A failing test is retried once, because OpenFHE seeds its random
-   generator on every run and a few tests flip with no source change. A test
-   that fails twice fails the check.
+   flaky.txt. A failing test gets up to RETRIES more attempts, because OpenFHE
+   seeds its random generator on every run and a few tests flip with no source
+   change. A test that fails every attempt fails the check.
 2. Flaky: the tests in flaky.txt, as a report that never fails the check.
 3. Known failures, with --known-failures: the tests in known-failures.txt, as a
    report that never fails the check.
@@ -14,8 +14,9 @@ Three passes, each with its own gtest XML report:
 The suite prints too much for a step log, so each pass writes its full output
 to <out>/<pass>.log and the step log keeps only gtest's progress lines. The
 report is Markdown, appended to $GITHUB_STEP_SUMMARY when that is set and
-printed otherwise. Exit status: 0 when no gate test failed twice, 1 when one
-did, and the suite's own status when it crashed before writing its report.
+printed otherwise. Exit status: 0 when no gate test failed every attempt, 1
+when one did, and the suite's own status when it crashed before writing its
+report.
 """
 
 import argparse
@@ -26,6 +27,9 @@ import sys
 import xml.etree.ElementTree as ET
 
 LISTS = ("benchmarks.txt", "known-failures.txt", "flaky.txt")
+
+# Extra attempts for a gate test that fails.
+RETRIES = 2
 
 
 def read_patterns(path):
@@ -128,31 +132,50 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     benchmarks, known, flaky = (read_patterns(os.path.join(args.lists, name)) for name in LISTS)
 
-    # 1. Gate, with one retry of whatever failed.
+    # 1. Gate, with up to RETRIES more attempts for whatever fails.
     gate_status, gate = run(args.binary, "-" + ":".join(benchmarks + known + flaky),
                             os.path.join(args.out, "gate.xml"))
     exit_status = 0
-    retry_status, retry = 0, None
-    failed = []
+    failed = []        # gate tests that failed their first attempt
+    pending = []       # gate tests that have failed every attempt so far
+    attempts = {}      # test -> outcome of each retry
+    last_message = {}  # test -> message of its latest failure
+    retry_rows = []    # (label, results, status) of each retry, for the counts table
     if gate is None:
         print(f"::error::The GPU suite exited {gate_status} without writing its report; it probably crashed.")
         exit_status = gate_status or 1
     else:
         failed = [name for name, (status, _) in gate.items() if status == "failed"]
-        if failed:
-            print("Retrying the failing tests once: " + " ".join(failed), flush=True)
-            retry_status, retry = run(args.binary, ":".join(failed),
-                                      os.path.join(args.out, "gate-retry.xml"))
-        elif gate_status != 0:
+        last_message = {name: gate[name][1] for name in failed}
+        pending = list(failed)
+        for attempt in range(1, RETRIES + 1):
+            if not pending:
+                break
+            print(f"Retry {attempt} of {RETRIES}: " + " ".join(pending), flush=True)
+            status, results = run(args.binary, ":".join(pending),
+                                  os.path.join(args.out, f"gate-retry{attempt}.xml"))
+            retry_rows.append((f"Check, retry {attempt}", results, status))
+            still = []
+            for name in pending:
+                if results is None:
+                    outcome, message = "crashed", ""
+                else:
+                    outcome, message = results.get(name, ("not run", ""))
+                attempts.setdefault(name, []).append(outcome)
+                if outcome == "failed":
+                    last_message[name] = message
+                if outcome != "passed":
+                    still.append(name)
+            pending = still
+        if not failed and gate_status != 0:
             print(f"::error::The GPU suite exited {gate_status} but its report lists no failing test.")
             exit_status = gate_status
 
-    twice = [n for n in failed if retry is None or retry.get(n, ("failed", ""))[0] != "passed"]
-    once = [n for n in failed if n not in twice]
-    for name in once:
+    recovered = [n for n in failed if n not in pending]
+    for name in recovered:
         print(f"::warning::Passed on retry, possibly flaky: {name}")
-    if twice:
-        print("::error::Failed twice: " + " ".join(twice))
+    if pending:
+        print(f"::error::Failed all {RETRIES + 1} attempts: " + " ".join(pending))
         exit_status = 1
 
     # 2 and 3. Report-only passes.
@@ -162,27 +185,25 @@ def main():
 
     lines = ["## GPU test suite", ""]
     if exit_status == 0:
-        lines.append("**Check: passed.** No test outside the lists failed twice.")
-    elif twice:
-        lines.append(f"**Check: failed.** {len(twice)} test(s) failed twice.")
+        lines.append(f"**Check: passed.** No test outside the lists failed all {RETRIES + 1} attempts.")
+    elif pending:
+        lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {RETRIES + 1} attempts.")
     else:
         lines.append("**Check: failed.** The suite did not finish; see the job log.")
     lines += ["", "| Pass | Tests | Passed | Failed | Skipped |", "|---|---:|---:|---:|---:|"]
     lines.append(count_row("Check", gate, gate_status))
-    if failed:
-        lines.append(count_row("Check, retry of failures", retry, retry_status))
+    for label, results, status in retry_rows:
+        lines.append(count_row(label, results, status))
     if flaky_pass:
         lines.append(count_row("Flaky (report only)", flaky_pass[1], flaky_pass[0]))
     if known_pass:
         lines.append(count_row("Known failures (report only)", known_pass[1], known_pass[0]))
 
     if failed:
-        lines += ["", "### Check failures", "", "| Test | First run | Retry | Message |", "|---|---|---|---|"]
+        lines += ["", "### Check failures", "", "| Test | Attempts | Message |", "|---|---|---|"]
         for name in failed:
-            first = gate[name][1]
-            again = retry.get(name, ("not run", "")) if retry is not None else ("crashed", "")
-            message = again[1] if again[0] == "failed" else first
-            lines.append(f"| `{name}` | failed | {again[0]} | {message} |")
+            outcomes = ", ".join(["failed"] + attempts.get(name, []))
+            lines.append(f"| `{name}` | {outcomes} | {last_message[name]} |")
 
     if flaky_pass and flaky_pass[1] is not None:
         flaky_failed = [(n, m) for n, (s, m) in flaky_pass[1].items() if s == "failed"]
