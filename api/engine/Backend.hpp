@@ -10,6 +10,8 @@ namespace fideslib {
 enum class Backend {
 	CPU,  ///< OpenFHE on the host. Always available.
 	CUDA, ///< FIDESlib CUDA implementation. Available iff built with CUDA.
+	HAZE, ///< haze (FHETCH) record/replay backend targeting the Niobium accelerator.
+	      ///< Available iff built with FIDESLIB_ENABLE_HAZE.
 };
 
 class Engine;

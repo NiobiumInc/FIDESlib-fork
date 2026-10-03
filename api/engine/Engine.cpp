@@ -216,6 +216,13 @@ void Engine::recoverHostCiphertext(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRT
 	notImplemented("recoverHostCiphertext");
 }
 
+// No-op default: CPU and CUDA have no record/replay concept, so MarkOutput is a safe no-op on
+// those backends. The haze backend overrides this to register ciphertexts for the final
+// hazeTagOutput+hazeFlush batch in materialize(). The no-op default (rather than a throw) lets
+// callers freely call MarkOutput regardless of backend.
+void Engine::markOutput(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRTPoly>&) {
+}
+
 // ---- Device residency ----
 void Engine::loadContext(CryptoContextImpl<DCRTPoly>&, const PublicKey<DCRTPoly>&) {
 	notImplemented("loadContext");

@@ -140,6 +140,13 @@ class Engine {
 	// level-raising ModRaise).
 	virtual void recoverHostCiphertext(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct);
 
+	/// @brief Declare ct as a program output for record/replay backends (haze). No-op by default.
+	/// CPU and CUDA inherit this no-op default unchanged; haze overrides it to register the
+	/// ciphertext in its outputs_ list so materialize() can hazeTagOutput + hazeFlush all declared
+	/// outputs in one batch. A no-op default (rather than a throw) is the correct choice here:
+	/// MarkOutput is semantically safe on every backend and callers should not need to guard it.
+	virtual void markOutput(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct);
+
 	// ---- Device residency (CUDA-only; the CPU backend implements these as no-ops) ----
 	virtual void loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<DCRTPoly>& publicKey);
 	virtual void loadPlaintext(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt);

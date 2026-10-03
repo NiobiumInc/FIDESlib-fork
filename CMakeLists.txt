@@ -46,6 +46,14 @@ option(FIDESLIB_COMPILE_TESTS "Set ON to compile the FIDESlib test suite." ON)
 # are added as their own FIDESLIB_ENABLE_<backend> flag.
 option(FIDESLIB_ENABLE_CUDA "Build the CUDA backend (CPU/OpenFHE is always available)." ON)
 
+# haze (FHETCH) backend. OFF by default. Requires a built haze tree pointed at by FIDESLIB_HAZE_DIR.
+# HAZE is orthogonal to CUDA — both may be ON simultaneously.
+option(FIDESLIB_ENABLE_HAZE "Enable the haze (FHETCH) backend (Niobium accelerator)." OFF)
+# Path to a built haze tree. When FIDESLIB_ENABLE_HAZE is ON this must point at a directory
+# containing build/libhaze.so and include/ (haze.h, haze_types.h) plus the replay_bridge headers
+# under replay_bridge/include/. Set via -DFIDESLIB_HAZE_DIR=<path>.
+set(FIDESLIB_HAZE_DIR "" CACHE PATH "Path to a built haze tree (contains build/libhaze.so and include/).")
+
 # Export compile commands for debugging.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 
@@ -235,6 +243,11 @@ file(GLOB_RECURSE SOURCE_FILES_API ${API_DIR}/*.cpp)
 if (NOT FIDESLIB_ENABLE_CUDA)
     list(REMOVE_ITEM SOURCE_FILES_API ${API_DIR}/engine/cuda/CudaEngine.cpp)
 endif ()
+# engine/haze/*.cpp are the haze backend; exclude them when haze is not enabled.
+if (NOT FIDESLIB_ENABLE_HAZE)
+    file(GLOB _HAZE_SOURCES ${API_DIR}/engine/haze/*.cpp)
+    list(REMOVE_ITEM SOURCE_FILES_API ${_HAZE_SOURCES})
+endif ()
 file(GLOB_RECURSE HEADER_FILES_PUBLIC ${API_DIR}/*.hpp)
 set_source_files_properties(${HEADER_FILES_PUBLIC} ${SOURCE_FILES_API} PROPERTIES LANGUAGE CXX)
 
@@ -290,6 +303,39 @@ if (FIDESLIB_ENABLE_CUDA)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNCCL")
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -DNCCL")
     endif ()
+endif ()
+
+if (FIDESLIB_ENABLE_HAZE)
+    if (NOT FIDESLIB_HAZE_DIR)
+        message(FATAL_ERROR "FIDESLIB_ENABLE_HAZE=ON but FIDESLIB_HAZE_DIR is not set. "
+                            "Set -DFIDESLIB_HAZE_DIR=<path-to-built-haze-tree>.")
+    endif ()
+
+    # haze artifact layout (from make build MODE=release in the haze tree):
+    #   <FIDESLIB_HAZE_DIR>/build/libhaze.so     — the single shipped shared library;
+    #                                               absorbs libnbfhetch + replay_bridge objects.
+    #   <FIDESLIB_HAZE_DIR>/include/haze/         — haze.h, haze_types.h (core API)
+    #   <FIDESLIB_HAZE_DIR>/replay_bridge/include/ — haze/replay_bridge.h (hazeReplayBridge* ABI)
+    set(_HAZE_SO "${FIDESLIB_HAZE_DIR}/build/libhaze.so")
+    if (NOT EXISTS "${_HAZE_SO}")
+        message(FATAL_ERROR "haze library not found at ${_HAZE_SO}. "
+                            "Build haze first (make build MODE=release in the haze tree) "
+                            "or adjust FIDESLIB_HAZE_DIR.")
+    endif ()
+
+    # Single imported target: libhaze.so absorbs both the core haze API and the
+    # replay_bridge symbols (hazeReplayBridge* are OBJECT-library-absorbed at link time).
+    add_library(haze::haze SHARED IMPORTED GLOBAL)
+    set_target_properties(haze::haze PROPERTIES
+        IMPORTED_LOCATION "${_HAZE_SO}"
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${FIDESLIB_HAZE_DIR}/include;${FIDESLIB_HAZE_DIR}/replay_bridge/include"
+    )
+
+    target_compile_definitions(fideslib PUBLIC FIDESLIB_ENABLE_HAZE)
+    target_link_libraries(fideslib PUBLIC haze::haze)
+
+    message(STATUS "haze (FHETCH) backend enabled: ${_HAZE_SO}")
 endif ()
 
 target_link_options(fideslib PRIVATE -static-libstdc++ -static-libgcc)

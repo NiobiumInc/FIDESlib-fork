@@ -248,6 +248,11 @@ std::vector<iteration_time_t> logistic_regression_inference(std::vector<std::vec
 	cc->Synchronize();
 	auto end_total = std::chrono::high_resolution_clock::now();
 
+	// Declare every inference result an output before the first decrypt: a record/replay
+	// backend (haze) executes the recorded program once at the first readback, so all
+	// results that will be read back must be declared up front (no-op on CPU/CUDA).
+	for (auto& ct : enc_data)
+		cc->MarkOutput(ct);
 	for (size_t i = 0; i < data.size(); ++i) {
 		data[i] = decrypt_data(enc_data[i], k.secretKey, numSlots);
 	}

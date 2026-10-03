@@ -24,3 +24,24 @@ message(STATUS "Using FIDESlib.")
 ############### Link dependencies ###############
 
 find_package(CUDAToolkit)
+
+# haze (FHETCH) backend — re-create the haze::haze imported target when the package
+# was built with FIDESLIB_ENABLE_HAZE=ON. Examples are standalone CMake projects that
+# link the installed static fideslib; they need haze::haze to be resolvable here so
+# libhaze.so propagates through fideslib's PUBLIC link requirements.
+set(FIDESLIB_HAZE_DIR "@FIDESLIB_HAZE_DIR@")
+if(FIDESLIB_HAZE_DIR AND NOT TARGET haze::haze)
+  # haze artifact layout: build/libhaze.so, include/, replay_bridge/include/
+  set(_HAZE_SO "${FIDESLIB_HAZE_DIR}/build/libhaze.so")
+  if(EXISTS "${_HAZE_SO}")
+    add_library(haze::haze SHARED IMPORTED GLOBAL)
+    set_target_properties(haze::haze PROPERTIES
+      IMPORTED_LOCATION "${_HAZE_SO}"
+      INTERFACE_INCLUDE_DIRECTORIES
+          "${FIDESLIB_HAZE_DIR}/include;${FIDESLIB_HAZE_DIR}/replay_bridge/include"
+    )
+  else()
+    message(WARNING "FIDESlib was built with haze support (FIDESLIB_HAZE_DIR=${FIDESLIB_HAZE_DIR}) "
+                    "but libhaze.so was not found at ${_HAZE_SO}.")
+  endif()
+endif()

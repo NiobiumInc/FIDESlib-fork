@@ -5,6 +5,9 @@
 #ifdef FIDESLIB_ENABLE_CUDA
 #include "engine/cuda/CudaEngine.hpp"
 #endif
+#ifdef FIDESLIB_ENABLE_HAZE
+#include "engine/haze/HazeEngine.hpp"
+#endif
 
 #include <stdexcept>
 
@@ -15,6 +18,12 @@ bool IsBackendAvailable(Backend backend) {
 	case Backend::CPU: return true;
 	case Backend::CUDA:
 #ifdef FIDESLIB_ENABLE_CUDA
+		return true;
+#else
+		return false;
+#endif
+	case Backend::HAZE:
+#ifdef FIDESLIB_ENABLE_HAZE
 		return true;
 #else
 		return false;
@@ -31,6 +40,12 @@ std::unique_ptr<Engine> MakeEngine(Backend backend) {
 		return std::make_unique<CudaEngine>();
 #else
 		throw std::runtime_error("CUDA backend not compiled in; rebuild with FIDESLIB_ENABLE_CUDA=ON (i.e. with CUDA).");
+#endif
+	case Backend::HAZE:
+#ifdef FIDESLIB_ENABLE_HAZE
+		return std::make_unique<HazeEngine>();
+#else
+		throw std::runtime_error("haze (FHETCH) backend not compiled in; rebuild with FIDESLIB_ENABLE_HAZE=ON.");
 #endif
 	}
 	throw std::runtime_error("unknown backend");
