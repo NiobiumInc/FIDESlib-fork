@@ -41,7 +41,7 @@ struct HybridKeyswitchLimbs {
 /// Calls GetEvalMultKeyVector(keyTag) to retrieve the key; pk and sk of a keypair
 /// share the same tag, so passing the public key's tag is sufficient.
 ///
-/// @throws (OPENFHE_THROW) with a descriptive message on any failure:
+/// @throws (std::runtime_error) with a descriptive message on any failure:
 ///   - no EvalMult key registered for the tag
 ///   - keyswitch technique is not HYBRID
 ///   - internal shape mismatch (tower count, ring dimension)
@@ -54,7 +54,7 @@ HybridKeyswitchLimbs extractEvalMultKeyLimbs(
 /// Calls GetEvalAutomorphismKeyMapPtr(keyTag) and looks up autoIndex in the map.
 /// pk and sk of a keypair share the same tag.
 ///
-/// @throws (OPENFHE_THROW) with a descriptive message on any failure:
+/// @throws (std::runtime_error) with a descriptive message on any failure:
 ///   - no automorphism key map registered for the tag
 ///   - autoIndex not present in the map
 ///   - keyswitch technique is not HYBRID
