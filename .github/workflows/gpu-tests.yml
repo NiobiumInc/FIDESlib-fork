@@ -160,9 +160,13 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
+      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
+      # unless told otherwise; cuda makes them exercise the CUDA engine, which
+      # is what this job is for. The CPU backend has its own job in ci.yml.
       - name: Test
         working-directory: build
         env:
+          FIDESLIB_TEST_BACKEND: cuda
           KNOWN_FAILURES: ${{ inputs.known_failures }}
         run: |
           args=()
