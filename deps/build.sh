@@ -22,6 +22,11 @@ git apply ../openfhe-1.5.1.patch
 mkdir build
 cd build
 echo "Installing into $1"
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$1" ..
+# OPENFHE_EXTRA_CMAKE_FLAGS: optional extra -D flags. The haze (FHETCH) backend's
+# bit-exact parity requires the oracle built with -DWITH_REDUCED_NOISE=ON (haze's
+# recorder implements that keyswitch/ModDown rounding; see haze's own Makefile, which
+# builds its reference OpenFHE the same way). The default (flag unset) is unchanged
+# and matches what the CUDA backend was verified against.
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$1" ${OPENFHE_EXTRA_CMAKE_FLAGS} ..
 make -j12
 make install -j12
