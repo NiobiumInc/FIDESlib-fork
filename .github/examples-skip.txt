@@ -1,0 +1,4 @@
+# Examples the CI build skips, one directory name under examples/ per line,
+# with the reason after a #. A pull request that fixes one deletes its line.
+
+bert-tiny  # takes OpenFHE's headers from ../../deps/openfhe-install, a path no install step creates, and does not build against the installed package (upstream issue CAPS-UMU/FIDESlib#17)
