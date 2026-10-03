@@ -28,8 +28,47 @@ env:
   OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
 
 jobs:
+  # Lists the pull request's changed files and decides whether the test jobs
+  # need to run (.github/scripts/needs_tests.py). Only an explicit "false"
+  # skips them: if this job fails, they run anyway.
+  changes:
+    name: Decide what to test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "**Tests run:** $EVENT event, not a pull request." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > changed.txt
+          python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt \
+            --always .github/workflows/ci.yml .github/scripts/needs_tests.py .github/no-test-paths.txt
+
   cpu:
     name: CPU build and tests
+    needs: changes
+    # Runs unless the decision is an explicit "false"; a failed decision runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.run != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -95,6 +134,9 @@ jobs:
 
   cuda-compile:
     name: CUDA compile (sm_120, no GPU)
+    needs: changes
+    # Runs unless the decision is an explicit "false"; a failed decision runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.run != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:

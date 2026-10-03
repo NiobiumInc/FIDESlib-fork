@@ -1,0 +1,25 @@
+# Paths whose changes cannot affect a build or a test result. A pull request
+# whose changed files all match these patterns skips the test jobs; any other
+# file runs them. Each workflow also names its own files, which always run it
+# even though they sit under .github/.
+#
+# One pattern per line: a pattern ending in /** matches everything under that
+# directory, any other pattern is a shell glob on the whole path (* also
+# crosses /). Lines that start with # are comments.
+
+# Documentation and licensing.
+*.md
+LICENSE.txt
+NOTICE
+.scanoss-curations.json
+doxygen/**
+
+# Editor, formatter and container setup that CI does not use.
+.gitignore
+.clang-format
+.clang-tidy
+.clangd
+docker/**
+
+# CI configuration. A workflow's own files are listed in that workflow.
+.github/**
