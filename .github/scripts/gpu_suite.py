@@ -43,8 +43,8 @@ def read_patterns(path):
     return patterns
 
 
-def summarize(message):
-    """Shortens a gtest failure message to one table cell."""
+def summarize(message, location=True):
+    """Shortens a gtest message to one table cell, with or without its file:line."""
     lines = [line.strip() for line in message.strip().splitlines() if line.strip()]
     where = ""
     if lines and re.search(r":\d+$", lines[0]):
@@ -52,7 +52,7 @@ def summarize(message):
     text = " ".join(lines)
     if len(text) > 220:
         text = text[:217] + "..."
-    text = f"{where}: {text}" if where else text
+    text = f"{where}: {text}" if where and location else text
     return text.replace("|", "\\|")
 
 
@@ -67,7 +67,9 @@ def parse(report):
                 text = failure.get("message") or failure.text or ""
                 results[name] = ("failed", summarize(text))
             elif case.find("skipped") is not None or case.get("result") == "skipped":
-                results[name] = ("skipped", "")
+                skipped = case.find("skipped")
+                text = "" if skipped is None else (skipped.get("message") or skipped.text or "")
+                results[name] = ("skipped", summarize(text, location=False))
             else:
                 results[name] = ("passed", "")
     return results
@@ -204,6 +206,21 @@ def main():
         for name in failed:
             outcomes = ", ".join(["failed"] + attempts.get(name, []))
             lines.append(f"| `{name}` | {outcomes} | {last_message[name]} |")
+
+    # Tests that call GTEST_SKIP count as passing; list them with their reasons
+    # so a skip that hides a known bug stays visible.
+    self_skipped = {}
+    for name, (status, reason) in (gate or {}).items():
+        if status == "skipped":
+            self_skipped.setdefault(reason or "no reason given", []).append(name)
+    if self_skipped:
+        total = sum(len(names) for names in self_skipped.values())
+        print(f"::notice::{total} tests skipped themselves and count as passing. See the job summary.")
+        lines += ["", "### Skipped by the tests themselves", "",
+                  "The check counts these as passing. Each reason is the test's own GTEST_SKIP message.", "",
+                  "| Reason | Tests |", "|---|---|"]
+        for reason, names in sorted(self_skipped.items(), key=lambda item: -len(item[1])):
+            lines.append(f"| {reason} | " + ", ".join(f"`{n}`" for n in sorted(names)) + " |")
 
     if flaky_pass and flaky_pass[1] is not None:
         flaky_failed = [(n, m) for n, (s, m) in flaky_pass[1].items() if s == "failed"]
