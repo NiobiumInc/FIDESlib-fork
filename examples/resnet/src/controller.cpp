@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 #include <fideslib/Definitions.hpp>
 #include <functional>
 #include <iostream>
@@ -46,7 +47,7 @@ void resnet::generate_context(experiment_settings e) {
 		std::iota(this->devices.begin(), this->devices.end(), 0);
 	}
 
-	parameters.SetBackend(fideslib::Backend::CUDA);
+	parameters.SetBackend(fideslib::BackendFromEnv());
 	parameters.SetSecretKeyDist(e.secret_key_dist);
 	parameters.SetPlaintextAutoload(e.autoload);
 

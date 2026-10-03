@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <vector>
+#include "BackendEnv.hpp"
 
 fideslib::CryptoContext<fideslib::DCRTPoly> cc = nullptr;
 fideslib::KeyPair<fideslib::DCRTPoly> keys;
@@ -45,7 +46,7 @@ uint32_t create_context(bool inference) {
 	params.SetKeySwitchTechnique(fideslib::HYBRID);
 	params.SetSecretKeyDist(sparse_encaps ? fideslib::SPARSE_TERNARY : fideslib::UNIFORM_TERNARY);
 	params.SetNumLargeDigits(digits);
-	params.SetBackend(fideslib::Backend::CUDA);
+	params.SetBackend(fideslib::BackendFromEnv());
 	params.SetMultiplicativeDepth(depth);
 
 	cc = GenCryptoContext(params);

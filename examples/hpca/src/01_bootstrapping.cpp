@@ -1,4 +1,5 @@
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <iostream>
 
@@ -36,7 +37,7 @@ int main() {
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBatchSize(batchSize);
 	// GPU Settings. Devices and autoload configuration.
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

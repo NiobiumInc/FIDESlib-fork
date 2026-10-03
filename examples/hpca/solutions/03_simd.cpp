@@ -1,4 +1,5 @@
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <iomanip>
 #include <iostream>
@@ -195,7 +196,7 @@ int main() {
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBatchSize(batchSize);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

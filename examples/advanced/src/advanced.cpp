@@ -30,6 +30,7 @@
 //==================================================================================
 
 #include "fideslib.hpp"
+#include "BackendEnv.hpp"
 
 #include <chrono>
 
@@ -76,7 +77,7 @@ void AutomaticRescaleDemo(ScalingTechnique scalTech) {
 	parameters.SetScalingModSize(50);
 	parameters.SetScalingTechnique(scalTech);
 	parameters.SetBatchSize(batchSize);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -125,7 +126,7 @@ void ManualRescaleDemo(ScalingTechnique scalTech) {
 	parameters.SetScalingModSize(50);
 	parameters.SetBatchSize(batchSize);
 	parameters.SetScalingTechnique(scalTech);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -189,7 +190,7 @@ void HybridKeySwitchingDemo1() {
 	parameters.SetBatchSize(batchSize);
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -244,7 +245,7 @@ void HybridKeySwitchingDemo2() {
 	parameters.SetBatchSize(batchSize);
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -299,7 +300,7 @@ void FastRotationsDemo1() {
 	parameters.SetBatchSize(batchSize);
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -399,7 +400,7 @@ void FastRotationsDemo2() {
 	// parameters.SetKeySwitchTechnique(BV);
 	parameters.SetFirstModSize(60);
 	parameters.SetDigitSize(digitSize);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 

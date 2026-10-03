@@ -1,4 +1,5 @@
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -371,7 +372,7 @@ int main(int argc, char* argv[]) {
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBatchSize(batchSize);
-	parameters.SetBackend(Backend::CUDA);
+	parameters.SetBackend(BackendFromEnv());
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

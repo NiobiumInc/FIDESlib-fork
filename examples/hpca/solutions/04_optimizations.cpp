@@ -1,4 +1,5 @@
 #include <fideslib.hpp>
+#include "BackendEnv.hpp"
 
 #include <chrono>
 #include <iomanip>
@@ -137,7 +138,7 @@ void sparse_bootstrap() {
 	params.SetKeySwitchTechnique(HYBRID);
 	params.SetNumLargeDigits(dnum);
 	params.SetBatchSize(batchSize);
-	params.SetBackend(Backend::CUDA);
+	params.SetBackend(BackendFromEnv());
 	params.SetCiphertextAutoload(true);
 
 	// ========
@@ -206,7 +207,7 @@ void uniform_bootstrap() {
 	params.SetKeySwitchTechnique(HYBRID);
 	params.SetNumLargeDigits(dnum);
 	params.SetBatchSize(batchSize);
-	params.SetBackend(Backend::CUDA);
+	params.SetBackend(BackendFromEnv());
 	params.SetCiphertextAutoload(true);
 
 	// ========
@@ -276,7 +277,7 @@ int main() {
 		parameters.SetKeySwitchTechnique(HYBRID);
 		parameters.SetNumLargeDigits(dnum);
 		parameters.SetBatchSize(batchSize);
-		parameters.SetBackend(Backend::CUDA);
+		parameters.SetBackend(BackendFromEnv());
 		parameters.SetPlaintextAutoload(false);
 		parameters.SetCiphertextAutoload(true);
 
