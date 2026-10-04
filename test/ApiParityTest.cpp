@@ -236,6 +236,29 @@ TEST_F(ApiParityTest, EvalRotate) {
 	ExpectApproxEq(got, oracle);
 }
 
+TEST_F(ApiParityTest, EvalRotateSlotsAware) {
+	// Rotate an 8-slot ciphertext by 5/6/7 — steps > slots/2 — to lock the slots-aware rotation
+	// (parity #7: normalyzeIndex + the actual_index/alternate-key selection) to CUDA/OpenFHE. The
+	// EvalRotate case above rotates by 1, where normalyzeIndex is the identity and the gap is hidden.
+	// One program per context: declare all rotations as outputs before any readback.
+	auto a1	 = EncryptV1();
+	auto lb1 = LbCt(a1);
+	const std::vector<int> steps = { 5, 6, 7 };
+	std::vector<Ciphertext<DCRTPoly>> rots;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> oracles;
+	for (int s : steps) {
+		auto r = cc->EvalRotate(a1, s);
+		cc->MarkOutput(r);
+		rots.push_back(r);
+		oracles.push_back(LbCc(cc)->EvalRotate(lb1, s));
+	}
+	for (size_t i = 0; i < steps.size(); ++i) {
+		SCOPED_TRACE("rotate by " + std::to_string(steps[i]));
+		auto got = HostCt(cc, rots[i]);
+		ExpectSlotsNear(cc, keys.secretKey, got, oracles[i], kSlots, 1e-5);
+	}
+}
+
 TEST_F(ApiParityTest, EvalAddPlaintext) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);

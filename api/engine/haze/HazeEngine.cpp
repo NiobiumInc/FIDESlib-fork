@@ -182,6 +182,16 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, rk.autoIndex);
 		rotKeys_.emplace(step, std::move(rk));
 	}
+	// Index the registered keys by CUDA's normalized rotation index ((step mod N/2), positive),
+	// so rotateCore can replicate GetRotationKey's slots-aware actual_index selection (#7).
+	rotKeyIndex_.clear();
+	if (ringDim_ >= 2) {
+		const int32_t half = static_cast<int32_t>(ringDim_ / 2);
+		for (const auto& [step, rk] : rotKeys_) {
+			const int32_t idx = ((step % half) + half) % half;
+			rotKeyIndex_.emplace(idx, step); // first registered step wins for a given normalized index
+		}
+	}
 	// Bootstrap precomputation per registered slot count (host-only). The rotation
 	// and conjugation keys it needs resolve lazily through autoKeyFor at first use.
 	boot_.clear();
@@ -626,7 +636,13 @@ HazeEngine::Operand HazeEngine::rescaleCore(const Operand& x) {
 }
 
 HazeEngine::Operand HazeEngine::negateCore(const Operand& x) {
-	// Exact EvalNegate: per-limb scalar q_i − 1 (≡ −1 mod q_i); metadata unchanged.
+	// Degree-preserving EvalNegate: per-limb scalar q_i − 1 (≡ −1 mod q_i); metadata unchanged.
+	// CUDA's evalNegate is multScalar(-1.0) instead (CudaEngine.cpp:104-110): residues become the
+	// ElemForEvalMult(-1.0) scaled const, bumping NSD 1→2 and sf *= ScalingFactorReal[level] with a
+	// depth-2 precheck (known GPU fidelity gap, ApiParityTest.cpp:221) — NOT OpenFHE's q_i−1. We keep
+	// the q_i−1 multiply: component count is unchanged (per Ryan's rule, only a degree/component-count
+	// change forces literal CUDA reproduction), and it is not obvious CUDA's NSD 1→2 bump is safe for
+	// how FIDESlib consumes noiseScaleDeg downstream, so we deliberately do not replicate it.
 	std::vector<uint64_t> scalars(x.towers);
 	for (size_t i = 0; i < x.towers; ++i) {
 		scalars[i] = qBase_[i] - 1;
@@ -646,16 +662,54 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st == lbcrypto::FIXEDMANUAL) {
 		// OpenFHE AdjustLevelsInPlace: level-align by dropping towers of the fresher operand
-		// (pure truncation — a view change here, no IR).
+		// (pure truncation — a view change here, no IR). FIXEDMANUAL never auto-rescales, so the
+		// depth-fix below is not applied (CUDA does not call adjustForAddOrSub for FIXEDMANUAL).
 		const size_t towers = std::min(a.towers, b.towers);
 		a.towers			= towers;
 		b.towers			= towers;
 		return;
 	}
-	// Port of OpenFHE LeveledSHECKKSRNS::AdjustLevelsAndDepthInPlace (compositeDegree == 1;
-	// one shared implementation for FIXEDAUTO and the FLEXIBLE modes), in towers-space:
-	// OpenFHE level = |Q| − towers; LevelReduceInternal is a view truncation. The "fresher"
-	// operand (more towers / lower level) is adjusted toward the other.
+	if (st == lbcrypto::FIXEDAUTO) {
+		// CUDA Ciphertext::adjustForAddOrSub FIXEDAUTO branch (Ciphertext.cpp:1473-1488): a SIMPLE
+		// depth-fix only — rescale a depth-2 operand or multScalar(1.0)-bump a depth-1 operand so both
+		// reach a common depth — and the level alignment is PURE TRUNCATION in the add/sub tail
+		// (:187-195, dropToLevel@1140 drops the fresher/more-towers operand). NOT OpenFHE's generic
+		// AdjustLevelsAndDepth (the FIXEDAUTO scale tables degenerate to a constant, so its
+		// multScalar(~1/S)+rescale is wasted work that perturbs NSD); that generic path is reserved for
+		// the FLEXIBLE modes below. The depth-adjusted-level comparison mirrors CUDA's
+		// getLevel()-NoiseLevel (getLevel = towers−1, so the −1 cancels): towers − noiseScaleDeg.
+		auto depthFix = [&](Operand& x, const Operand& y) -> bool {
+			const long dlx = static_cast<long>(x.towers) - static_cast<long>(x.noiseScaleDeg);
+			const long dly = static_cast<long>(y.towers) - static_cast<long>(y.noiseScaleDeg);
+			if (dlx > dly) {
+				if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
+					x = rescaleCore(x);
+				} else if (y.noiseScaleDeg == 2 && x.noiseScaleDeg == 1) {
+					x = multScalarCore(x, 1.0);
+				}
+				return true;
+			} else if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
+				x = rescaleCore(x);
+				return true;
+			} else if (x.noiseScaleDeg == 1 && y.noiseScaleDeg == 2) {
+				return false; // ask the caller to adjust the other operand instead (CUDA's swap+retry)
+			}
+			return true;
+		};
+		if (!depthFix(a, b)) {
+			if (!depthFix(b, a)) {
+				throw std::runtime_error("haze backend: FIXEDAUTO add/sub adjust failed to reconcile depth");
+			}
+		}
+		// Tail: pure truncation of the fresher (more-towers) operand to the other's tower count.
+		const size_t towers = std::min(a.towers, b.towers);
+		a.towers			= towers;
+		b.towers			= towers;
+		return;
+	}
+	// FLEXIBLEAUTO / FLEXIBLEAUTOEXT: OpenFHE/CUDA AdjustScaleAndLevel via the generic ciphertext
+	// helper (towers-space; OpenFHE level = |Q| − towers). The "fresher" operand (more towers / lower
+	// level) is adjusted toward the other; equal level only needs a depth bump.
 	if (levelOf(a) < levelOf(b)) {
 		adjustOperandToward(a, b);
 	} else if (levelOf(a) > levelOf(b)) {
@@ -669,7 +723,7 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 	}
 }
 
-void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
+void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt, bool ctRule) {
 	{
 		const size_t c1lvl	 = levelOf(x);
 		const size_t c2lvl	 = levelOf(tgt);
@@ -680,11 +734,27 @@ void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
 				const double scf1 = x.scalingFactor;
 				const double scf2 = tgt.scalingFactor;
 				const double scf  = sfReal_[c1lvl];
-				const double q1	  = modReduceFactor_[x.towers - 1];
-				x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
-				x				  = rescaleCore(x);
-				if (c1lvl + 1 < c2lvl) {
-					x.towers -= c2lvl - c1lvl - 1;
+				if (ctRule) {
+					// Ciphertext rule (CUDA Ciphertext::adjustScaleAndLevel, Ciphertext.cpp:1388-1400):
+					// q1 = ModReduceFactor[c2lvl+1] = modReduceFactor_[tgt.towers] (tower-indexed, matches
+					// CUDA param.ModReduceFactor), and TRIM the extra top towers BEFORE rescale (dropToLevel
+					// then rescale) so the correct top tower is folded when operands are >1 level apart.
+					const double q1 = modReduceFactor_[tgt.towers];
+					x				= multScalarCore(x, scf2 * q1 / scf1 / scf);
+					if (c1lvl + 1 < c2lvl) {
+						x.towers -= c2lvl - c1lvl - 1;
+					}
+					x = rescaleCore(x);
+				} else {
+					// Plaintext rule (CUDA Plaintext::adjustScaleAndLevel, Plaintext.cu:119-134): q1 =
+					// ModReduceFactor[c1lvl] = modReduceFactor_[x.towers−1], and rescale BEFORE trim. Kept
+					// only for adjustPtToward (the pt operand), per parity #5.
+					const double q1 = modReduceFactor_[x.towers - 1];
+					x				= multScalarCore(x, scf2 / scf1 * q1 / scf);
+					x				= rescaleCore(x);
+					if (c1lvl + 1 < c2lvl) {
+						x.towers -= c2lvl - c1lvl - 1;
+					}
 				}
 				x.scalingFactor = tgt.scalingFactor;
 			} else {
@@ -753,12 +823,13 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	}
 	if (st == lbcrypto::FLEXIBLEAUTO || st == lbcrypto::FLEXIBLEAUTOEXT) {
 		// Plaintext::adjustScaleAndLevel(c.NSD, c.level, c.sf): same generic adjust as
-		// ciphertext operands, including the equal-level depth bump.
+		// ciphertext operands, including the equal-level depth bump. ctRule=false keeps the
+		// Plaintext-rule depth2/depth2 branch1 (parity #5).
 		if (ptOp.towers < ct.towers) {
 			throw std::runtime_error("haze backend: plaintext is encoded deeper than the ciphertext (cannot raise a plaintext)");
 		}
 		if (levelOf(ptOp) < levelOf(ct)) {
-			adjustOperandToward(ptOp, ct);
+			adjustOperandToward(ptOp, ct, /*ctRule=*/false);
 		} else if (ptOp.noiseScaleDeg < ct.noiseScaleDeg) {
 			ptOp = multScalarCore(ptOp, 1.0);
 		} else if (ptOp.noiseScaleDeg > ct.noiseScaleDeg) {
@@ -797,7 +868,9 @@ HazeEngine::Operand HazeEngine::addScalarCore(const Operand& x, double scalar) {
 		auto factors = hazebk::elemForEvalAddOrSub(scalarParams(), x.towers, std::fabs(scalar), x.noiseScaleDeg);
 		if (scalar < 0.0) {
 			for (size_t i = 0; i < factors.size(); ++i) {
-				factors[i] = (factors[i] == 0) ? 0 : qBase_[i] - factors[i];
+				// CUDA flips unconditionally: elem[i] = prime.p − elem[i] (Ciphertext.cpp:786), so a
+				// 0 residue records the literal q_i, not 0. OpenFHE/old Haze guarded 0→0; we match CUDA.
+				factors[i] = qBase_[i] - factors[i];
 			}
 		}
 		const auto base = qPrefix(x.towers);
@@ -1053,8 +1126,12 @@ void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 }
 
 Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, double scalar, const Ciphertext<DCRTPoly>& ct) {
-	// scalar − ct = (−ct) + scalar via the exact negate (replaces CudaEngine's
-	// triple-multScalar trick, which bumps NSD).
+	// scalar − ct = (−ct) + scalar via the exact negate, honoring the oracle's s − ct contract
+	// (OpenFheEngine.cpp:174). CUDA's evalSub(scalar, ct) instead does multScalar(-1);addScalar(s);
+	// multScalar(-1) (CudaEngine.cpp:252-260), which actually computes ct − s (double-negate sign bug)
+	// plus an NSD bump and a dropped tower from the multScalar prechecks. The result stays 2-component,
+	// so per Ryan's rule we keep this correct s − ct and deliberately do NOT replicate CUDA's sign/level
+	// bug. (The negate primitive itself still differs per #1.)
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar, ct)");
 	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
@@ -1542,26 +1619,22 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 }
 
 Ciphertext<DCRTPoly> HazeEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
-	// OpenFHE public ModReduce mod-reduces only under FIXEDMANUAL; under the AUTO modes it
-	// is a clone (rescaling is deferred to the adjust steps). Matching that exactly keeps
-	// the level accounting identical to the CPU oracle.
+	// CUDA rescales eagerly under ALL scaling techniques (drop a limb, NoiseFactor /= ModReduceFactor,
+	// NoiseLevel −= 1; Ciphertext.cpp:428-442 via CudaEngine.cpp:459,466), unlike OpenFHE's public
+	// ModReduce which mod-reduces only under FIXEDMANUAL and clones under the AUTO modes. We match CUDA
+	// and always mod-reduce. (Task 02 #16's convolution special-exit rescale depends on this being
+	// unconditional.)
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "Rescale");
-	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	if (st != lbcrypto::FIXEDMANUAL) {
-		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext); // Clone (no-op rescale)
-	}
 	Operand res = rescaleCore(asOperand(p));
 	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
 }
 
 void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) {
+	// CUDA mod-reduces eagerly under every technique (see rescale() above), not OpenFHE's
+	// FIXEDMANUAL-only ModReduceInPlace.
 	auto p = ensureCt(ctx, ciphertext);
-	requireComputable(*p, "RescaleInPlace"); // guard before the no-op early-return, matching rescale()
-	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	if (st != lbcrypto::FIXEDMANUAL) {
-		return; // OpenFHE: ModReduceInPlace is a no-op outside FIXEDMANUAL
-	}
+	requireComputable(*p, "RescaleInPlace");
 	Operand res = rescaleCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1598,10 +1671,37 @@ HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& c
 }
 
 HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
-	const auto it = rotKeys_.find(step);
-	if (it != rotKeys_.end()) {
-		// Pre-extracted EvalRotateKeyGen key (keyed by slot step).
-		RotKey& rk		  = it->second;
+	// Slots-aware rotation (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887): normalyzeIndex maps the
+	// logical step to a full-ring rotation given the ct's slot count, then GetRotationKey selects the
+	// actual_index — the registered key whose normalized index is slot-compatible (the alternate-key
+	// search adds multiples of `slots`, which are no-ops on slots-periodic sparse data). OpenFHE's
+	// EvalAtIndex (the old path) used 5^step with slots ignored, so steps > slots/2 picked the wrong key.
+	const int32_t half	= (ringDim_ >= 2) ? static_cast<int32_t>(ringDim_ / 2) : 1;
+	const int32_t slots = (x.slots > 0) ? static_cast<int32_t>(x.slots) : half;
+	// normalyzeIndex(step, slots, N) — Context.cu:1088-1095.
+	int32_t norm = step % slots;
+	if (norm < 0)
+		norm += slots;
+	if (norm > slots / 2)
+		norm += half - slots; // N/2 − slots
+	// GetRotationKey actual_index (Context.cu:562-589): reduce mod N/2, then the slot-compatible search.
+	const int32_t idx		 = ((norm % half) + half) % half;
+	const int32_t* foundStep = nullptr;
+	if (auto hit = rotKeyIndex_.find(idx); hit != rotKeyIndex_.end()) {
+		foundStep = &hit->second;
+	} else if (slots != half) {
+		for (int32_t i = 1; i < half / slots; ++i) {
+			const int32_t idx_ = (idx + i * slots) % half;
+			if (auto alt = rotKeyIndex_.find(idx_); alt != rotKeyIndex_.end()) {
+				foundStep = &alt->second;
+				break;
+			}
+		}
+	}
+	if (foundStep != nullptr) {
+		// Pre-extracted EvalRotateKeyGen key; rk.autoIndex is the OpenFHE automorphism for the
+		// found step, which is the key matching CUDA's 5^(2N − actual_index) for that index.
+		RotKey& rk		  = rotKeys_.at(*foundStep);
 		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
 		const auto base	  = qPrefix(x.towers);
 		LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
@@ -1615,8 +1715,9 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 		res.p		= finishPayload(std::move(out0), std::move(out1), res);
 		return res;
 	}
-	// Fallback (bootstrap rotations and any other keyed step): resolve the automorphism
-	// index on the host and extract the key lazily from the tag's automorphism key map.
+	// Fallback (bootstrap rotations and any step without a registered key): resolve the automorphism
+	// index on the host and extract the key lazily. This path is not slots-aware (kept for full-slot
+	// bootstrap); sparse-bootstrap rotation correctness is Task 05's scope.
 	auto& context			 = hostContext(ctx);
 	const uint32_t autoIndex = context->FindAutomorphismIndex(static_cast<uint32_t>(step));
 	return rotateByAutoIndex(ctx, x, autoIndex);
@@ -1688,32 +1789,49 @@ std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextI
 	return results;
 }
 
-Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	// Port of the CPU rotate+add doubling loop (OpenFheEngine.cpp:357-370) over engine
-	// primitives, via the facade like evalAddMany.
-	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-	for (int i = 0; i < std::log2(slots); i++) {
-		const int rotIdx = stride * (1 << i);
-		auto tmp		 = ctx.EvalRotate(result, rotIdx);
-		ctx.EvalAddInPlace(result, tmp);
+namespace {
+// Radix-4 reduction cascade — CUDA Accumulate / AccumulateCascadeImpl (AccumulateBroadcast.cu:9-113),
+// expressed over facade rotate+add (the CUDA rotate_hoisted/extend/modDown are the hoisting form of the
+// same rotate-then-add; hoisting itself is Task 06 #19). bStep=4 ⇒ logbStep=2: outer s <<= 2 from
+// startFactor, inner adds rot(snapshot, stride*s*k) for k in {1,2,3} while stride*s*k < stride*size.
+// Each step rotates the PRE-STEP snapshot (CUDA rotates ctxt for all indexes before any of the step's
+// adds), unlike the old radix-2 byte-copy of the OpenFHE doubling loop which rotated the running sum.
+void hazeAccumulateCascade(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int size, int stride, int startFactor) {
+	if (startFactor <= 0 || size <= 0)
+		return;
+	for (int s = startFactor; s < size; s <<= 2) {
+		Ciphertext<DCRTPoly> snapshot = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+		for (int idx = stride * s; idx < stride * size && idx < 4 * stride * s; idx += stride * s) {
+			ctx.EvalAddInPlace(ct, ctx.EvalRotate(snapshot, idx));
+		}
 	}
+}
+} // namespace
+
+Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	const size_t ctSlots		= ensureCt(ctx, ct)->slots;
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+	hazeAccumulateCascade(ctx, result, slots, stride, /*startFactor=*/1);
+	// Slots-shrink (CUDA Accumulate AccumulateBroadcast.cu:107-108): when the accumulate spans the
+	// whole packing, the result is a broadcast over `stride` slots. OpenFHE's loop leaves slots intact.
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		result->SetSlots(static_cast<size_t>(stride));
 	return result;
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	for (int i = 0; i < std::log2(slots); i++) {
-		const int rotIdx = stride * (1 << i);
-		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
-		ctx.EvalAddInPlace(ct, tmp);
-	}
+	const size_t ctSlots = ensureCt(ctx, ct)->slots;
+	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/1);
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		ct->SetSlots(static_cast<size_t>(stride));
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
-	for (int s = start; s < slots; s <<= 1) {
-		const int rotIdx = stride * s;
-		auto tmp		 = ctx.EvalRotate(ct, rotIdx);
-		ctx.EvalAddInPlace(ct, tmp);
-	}
+	const size_t ctSlots = ensureCt(ctx, ct)->slots;
+	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/start);
+	// Cascade slots-shrink (AccumulateBroadcast.cu:41-42): result is a broadcast over stride*startFactor.
+	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
+		ct->SetSlots(static_cast<size_t>(stride) * static_cast<size_t>(start));
 }
 
 // ---- Bootstrap setup hooks (staged compute lands in a later change) ----
@@ -2232,7 +2350,14 @@ static Ciphertext<DCRTPoly> hazeConvolutionTransform(CryptoContextImpl<DCRTPoly>
 		hazeTreeAccumulate(ctx, blockResults, blockCount);
 	}
 
-	return ctx.Rescale(blockResults[0]);
+	// Exit rescale: only the SPECIAL (mask) path eager-rescales (NSD 2→1) at its end, matching CUDA
+	// SpecialConvolutionTransform's trailing ctxt.rescale() (LinearTransform.cu:648); the regular
+	// ConvolutionTransform has NO exit rescale (LinearTransform.cu:436 just copies). Now that Rescale is
+	// unconditionally eager (parity #3), gating on the mask reproduces both paths' level/NSD exactly —
+	// an unconditional Rescale here would over-drop the regular path a level.
+	if (mask != nullptr)
+		return ctx.Rescale(blockResults[0]);
+	return blockResults[0];
 }
 
 } // namespace

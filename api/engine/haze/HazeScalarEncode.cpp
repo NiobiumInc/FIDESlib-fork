@@ -108,7 +108,9 @@ std::vector<uint64_t> elemForEvalMult(
 
 	std::vector<lbcrypto::DCRTPoly::Integer> factors(numTowers);
 
-	if (large_abs >= bound) {
+	// CUDA uses `large_abs > bound` (Context.cu:390): at large_abs == 2^63 it takes the int64
+	// else-branch (wrapping to INT64_MIN), unlike OpenFHE's `>=` which keeps the true __int128 value.
+	if (large_abs > bound) {
 		for (usint i = 0; i < numTowers; i++) {
 			DoubleInteger reduced = large % static_cast<__int128>(moduli[i].ConvertToInt());
 			factors[i] = (reduced < 0)

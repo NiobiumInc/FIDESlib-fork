@@ -218,8 +218,11 @@ class HazeEngine final : public Engine {
 	void adjustForAddOrSub(Operand& a, Operand& b);
 	/// @brief Adjust `x` toward `tgt` (the c1lvl<c2lvl branch body of
 	/// AdjustLevelsAndDepthInPlace). Works on 1-component operands too (morphed
-	/// plaintexts: empty c1 chains are skipped by the cores).
-	void adjustOperandToward(Operand& x, const Operand& tgt);
+	/// plaintexts: empty c1 chains are skipped by the cores). `ctRule` selects the depth2/depth2
+	/// branch1 rule (parity #5): true = CUDA Ciphertext::adjustScaleAndLevel (q1=ModReduceFactor[c2lvl+1],
+	/// trim-before-rescale, used for ciphertext operands); false = CUDA Plaintext::adjustScaleAndLevel
+	/// (q1=ModReduceFactor[c1lvl], rescale-before-trim, used only by adjustPtToward).
+	void adjustOperandToward(Operand& x, const Operand& tgt, bool ctRule = true);
 	/// @brief GPU Plaintext::adjustPlaintextToCiphertext port: adjust a plaintext operand
 	/// (single chain) toward the ciphertext's (level, NSD, scalingFactor). FIXEDAUTO uses
 	/// the drop/rescale rules from src/CKKS/Plaintext.cu:195-225; FLEXIBLE modes reuse
@@ -290,6 +293,10 @@ class HazeEngine final : public Engine {
 		KsKey key;
 	};
 	std::map<int32_t, RotKey> rotKeys_; // slot step -> key
+	/// @brief CUDA-style normalized rotation index ((step mod N/2), made positive) -> the slot
+	/// step in rotKeys_. Built from rotKeys_; used by the slots-aware GetRotationKey port (#7,
+	/// incl. the alternate slot-compatible key search) so rotateCore can pick CUDA's actual_index.
+	std::map<int32_t, int32_t> rotKeyIndex_;
 	/// @brief Lazily-extracted automorphism keys by raw automorphism index (bootstrap
 	/// rotations, conjugation 2N−1, and any rotation step not in rotKeys_).
 	std::map<uint32_t, KsKey> autoKeys_;
