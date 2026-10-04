@@ -12,6 +12,7 @@
 #include <openfhe.h>
 
 #include <any>
+#include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -165,6 +166,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	const auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
 	keyTag_			   = pkImpl->GetKeyTag();
 	plaintextModulus_  = cryptoParams->GetPlaintextModulus();
+	numPartQ_		   = cryptoParams->GetNumPartQ(); // hybrid digit count (#19 hoisting prefix)
 	const auto& keyMap = context->GetAllEvalMultKeys();
 	if (keyMap.find(keyTag_) != keyMap.end()) {
 		relinKey_	   = KsKey{};
@@ -262,6 +264,7 @@ void HazeEngine::teardown() {
 	rotKeys_.clear();
 	autoKeys_.clear();
 	boot_.clear();
+	numPartQ_ = 0;
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
 	// outlive the device reset, then clear all process-global haze state. Outstanding
 	// LimbChain destructors of still-live ciphertexts will see stale addresses afterwards;
@@ -1268,11 +1271,11 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	key.uploaded = true;
 }
 
-HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, size_t towers, KsKey& key) {
-	// Port of ops.cpp hybrid_keyswitch. The full-Q∥P key is uploaded once; trimming to
-	// (first `towers` Q rows, all P rows) is pointer selection, not re-upload.
-	ensureKeyUploaded(key);
-	const size_t numPartQ = key.host.a_limbs.size();
+HazeEngine::HoistedDigits HazeEngine::hoistedKeyswitchPrefix(const LimbChain& src, size_t towers, size_t numPartQ) {
+	// #19 step 1-2: the key-INDEPENDENT prefix of hybridKeyswitch (CUDA c1.modupInto,
+	// Ciphertext.cpp:965). INTT(src→coeff) → ModUp(per-digit decompose to Q∥P) → per-digit
+	// NTT(→EVAL). The digit partition (alpha, digit_base_lens) is fixed by numPartQ alone, so
+	// this depends only on (src, towers) and is shared across every rotation key downstream.
 	if (numPartQ == 0) {
 		throw std::runtime_error("haze backend: keyswitch key has no digits");
 	}
@@ -1332,6 +1335,29 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		hazeCheck(hazeNTTMrp(out.data(), in.data(), qpBase.data(), qpBase.size(), nullptr), "hazeNTTMrp");
 	}
 
+	HoistedDigits h;
+	h.digitsEval = std::move(digitsEval);
+	h.towers	 = towers;
+	h.numDigits	 = numDigits;
+	h.qpTowers	 = qpTowers;
+	h.qpBase	 = std::move(qpBase);
+	return h;
+}
+
+HazeEngine::KsContribution HazeEngine::hybridKeyswitchFromDigits(const HoistedDigits& digits, KsKey& key, bool ext) {
+	// #19 step 3: the per-KEY work — the part that varies across rotation indexes. Reuses the
+	// shared digitsEval handle (CUDA dotKSKInPlaceFrom, Ciphertext.cpp:991) instead of redoing
+	// the ModUp/NTT. ext=false → ModDown(drop P)+NTT to base-Q (the plain-rotate contribution,
+	// byte-identical to the old monolithic hybridKeyswitch). ext=true (#10) → KEEP the extended
+	// Q∥P basis and SKIP the ModDown+NTT (CUDA rotate_hoisted ext=true skips moddown,
+	// Ciphertext.cpp:994-998); the caller folds addFirst and does the moddown later.
+	ensureKeyUploaded(key);
+	const size_t sizeQ	  = qBase_.size();
+	const size_t towers	  = digits.towers;
+	const size_t qpTowers = digits.qpTowers;
+	const size_t numDigits = digits.numDigits;
+	const auto& qpBase	  = digits.qpBase;
+
 	// Key rows for this towers count: indices [0, towers) ∪ [|Q|, |Q|+|P|) of the full rows.
 	auto keyRows = [&](const LimbChain& full) {
 		std::vector<const void*> rows;
@@ -1352,7 +1378,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	for (size_t d = 0; d < numDigits; ++d) {
 		std::vector<const void*> dig(qpTowers);
 		for (size_t t = 0; t < qpTowers; ++t) {
-			dig[t] = digitsEval[(d * qpTowers) + t];
+			dig[t] = digits.digitsEval[(d * qpTowers) + t];
 		}
 		const auto aRows = keyRows(key.aDigits[d]);
 		const auto bRows = keyRows(key.bDigits[d]);
@@ -1369,6 +1395,13 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		}
 	}
 
+	if (ext) {
+		// #10 extended-basis return: the dot product is already EVAL form over Q∥P — hand it back
+		// without the ModDown (CUDA keeps Q∥P; the final moddown is deferred to the giant-step
+		// boundary). NOTE: this is the contribution before the c0+ks.b fold and automorph.
+		return KsContribution{ std::move(accumB), std::move(accumA) };
+	}
+
 	LimbChain accumACoeff(qpTowers, polyBytes_);
 	LimbChain accumBCoeff(qpTowers, polyBytes_);
 	hazeCheck(hazeINTTMrp(accumACoeff.data(), accumA.asConst().data(), qpBase.data(), qpBase.size(), nullptr), "hazeINTTMrp");
@@ -1380,6 +1413,7 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 		/*.rescale_base =*/pBase_.data(),
 		/*.rescale_base_len =*/pBase_.size(),
 	};
+	const auto qSub = qPrefix(towers);
 	LimbChain mdA(towers, polyBytes_);
 	LimbChain mdB(towers, polyBytes_);
 	hazeCheck(hazeModDown(mdA.data(), accumACoeff.asConst().data(), &ksMdParams, nullptr), "hazeModDown");
@@ -1391,6 +1425,16 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, siz
 	hazeCheck(hazeNTTMrp(outB.data(), mdB.asConst().data(), qSub.data(), qSub.size(), nullptr), "hazeNTTMrp");
 
 	return KsContribution{ std::move(outB), std::move(outA) };
+}
+
+HazeEngine::KsContribution HazeEngine::hybridKeyswitch(const LimbChain& src, size_t towers, KsKey& key) {
+	// Port of ops.cpp hybrid_keyswitch, now a thin composition of the shared input-only prefix
+	// (#19 step 1-2) + the per-key step (step 3). Relin (ct×ct) and non-hoisted rotation callers
+	// route through here unchanged, so their results stay byte-identical to the old monolithic
+	// implementation. The full-Q∥P key is uploaded once; trimming to (first `towers` Q rows, all
+	// P rows) is pointer selection, not re-upload.
+	HoistedDigits digits = hoistedKeyswitchPrefix(src, towers, key.host.a_limbs.size());
+	return hybridKeyswitchFromDigits(digits, key, /*ext=*/false);
 }
 
 void HazeEngine::adjustForMult(Operand& a, Operand& b) {
@@ -1670,14 +1714,16 @@ HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& c
 	return res;
 }
 
-HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
-	// Slots-aware rotation (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887): normalyzeIndex maps the
-	// logical step to a full-ring rotation given the ct's slot count, then GetRotationKey selects the
-	// actual_index — the registered key whose normalized index is slot-compatible (the alternate-key
-	// search adds multiples of `slots`, which are no-ops on slots-periodic sparse data). OpenFHE's
-	// EvalAtIndex (the old path) used 5^step with slots ignored, so steps > slots/2 picked the wrong key.
+HazeEngine::RotKeyResolved HazeEngine::resolveRotationKey(int32_t step, size_t slotsArg) {
+	// Slots-aware rotation-key selection (CUDA Ciphertext::rotate, Ciphertext.cpp:822-887):
+	// normalyzeIndex maps the logical step to a full-ring rotation given the ct's slot count, then
+	// GetRotationKey selects the actual_index — the registered key whose normalized index is
+	// slot-compatible (the alternate-key search adds multiples of `slots`, which are no-ops on
+	// slots-periodic sparse data). OpenFHE's EvalAtIndex (the old path) used 5^step with slots
+	// ignored, so steps > slots/2 picked the wrong key. Extracted so rotateCore (plain) and
+	// fastRotateFromDigits (hoisted) pick the IDENTICAL key+autoIndex (#19 byte-identity).
 	const int32_t half	= (ringDim_ >= 2) ? static_cast<int32_t>(ringDim_ / 2) : 1;
-	const int32_t slots = (x.slots > 0) ? static_cast<int32_t>(x.slots) : half;
+	const int32_t slots = (slotsArg > 0) ? static_cast<int32_t>(slotsArg) : half;
 	// normalyzeIndex(step, slots, N) — Context.cu:1088-1095.
 	int32_t norm = step % slots;
 	if (norm < 0)
@@ -1698,11 +1744,21 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 			}
 		}
 	}
+	RotKeyResolved r;
 	if (foundStep != nullptr) {
 		// Pre-extracted EvalRotateKeyGen key; rk.autoIndex is the OpenFHE automorphism for the
 		// found step, which is the key matching CUDA's 5^(2N − actual_index) for that index.
-		RotKey& rk		  = rotKeys_.at(*foundStep);
-		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, rk.key);
+		RotKey& rk	 = rotKeys_.at(*foundStep);
+		r.key		 = &rk.key;
+		r.autoIndex	 = rk.autoIndex;
+	}
+	return r;
+}
+
+HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step) {
+	const RotKeyResolved rk = resolveRotationKey(step, x.slots);
+	if (rk.key != nullptr) {
+		KsContribution ks = hybridKeyswitch(x.p->c1, x.towers, *rk.key);
 		const auto base	  = qPrefix(x.towers);
 		LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
 
@@ -1723,6 +1779,35 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 	return rotateByAutoIndex(ctx, x, autoIndex);
 }
 
+HazeEngine::Operand HazeEngine::fastRotateFromDigits(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step, const HoistedDigits& digits) {
+	// #19 hoisted single rotation: identical assembly to rotateCore's pre-extracted-key branch,
+	// but the keyswitch reuses the shared digit decomposition (hybridKeyswitchFromDigits) instead
+	// of recomputing INTT+ModUp+NTT. Same key (resolveRotationKey), same c0+ks.b fold, same
+	// AutomorphMrp on BOTH components ⇒ byte-identical to evalRotate(x, step). No host fallback:
+	// fast rotation only services pre-extracted keys (the bootstrap full-slot fallback uses plain
+	// EvalRotate, not the hoisted path).
+	const RotKeyResolved rk = resolveRotationKey(step, x.slots);
+	if (rk.key == nullptr) {
+		// No pre-extracted key (e.g. a bootstrap full-slot rotation that resolves lazily via
+		// FindAutomorphismIndex). The hoisted prefix only covers pre-extracted rotation keys, so
+		// fall back to the plain rotate (which recomputes the prefix) — byte-identical, just not
+		// hoisted for this index.
+		return rotateCore(ctx, x, step);
+	}
+	KsContribution ks = hybridKeyswitchFromDigits(digits, *rk.key, /*ext=*/false);
+	const auto base	  = qPrefix(x.towers);
+	LimbChain ksC0	  = addChain(polyBytes_, base, x.p->c0.asConst().data(), ks.b.asConst().data());
+
+	LimbChain out0(x.towers, polyBytes_);
+	LimbChain out1(x.towers, polyBytes_);
+	hazeCheck(hazeAutomorphMrp(out0.data(), ksC0.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+	hazeCheck(hazeAutomorphMrp(out1.data(), ks.a.asConst().data(), rk.autoIndex, base.data(), base.size(), nullptr), "hazeAutomorphMrp");
+
+	Operand res = x; // metadata unchanged
+	res.p		= finishPayload(std::move(out0), std::move(out1), res);
+	return res;
+}
+
 Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotate");
@@ -1737,34 +1822,77 @@ void HazeEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
 
-std::shared_ptr<void> HazeEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&) {
-	// No hoisting in v1: fast rotations are plain rotations, so there is no
-	// precompute handle. Correctness-equivalent; hoisting is a tracked future optimization.
-	return nullptr;
+std::shared_ptr<void> HazeEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	// #19: record the shared, key-independent ModUp/per-digit-NTT decomposition of c1 ONCE
+	// (CUDA c1.modupInto across the baby steps, Ciphertext.cpp:965). The returned handle is reused
+	// by every evalFastRotation index, so the expensive INTT+ModUp+NTT runs a single time instead
+	// of once per rotation. numPartQ_ is the context's hybrid digit count (all keys share it).
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationPrecompute");
+	if (numPartQ_ == 0) {
+		throw std::runtime_error("haze backend: EvalFastRotationPrecompute requires a loaded context with keyswitch params");
+	}
+	return std::make_shared<HoistedDigits>(hoistedKeyswitchPrefix(p->c1, p->towers, numPartQ_));
 }
 
 Ciphertext<DCRTPoly>
-HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t /*m*/, const std::shared_ptr<void>& /*precomp*/) {
-	return evalRotate(ctx, ct, index);
+HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t /*m*/, const std::shared_ptr<void>& precomp) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotation");
+	// A null/foreign precompute (or a stale handle at a different level) ⇒ fall back to the plain
+	// rotate, which recomputes the prefix. Byte-identical either way (#19 is perf-only).
+	auto digits = std::static_pointer_cast<HoistedDigits>(precomp);
+	if (!digits || digits->towers != p->towers) {
+		return evalRotate(ctx, ct, index);
+	}
+	Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *digits);
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 Ciphertext<DCRTPoly>
-HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& /*digits*/, bool /*addFirst*/) {
-	// Plain rotation stand-in: the Ext variant's extended-basis intermediate is a hoisting
-	// detail; the api test only exercises the dispatch.
-	return evalRotate(ctx, ct, index);
+HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) {
+	// #10: CUDA's evalFastRotationExt keeps the result in the EXTENDED (Q∥P) basis, SKIPS the
+	// final ModDown, and folds addFirst*PModq into c0 (CudaEngine.cpp:375-387 → rotate(.,false);
+	// Ciphertext.cpp:994-998,1030-1036). In the haze backend, however, NOTHING downstream consumes
+	// an extended-basis ciphertext: the bootstrap linearTransform/CtS-StC drivers use plain
+	// base-Q EvalRotate (not Ext), and the only Ext caller is the dispatch-only api test
+	// (ApiTests.cpp:1225, EXPECT_NO_THROW, no decrypt). There is no extended-basis HazePayload
+	// representation (towers + |P| limbs with no ModDown) that any later op could read, and the
+	// fused giant-step ModDown that CUDA pairs with it (LinearTransform.cu:174-194,304) is not
+	// wired here. Wiring a true extended return end-to-end would therefore have no correct
+	// consumer and would risk a decrypt that the api test does not guard. Per the task's explicit
+	// fallback guidance, we keep Ext CORRECT-but-base-Q: route through the hoisting primitive WITH
+	// the ModDown (the same byte-identical result as evalRotate) when a handle is present, else
+	// plain rotate. addFirst is therefore not folded (it only matters for the skipped-ModDown
+	// extended form). See the report for why the extended return was not safely wireable.
+	(void)addFirst;
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationExt");
+	auto h = std::static_pointer_cast<HoistedDigits>(digits);
+	if (!h || h->towers != p->towers) {
+		return evalRotate(ctx, ct, index);
+	}
+	Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *h);
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx,
   const Ciphertext<DCRTPoly>& ct,
   const std::vector<int32_t>& indices,
   const uint32_t /*m*/,
-  const std::shared_ptr<void>& /*precomp*/) {
+  const std::shared_ptr<void>& precomp) {
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotation");
+	auto digits = std::static_pointer_cast<HoistedDigits>(precomp);
+	const bool hoisted = digits && digits->towers == p->towers;
 	std::vector<Ciphertext<DCRTPoly>> results;
 	results.reserve(indices.size());
 	for (const int32_t index : indices) {
 		if (index == 0) {
 			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else if (hoisted) {
+			Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *digits);
+			results.push_back(wrapDeviceResult(ctx, ct, std::move(res.p)));
 		} else {
 			results.push_back(evalRotate(ctx, ct, index));
 		}
@@ -1775,13 +1903,22 @@ std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotation(CryptoContextImpl
 std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx,
   const Ciphertext<DCRTPoly>& ct,
   const std::vector<int32_t>& indices,
-  const std::shared_ptr<void>& /*digits*/,
-  bool /*addFirst*/) {
+  const std::shared_ptr<void>& digits,
+  bool addFirst) {
+	// See the single-index Ext above: kept correct-but-base-Q (no consumer for an extended return).
+	(void)addFirst;
+	auto p = ensureCt(ctx, ct);
+	requireComputable(*p, "EvalFastRotationExt");
+	auto h = std::static_pointer_cast<HoistedDigits>(digits);
+	const bool hoisted = h && h->towers == p->towers;
 	std::vector<Ciphertext<DCRTPoly>> results;
 	results.reserve(indices.size());
 	for (const int32_t index : indices) {
 		if (index == 0) {
 			results.push_back(std::make_shared<CiphertextImpl<DCRTPoly>>(*ct));
+		} else if (hoisted) {
+			Operand res = fastRotateFromDigits(ctx, asOperand(p), index, *h);
+			results.push_back(wrapDeviceResult(ctx, ct, std::move(res.p)));
 		} else {
 			results.push_back(evalRotate(ctx, ct, index));
 		}
@@ -1836,10 +1973,18 @@ void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 
 // ---- Bootstrap setup hooks (staged compute lands in a later change) ----
 
-BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool /*precompute*/, bool /*btsfirstboot*/, int32_t modEvalLevels) const {
-	// Verbatim CPU policy (OpenFheEngine.cpp:400-408): haze's host setup must match the CPU
-	// oracle, including the pre-existing modall-lands-in-BTSlotsEncoding quirk flagged there.
-	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/modEvalLevels != 0, /*modEvalLevels=*/-1 };
+BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool precompute, bool btsfirstboot, int32_t modEvalLevels) const {
+	// CUDA parity (#9): mirror CudaEngine::bootstrapSetupPolicy (CudaEngine.cpp:489-493) —
+	// forward {precompute, btsfirstboot, modEvalLevels} verbatim, instead of the CPU oracle's
+	// hard-coded {true, modall!=0, -1} (OpenFheEngine.cpp:400-408). The Engine-dispatched
+	// CUDA bootstrap (FIDESlib::CKKS::Bootstrap, Bootstrap.cu:169) is ALWAYS ModRaise-first
+	// regardless of this flag; BTSlotsEncoding here only steers OpenFHE's host setup (correction
+	// factor + StC encode level lDec, ckksrns-fhe.cpp:108-216), and for REAL data the precom
+	// LAYOUT is identical either way (the `REAL || !BTSlotsEncoding` guards at :234,257 fire on
+	// REAL). With btsfirstboot=false (the EvalBootstrap default), the OpenFHE host oracle the
+	// parity test compares against also dispatches the normal ModRaise-first EvalBootstrap, so
+	// haze's ModRaise-first port and the oracle stay in lockstep.
+	return BootstrapSetupPolicy{ precompute, btsfirstboot, modEvalLevels };
 }
 
 void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
@@ -1861,390 +2006,11 @@ std::vector<uint64_t> HazeEngine::qPrefix(size_t towers) const {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Chebyshev helpers — all ported from
-//   deps/openfhe-src/src/pke/lib/scheme/ckksrns/ckksrns-advancedshe.cpp
-// and
-//   deps/openfhe-src/src/pke/include/scheme/ckksrns/ckksrns-utils.h
-// expressed over the fideslib facade (CryptoContextImpl<DCRTPoly>& ctx).
+// Chebyshev Paterson-Stockmeyer is implemented as HazeEngine member functions
+// (see below, after the convolution helpers) so the base-case weighted sums can
+// call the Operand-level evalLinearWSumMutableCore. The recursion and affine map
+// are ported from the CUDA spec src/CKKS/ApproxModEval.cu (NOT OpenFHE).
 // ---------------------------------------------------------------------------
-
-// Under FIXEDAUTO (FIXEDMANUAL + AUTO modes):
-//   ctx.Rescale = OpenFHE ModReduceInPlace = no-op (clone) for AUTO.
-//   LevelReduce by n levels = SetLevel(ct, ct->GetLevel() + n): truncation only.
-//
-// compositeDegree = 1 (the default for FIXEDAUTO with standard params; see
-// deps/openfhe-src/src/pke/include/scheme/gen-cryptocontext-params-defaults.h:84).
-
-// Rescale one level (OpenFHE ModReduceInPlace). Under FIXEDAUTO this is a
-// no-op/clone in the facade — any depth-equalization needed is handled inside
-// EvalMult/EvalAdd adjust. We call it at exactly the same places OpenFHE does.
-static void hazeModReduceInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
-	ctx.RescaleInPlace(ct);
-}
-
-// Drop `n` levels (OpenFHE LevelReduceInPlace with diff/compositeDegree = n).
-// On the haze engine this calls setCiphertextLevel which truncates the limb chains
-// (no IR, no flush) — exactly as OpenFHE's DropLastElements.
-static void hazeLevelReduceInPlace(Ciphertext<DCRTPoly>& ct, size_t n) {
-	if (n == 0)
-		return;
-	ct->SetLevel(ct->GetLevel() + n);
-}
-
-// EvalPartialLinearWSum(T, coefficients, limit): sum_{i=1}^{limit} T[i-1] * coefficients[i],
-// rescaled by one level. Ported from ckksrns-advancedshe.cpp:142-193. Uses T[0..limit-1]
-// with coefficient indices [1..limit] (i.e. index 0 is the constant term, handled separately).
-static Ciphertext<DCRTPoly> hazeEvalPartialLinearWSum(CryptoContextImpl<DCRTPoly>& ctx,
-  const std::vector<Ciphertext<DCRTPoly>>& T,
-  const std::vector<double>& coefficients,
-  uint32_t limit) {
-	if (limit == 0)
-		limit = static_cast<uint32_t>(T.size());
-
-	// Under FIXEDAUTO, align all Ts to the same level (the max level + NSD).
-	// We do a simple clone-and-level-reduce approach matching what OpenFHE does:
-	// find the deepest (highest-level) T[i] up to limit, then drop others to match.
-	// For our use case (degree 5, all Ts were equalized to T[k-1] before calling),
-	// they are already equal, so this is mostly a no-op clone step.
-	std::vector<Ciphertext<DCRTPoly>> cts(limit);
-	size_t maxLevel = 0;
-	uint32_t maxIdx = 0;
-	for (uint32_t i = 0; i < limit; ++i) {
-		cts[i] = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[i]);
-		size_t lvl = cts[i]->GetLevel();
-		if (lvl > maxLevel || (lvl == maxLevel && cts[i]->GetNoiseScaleDeg() == 2)) {
-			maxLevel = lvl;
-			maxIdx	 = i;
-		}
-	}
-	// Drop all to the same level as the deepest.
-	for (uint32_t i = 0; i < limit; ++i) {
-		if (i != maxIdx) {
-			size_t diff = cts[maxIdx]->GetLevel() - cts[i]->GetLevel();
-			if (diff > 0)
-				hazeLevelReduceInPlace(cts[i], diff);
-		}
-	}
-	// Rescale depth-2 entries if the max is also depth 2.
-	if (cts[maxIdx]->GetNoiseScaleDeg() == 2) {
-		for (uint32_t i = 0; i < limit; ++i)
-			hazeModReduceInPlace(ctx, cts[i]);
-	}
-
-	// EvalMult by coefficients[i+1] (index i+1 corresponds to T[i]).
-	ctx.EvalMultInPlace(cts[0], coefficients[1]);
-	for (uint32_t i = 1; i < limit; ++i) {
-		ctx.EvalMultInPlace(cts[i], coefficients[i + 1]);
-		ctx.EvalAddInPlace(cts[0], cts[i]);
-	}
-	ctx.RescaleInPlace(cts[0]);
-	return cts[0];
-}
-
-// Forward declaration.
-static Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& x,
-  const std::vector<double>& coefficients,
-  uint32_t k, uint32_t m,
-  const std::vector<Ciphertext<DCRTPoly>>& T,
-  const std::vector<Ciphertext<DCRTPoly>>& T2);
-
-// Port of InnerEvalChebyshevPS from ckksrns-advancedshe.cpp:650-760.
-// Recurses on the Paterson-Stockmeyer tree.
-static Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& x,
-  const std::vector<double>& coefficients,
-  uint32_t k, uint32_t m,
-  const std::vector<Ciphertext<DCRTPoly>>& T,
-  const std::vector<Ciphertext<DCRTPoly>>& T2) {
-	// k2m2k = k*2^{m-1} - k
-	uint32_t k2m2k = k * (1u << (m - 1)) - k;
-
-	// Divide coefficients by T^{k*2^{m-1}}
-	std::vector<double> Tkm(k2m2k + k + 1, 0.0);
-	Tkm.back() = 1.0;
-	auto divqr = lbcrypto::LongDivisionChebyshev(coefficients, Tkm);
-
-	// Subtract T^{k(2^{m-1} - 1)} from r
-	auto& r2 = divqr->r;
-	uint32_t n = lbcrypto::Degree(r2);
-	if (static_cast<int32_t>(k2m2k - n) <= 0) {
-		r2.resize(n + 1);
-		r2[k2m2k] -= 1.0;
-	} else {
-		r2.resize(k2m2k + 1);
-		r2.back() = -1.0;
-	}
-
-	auto divcs = lbcrypto::LongDivisionChebyshev(r2, divqr->q);
-
-	Ciphertext<DCRTPoly> cu, qu, su;
-
-	{
-		// Evaluate q at u.
-		if (lbcrypto::Degree(divqr->q) > k) {
-			qu = hazeInnerEvalChebyshevPS(ctx, x, divqr->q, k, m - 1, T, T2);
-		} else {
-			// dq = k from construction; highest order is a power of 2 up to 2^{m-1}.
-			qu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
-			uint32_t limit = static_cast<uint32_t>(std::log2(lbcrypto::ToReal(divqr->q.back())));
-			for (uint32_t i = 0; i < limit; ++i)
-				ctx.EvalAddInPlace(qu, qu);
-			// adds the free term (constant) /2
-			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
-			// Add partial linear sum for remaining coefficients
-			divqr->q.resize(k);
-			if (uint32_t nn = lbcrypto::Degree(divqr->q); nn > 0)
-				ctx.EvalAddInPlace(qu, hazeEvalPartialLinearWSum(ctx, T, divqr->q, nn));
-		}
-	}
-
-	{
-		// Evaluate s2 at u: first add T^{k(2^{m-1}-1)} back to s.
-		auto& s2 = divcs->r;
-		s2.resize(k2m2k + 1);
-		s2.back() = 1.0;
-
-		if (lbcrypto::Degree(s2) > k) {
-			su = hazeInnerEvalChebyshevPS(ctx, x, s2, k, m - 1, T, T2);
-		} else {
-			// Highest order is 1 (s2 is monic).
-			su = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
-			s2.resize(k);
-			if (uint32_t nn = lbcrypto::Degree(s2); nn > 0)
-				ctx.EvalAddInPlace(su, hazeEvalPartialLinearWSum(ctx, T, s2, nn));
-			// adds the free term /2
-			ctx.EvalAddInPlace(su, s2.front() / 2.0);
-			// reduce su to match T2[m-1] + 1 levels
-			hazeLevelReduceInPlace(su, (su->GetLevel() > T2[m - 1]->GetLevel()) ? su->GetLevel() - T2[m - 1]->GetLevel() : 0);
-		}
-	}
-
-	// Evaluate c (the quotient polynomial from divcs).
-	{
-		uint32_t n_c = lbcrypto::Degree(divcs->q);
-		if (n_c >= 1) {
-			if (n_c == 1) {
-				if (lbcrypto::IsNotEqualOne(divcs->q[1])) {
-					cu = ctx.EvalMult(T[0], divcs->q[1]);
-					hazeModReduceInPlace(ctx, cu);
-				} else {
-					cu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[0]);
-				}
-			} else {
-				cu = hazeEvalPartialLinearWSum(ctx, T, divcs->q, n_c);
-			}
-			// adds the free term /2
-			ctx.EvalAddInPlace(cu, divcs->q.front() / 2.0);
-			// level-reduce cu to T2[m-1]
-			size_t cuLvl	 = cu->GetLevel();
-			size_t t2mLvl	 = T2[m - 1]->GetLevel();
-			if (cuLvl < t2mLvl)
-				hazeLevelReduceInPlace(cu, t2mLvl - cuLvl);
-		}
-	}
-
-	if (cu) {
-		cu = ctx.EvalAdd(T2[m - 1], cu);
-	} else {
-		cu = ctx.EvalAdd(T2[m - 1], divcs->q.front() / 2.0);
-	}
-
-	auto result = ctx.EvalMult(cu, qu);
-	hazeModReduceInPlace(ctx, result);
-	ctx.EvalAddInPlace(result, su);
-	return result;
-}
-
-// Port of internalEvalChebyPolysLinear (ckksrns-advancedshe.cpp:572-621):
-// build T[0..k-1] (Chebyshev powers of the linearly-transformed argument) and
-// level-equalize them to T[k-1].
-static std::vector<Ciphertext<DCRTPoly>> hazeEvalChebyPolysLinear(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& x,
-  const std::vector<double>& coefficients,
-  double a, double b) {
-	const uint32_t k = static_cast<uint32_t>(coefficients.size()) - 1;
-	std::vector<Ciphertext<DCRTPoly>> T(k);
-
-	// Linear transformation: y = -1 + 2*(x-a)/(b-a), consuming one level when [a,b] != [-1,1].
-	if (!lbcrypto::IsNotEqualNegOne(a) && !lbcrypto::IsNotEqualOne(b)) {
-		T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*x);
-	} else {
-		double alpha = 2.0 / (b - a);
-		double beta	 = a * alpha;
-		T[0]		 = ctx.EvalMult(x, alpha);
-		hazeModReduceInPlace(ctx, T[0]);
-		ctx.EvalAddInPlace(T[0], -1.0 - beta);
-	}
-
-	// Build Chebyshev powers up to degree k: T_{2i}(y) = 2*T_i(y)^2 - 1; T_{2i+1} = 2*T_i*T_{i+1} - y.
-	for (uint32_t i = 2; i <= k; ++i) {
-		if (i & 0x1u) {
-			// T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
-			T[i - 1] = ctx.EvalMult(T[i / 2 - 1], T[i / 2]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2 (no rescale; NSD already 2)
-			hazeModReduceInPlace(ctx, T[i - 1]);
-			ctx.EvalSubInPlace(T[i - 1], T[0]);
-		} else {
-			// T_{2i}(y) = 2*T_i(y)^2 - 1
-			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
-			hazeModReduceInPlace(ctx, T[i - 1]);
-			ctx.EvalAddInPlace(T[i - 1], -1.0);
-		}
-	}
-
-	// Level-equalize: bring all T[0..k-2] to the level of T[k-1].
-	for (uint32_t i = 1; i < k; ++i) {
-		size_t diff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
-		hazeLevelReduceInPlace(T[i - 1], diff);
-	}
-
-	return T;
-}
-
-// Port of internalEvalChebyshevSeriesLinearWithPrecomp (ckksrns-advancedshe.cpp:624-647):
-// compute the linear weighted sum of the T powers, adding the free term at the end.
-static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesLinearWithPrecomp(CryptoContextImpl<DCRTPoly>& ctx,
-  std::vector<Ciphertext<DCRTPoly>>& T,
-  const std::vector<double>& coefficients) {
-	const uint32_t k = static_cast<uint32_t>(coefficients.size()) - 2;
-
-	// Scalar multiply for highest-order term.
-	auto result = ctx.EvalMult(T[k], coefficients[k + 1]);
-
-	// Scalar multiply for all other terms and accumulate.
-	for (uint32_t i = 0; i < k; ++i) {
-		if (lbcrypto::IsNotEqualZero(coefficients[i + 1])) {
-			ctx.EvalMultInPlace(T[i], coefficients[i + 1]);
-			ctx.EvalAddInPlace(result, T[i]);
-		}
-	}
-
-	// Rescale after the scalar multiplications.
-	hazeModReduceInPlace(ctx, result);
-
-	// Add the free term (constant) / 2.
-	ctx.EvalAddInPlace(result, coefficients[0] / 2.0);
-
-	return result;
-}
-
-// Port of internalEvalChebyPolysPS (ckksrns-advancedshe.cpp:763-841):
-// build T[0..k-1] (the base Chebyshev powers), T2[0..m-1] (the extended chain),
-// and T2km1 = T_{k(2^m - 1)}.
-struct HazeChebyPS {
-	std::vector<Ciphertext<DCRTPoly>> T;	 // T[0] = T_1(y), ... T[k-1] = T_k(y)
-	std::vector<Ciphertext<DCRTPoly>> T2; // T2[i] = T_{k*2^i}(y), T2[0] placeholder = T[k-1]
-	Ciphertext<DCRTPoly> T2km1;			 // T_{k(2^m-1)}(y)
-	uint32_t k, m;
-};
-
-static HazeChebyPS hazeEvalChebyPolysPS(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& x,
-  uint32_t degree, double a, double b) {
-	auto degs  = lbcrypto::ComputeDegreesPS(degree);
-	uint32_t k = degs[0];
-	uint32_t m = degs[1];
-
-	std::vector<Ciphertext<DCRTPoly>> T(k);
-	// Linear transformation (same as linear path).
-	if (!lbcrypto::IsNotEqualNegOne(a) && !lbcrypto::IsNotEqualOne(b)) {
-		T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*x);
-	} else {
-		double alpha = 2.0 / (b - a);
-		double beta	 = a * alpha;
-		T[0]		 = ctx.EvalMult(x, alpha);
-		hazeModReduceInPlace(ctx, T[0]);
-		ctx.EvalAddInPlace(T[0], -1.0 - beta);
-	}
-
-	// Build Chebyshev powers up to degree k.
-	for (uint32_t i = 2; i <= k; ++i) {
-		if (i & 0x1u) {
-			T[i - 1] = ctx.EvalMult(T[i / 2 - 1], T[i / 2]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
-			hazeModReduceInPlace(ctx, T[i - 1]);
-			ctx.EvalSubInPlace(T[i - 1], T[0]);
-		} else {
-			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]); // ×2
-			hazeModReduceInPlace(ctx, T[i - 1]);
-			ctx.EvalAddInPlace(T[i - 1], -1.0);
-		}
-	}
-
-	// Under FIXEDAUTO, equalize T[0..k-2] to T[k-1] via AdjustLevelsAndDepthInPlace.
-	// For FIXEDAUTO this means adjustForAddOrSub: the engine handles this inside EvalAdd,
-	// but we must pre-equalize for the PS algorithm which accesses T directly.
-	// Use the same approach as the PS path: AdjustLevelsAndDepthInPlace = SetLevel to max.
-	for (uint32_t i = 1; i < k; ++i) {
-		size_t diff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
-		if (diff > 0)
-			hazeLevelReduceInPlace(T[i - 1], diff);
-	}
-
-	// Build T2[0..m-1] and T2km1.
-	std::vector<Ciphertext<DCRTPoly>> T2(m);
-	T2[0] = T.back(); // placeholder
-
-	auto T2km1 = T.back();
-
-	for (uint32_t i = 1; i < m; ++i) {
-		// T2[i] = 2*T2[i-1]^2 - 1 = T_{k*2^i}(y)
-		T2[i] = ctx.EvalSquare(T2[i - 1]);
-		ctx.EvalAddInPlace(T2[i], T2[i]); // ×2
-		hazeModReduceInPlace(ctx, T2[i]);
-		ctx.EvalAddInPlace(T2[i], -1.0);
-
-		// T2km1 = 2*T2km1 * T2[i] - T2[0] = T_{k(2*m-1)}(y)
-		T2km1 = ctx.EvalMult(T2km1, T2[i]);
-		ctx.EvalAddInPlace(T2km1, T2km1); // ×2
-		hazeModReduceInPlace(ctx, T2km1);
-		ctx.EvalSubInPlace(T2km1, T2[0]);
-	}
-
-	return HazeChebyPS{ std::move(T), std::move(T2), std::move(T2km1), k, m };
-}
-
-// Port of internalEvalChebyshevSeriesPSWithPrecomp (ckksrns-advancedshe.cpp:844-861).
-static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesPSWithPrecomp(CryptoContextImpl<DCRTPoly>& ctx,
-  HazeChebyPS& poly,
-  const std::vector<double>& coefficients) {
-	auto& T	   = poly.T;
-	auto& T2   = poly.T2;
-	auto& T2km1 = poly.T2km1;
-	uint32_t k = poly.k;
-	uint32_t m = poly.m;
-
-	uint32_t k2m2k = k * (1u << (m - 1)) - k;
-
-	// f2 = coefficients extended + 1 at position 2*k2m2k+k (monic degree).
-	auto f2 = coefficients;
-	f2.resize(lbcrypto::Degree(f2) + 1);
-	f2.resize(2 * k2m2k + k + 1);
-	f2.back() = 1.0;
-
-	return ctx.EvalSub(hazeInnerEvalChebyshevPS(ctx, T[0], f2, k, m, T, T2), T2km1);
-}
-
-// Top-level port of EvalChebyshevSeries: dispatch on degree < 5 (linear) vs >= 5 (PS).
-// Port of AdvancedSHECKKSRNS::EvalChebyshevSeries (ckksrns-advancedshe.cpp:882-896).
-static Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& ct,
-  std::vector<double>& coeffs,
-  double a, double b) {
-	uint32_t degree = lbcrypto::Degree(coeffs);
-	if (degree < 5) {
-		// Linear path.
-		auto T = hazeEvalChebyPolysLinear(ctx, ct, coeffs, a, b);
-		return hazeEvalChebyshevSeriesLinearWithPrecomp(ctx, T, coeffs);
-	} else {
-		// Paterson-Stockmeyer path.
-		auto poly = hazeEvalChebyPolysPS(ctx, ct, degree, a, b);
-		return hazeEvalChebyshevSeriesPSWithPrecomp(ctx, poly, coeffs);
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Convolution transform — ported from cpuConvolutionTransform
@@ -2361,6 +2127,345 @@ static Ciphertext<DCRTPoly> hazeConvolutionTransform(CryptoContextImpl<DCRTPoly>
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Chebyshev Paterson-Stockmeyer — port of the CUDA spec src/CKKS/ApproxModEval.cu
+// (evalChebyshevSeries@370, innerEvalChebyshevPS@138). FIDESlib/CUDA is the spec;
+// OpenFHE is reference-only. Divergences from OpenFHE are commented inline (#12-#15).
+// ---------------------------------------------------------------------------
+
+HazeEngine::Operand HazeEngine::evalLinearWSumMutableCore(size_t targetTowers,
+  const std::vector<Operand>& ops,
+  const std::vector<double>& weights) {
+	// Port of CUDA Ciphertext::evalLinearWSumMutable (Ciphertext.cpp:1168): out = sum_i
+	// weights[i]*ops[i] produced directly at `targetTowers` (NSD=2). CUDA grows a fresh ct to
+	// the target level then fills it via per-limb ElemForEvalMult + evalLinearWSum; haze cannot
+	// grow (setCiphertextLevel only drops), so we build the result at targetTowers here.
+	// Each ops[i] is at NoiseLevel 1 and ops[i].towers >= targetTowers; reading the leading
+	// targetTowers limbs is a valid Q-prefix view (CUDA ElemForEvalMult uses level_in=towersIn).
+	const size_t n	= ops.size();
+	const auto base = qPrefix(targetTowers);
+	if (n == 0) {
+		throw std::runtime_error("haze backend: evalLinearWSumMutableCore needs at least one operand");
+	}
+
+	// CUDA encodes each weight with level_in = ops[i].towers (the bootstrap-prescale fast path:
+	// scFactorOut * ModReduceFactor[targetTowers-1] / scFactorIn), exact for FIXED modes.
+	for (size_t i = 0; i < n; ++i) {
+		// CUDA asserts target level <= ctxs[i] level, i.e. each op must have >= targetTowers limbs
+		// (reading the leading targetTowers limbs as a Q-prefix view).
+		if (ops[i].towers < targetTowers) {
+			throw std::runtime_error("haze backend: evalLinearWSumMutableCore operand has fewer towers than target");
+		}
+	}
+	auto encode = [&](size_t i) {
+		return hazebk::elemForEvalMult(scalarParams(), targetTowers, weights[i], ops[i].towers);
+	};
+
+	LimbChain out0(targetTowers, polyBytes_);
+	{
+		const auto f0 = encode(0);
+		hazeCheck(hazeMulScalarMrp(out0.data(), ops[0].p->c0.asConst().data(), f0.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
+	}
+	LimbChain out1;
+	const bool haveC1 = !ops[0].p->c1.empty();
+	if (haveC1) {
+		out1		  = LimbChain(targetTowers, polyBytes_);
+		const auto f0 = encode(0);
+		hazeCheck(hazeMulScalarMrp(out1.data(), ops[0].p->c1.asConst().data(), f0.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
+	}
+	for (size_t i = 1; i < n; ++i) {
+		const auto fi = encode(i);
+		LimbChain term0(targetTowers, polyBytes_);
+		hazeCheck(hazeMulScalarMrp(term0.data(), ops[i].p->c0.asConst().data(), fi.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
+		LimbChain acc0(targetTowers, polyBytes_);
+		hazeCheck(hazeAddMrp(acc0.data(), out0.asConst().data(), term0.asConst().data(), base.data(), base.size(), nullptr), "hazeAddMrp");
+		out0 = std::move(acc0);
+		if (haveC1) {
+			LimbChain term1(targetTowers, polyBytes_);
+			hazeCheck(hazeMulScalarMrp(term1.data(), ops[i].p->c1.asConst().data(), fi.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
+			LimbChain acc1(targetTowers, polyBytes_);
+			hazeCheck(hazeAddMrp(acc1.data(), out1.asConst().data(), term1.asConst().data(), base.data(), base.size(), nullptr), "hazeAddMrp");
+			out1 = std::move(acc1);
+		}
+	}
+
+	Operand res;
+	res.towers		  = targetTowers;
+	res.noiseScaleDeg = 2; // CUDA NoiseLevel=2 after the weighted sum
+	const size_t level = qBase_.size() - targetTowers;
+	res.scalingFactor = sfReal_[level] * sfReal_[level]; // CUDA NoiseFactor = ScalingFactorReal[level]^2
+	res.slots		  = ops[0].slots;
+	for (size_t i = 1; i < n; ++i)
+		res.slots = std::max(res.slots, ops[i].slots);
+	res.p = finishPayload(std::move(out0), std::move(out1), res);
+	return res;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::evalLinearWSumMutableFacade(CryptoContextImpl<DCRTPoly>& ctx,
+  size_t targetTowers,
+  const std::vector<Ciphertext<DCRTPoly>>& ctxs,
+  const std::vector<double>& weights) {
+	std::vector<Operand> ops;
+	ops.reserve(ctxs.size());
+	for (const auto& c : ctxs) {
+		auto pc = ensureCt(ctx, c);
+		ops.push_back(asOperand(pc));
+	}
+	Operand res = evalLinearWSumMutableCore(targetTowers, ops, weights);
+	return wrapDeviceResult(ctx, ctxs[0], std::move(res.p));
+}
+
+Ciphertext<DCRTPoly> HazeEngine::hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+  const std::vector<double>& coefficients,
+  uint32_t k, uint32_t m,
+  const std::vector<Ciphertext<DCRTPoly>>& T,
+  const std::vector<Ciphertext<DCRTPoly>>& T2,
+  int level_offset, int max_m) {
+	// CUDA getLevel of a facade ct = towers-1 = (|Q| - GetLevel()) - 1 (inverse of OpenFHE GetLevel).
+	auto cudaLevel = [&](const Ciphertext<DCRTPoly>& c) -> int {
+		return static_cast<int>(qBase_.size()) - static_cast<int>(c->GetLevel()) - 1;
+	};
+	auto noiseLevel = [&](const Ciphertext<DCRTPoly>& c) -> size_t { return c->GetNoiseScaleDeg(); };
+
+	// --- Coefficient long division (identical to OpenFHE / CUDA, left as-is) ---
+	uint32_t k2m2k = k * (1u << (m - 1)) - k;
+	auto f2		   = coefficients;
+	f2.resize(2 * k2m2k + k + 1, 0.0);
+	if (f2.size() > coefficients.size())
+		f2.back() = 1.0;
+	std::vector<double> Tkm(int32_t(k2m2k + k) + 1, 0.0);
+	Tkm.back()	= 1.0;
+	auto divqr	= lbcrypto::LongDivisionChebyshev(f2, Tkm);
+	std::vector<double> r2 = divqr->r;
+	if (int32_t(k2m2k - lbcrypto::Degree(divqr->r)) <= 0) {
+		r2[int32_t(k2m2k)] -= 1.0;
+		r2.resize(lbcrypto::Degree(r2) + 1);
+	} else {
+		r2.resize(int32_t(k2m2k + 1), 0.0);
+		r2.back() = -1.0;
+	}
+	auto divcs			   = lbcrypto::LongDivisionChebyshev(r2, divqr->q);
+	std::vector<double> s2 = divcs->r;
+	s2.resize(int32_t(k2m2k + 1), 0.0);
+	s2.back() = 1.0;
+
+	// --- Evaluate c at u (cu) ---
+	Ciphertext<DCRTPoly> cu;
+	uint32_t dc	  = lbcrypto::Degree(divcs->q);
+	bool flag_c	  = false;
+	if (dc >= 1) {
+		if (dc == 1) {
+			if (divcs->q[1] != 1) {
+				// CUDA cu.multScalar(*T[0], divcs->q[1], true): under FIXEDAUTO the rescale arg is
+				// inert (multScalar passes rescale&&FIXEDMANUAL), so this is just multScalar -> NSD2.
+				cu = ctx.EvalMult(T[0], divcs->q[1]);
+			} else {
+				cu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[0]);
+			}
+		} else {
+			std::vector<double> weights(dc);
+			for (uint32_t i = 0; i < dc; ++i)
+				weights[i] = divcs->q[i + 1];
+			// CUDA: cu.dropToLevel(target); cu.growToLevel(target); cu.evalLinearWSumMutable(dc, T, weights).
+			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - level_offset;
+			std::vector<Ciphertext<DCRTPoly>> ctxs(T.begin(), T.begin() + dc);
+			cu = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxs, weights);
+		}
+		ctx.EvalAddInPlace(cu, divcs->q.front() / 2.0);
+		// FIXEDMANUAL rescale here is skipped on the FIXEDAUTO spec path.
+		flag_c = true;
+	}
+
+	// --- Evaluate q at u (qu) ---
+	Ciphertext<DCRTPoly> qu;
+	if (lbcrypto::Degree(divqr->q) > k) {
+		assert(m > 2);
+		// q recurses at level_offset (CUDA ApproxModEval.cu:230).
+		qu = hazeInnerEvalChebyshevPS(ctx, divqr->q, k, m - 1, T, T2, level_offset, max_m);
+		if (noiseLevel(qu) == 2)
+			ctx.RescaleInPlace(qu);
+	} else {
+		auto qcopy = divqr->q;
+		qcopy.resize(k);
+		if (lbcrypto::Degree(qcopy) > 0) {
+			std::vector<double> weights;
+			std::vector<Ciphertext<DCRTPoly>> ctxs;
+			for (uint32_t i = 0; i < divqr->q.size() - 1; ++i) {
+				if (divqr->q[i + 1] != 0) {
+					weights.push_back(divqr->q[i + 1]);
+					ctxs.push_back(T[i]);
+				}
+			}
+			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - level_offset;
+			qu		   = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxs, weights);
+			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
+			// CUDA: if (T[k-1]->NoiseLevel==1) qu.rescale(); ... if (T[k-1]->NoiseLevel==2) qu.rescale();
+			// Either way qu is rescaled exactly once (NSD2 -> NSD1) since T[k-1] NL is 1 or 2.
+			ctx.RescaleInPlace(qu);
+		} else {
+			qu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
+			if (divqr->q.back() > 0 && divqr->q.back() - std::round(divqr->q.back()) == 0.0) {
+				// CUDA multIntScalar (integer scalar mult); for the degree path this is the leading
+				// power-of-2 coefficient. EvalMult by a double is metadata-equivalent here.
+				ctx.EvalMultInPlace(qu, divqr->q.back());
+			} else {
+				__builtin_unreachable();
+			}
+			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
+			if (noiseLevel(qu) == 2)
+				ctx.RescaleInPlace(qu);
+		}
+	}
+
+	// --- Evaluate s2 at u (su) ---
+	Ciphertext<DCRTPoly> su;
+	if (lbcrypto::Degree(s2) > k) {
+		assert(m > 2);
+		// s recurses at level_offset + 1 (CUDA ApproxModEval.cu:308).
+		su = hazeInnerEvalChebyshevPS(ctx, s2, k, m - 1, T, T2, level_offset + 1, max_m);
+	} else {
+		auto scopy = s2;
+		scopy.resize(k);
+		if (lbcrypto::Degree(scopy) > 0) {
+			std::vector<Ciphertext<DCRTPoly>> ctxs;
+			std::vector<double> weights;
+			for (uint32_t i = 0; i < s2.size() - 1; ++i) {
+				if (s2[i + 1] != 0) {
+					ctxs.emplace_back(T[i]);
+					weights.push_back(s2[i + 1]);
+				}
+			}
+			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - 1 - level_offset;
+			// CUDA quirk: evalLinearWSumMutable(ctxs.size(), T, weights) passes the FULL T vector with
+			// n=ctxs.size() (ApproxModEval.cu:328), not the filtered ctxs. Match CUDA verbatim.
+			std::vector<Ciphertext<DCRTPoly>> ctxsFull(T.begin(), T.begin() + ctxs.size());
+			su = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxsFull, weights);
+			ctx.EvalAddInPlace(su, s2.front() / 2.0);
+			// CUDA leaves su un-rescaled here (the rescale lines are commented out); s2 is monic.
+			assert(s2.back() == 1.0);
+		} else {
+			su = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
+			ctx.EvalAddInPlace(su, s2.front() / 2.0);
+		}
+	}
+
+	// --- Combine: cu = (T2[m-1] + cu) * qu + su ---
+	if (flag_c) {
+		// CUDA: for m>3 the required cu levels are not strictly decreasing, so cache-align cu to
+		// T2[m-1] only when max_m - m <= 1 (ApproxModEval.cu:351). adjustForAddOrSub equalizes
+		// level+depth in place; in the facade EvalAdd does the adjust, so we let EvalAdd handle it
+		// when caching applies and otherwise still EvalAdd (the metadata outcome is the same).
+		ctx.EvalAddInPlace(cu, T2[m - 1]);
+	} else {
+		cu = ctx.EvalAdd(T2[m - 1], divcs->q.front() / 2.0);
+	}
+	// FIXEDMANUAL out NSD==2 rescale skipped on the FIXEDAUTO spec path.
+	cu = ctx.EvalMult(cu, qu); // CUDA cu.mult(qu, false): relin, no rescale
+	ctx.EvalAddInPlace(cu, su);
+	return cu;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& ct,
+  std::vector<double>& coefficients,
+  double a, double b) {
+	double lower_bound = a;
+	double upper_bound = b;
+
+	// Working copy of the input; the affine map + T[0] build mutate it (CUDA mutates ctxt in place).
+	Ciphertext<DCRTPoly> ctxt = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+
+	// #13 affine map to [-1,1] — CUDA pre-T centering (ApproxModEval.cu:377-387), NOT OpenFHE's
+	// single y=-1+2(x-a)/(b-a) (which always costs a multScalar+ModReduce). CUDA has a span==2
+	// no-multiply fast path and otherwise centers-then-scales.
+	if (std::abs(lower_bound + 1.0) > 1e-9 || std::abs(upper_bound - 1.0) > 1e-9) {
+		if (std::abs(upper_bound - lower_bound - 2.0) < 1e-8) {
+			// span == 2 fast path: shift only, no multiply (OpenFHE would still multiply by 1).
+			ctx.EvalAddInPlace(ctxt, -lower_bound + 1.0);
+		} else {
+			if (std::abs(lower_bound + upper_bound) > 1e-8)
+				// Center on 0: subtract the interval midpoint (a+b)/2 == a + (b-a)/2.
+				// CUDA writes addScalar(-a + (b-a)/2) (ApproxModEval.cu:382), distributing the minus
+				// onto only `a` — a sign BUG that gives shift (b-3a)/2 instead of -(a+b)/2. CUDA's own
+				// Chebyshev tests only use [-1,1] (the span==2 fast path above), so the bug is never
+				// exercised there; the haze [0,1] test does hit it, so we use the OpenFHE-correct
+				// shift -(a + (b-a)/2) here (the one deliberate deviation from a verbatim CUDA port).
+				ctx.EvalAddInPlace(ctxt, -(lower_bound + (upper_bound - lower_bound) / 2.0));
+			// FIXEDMANUAL pre-rescale (ApproxModEval.cu:383-384) is skipped on the FIXEDAUTO spec path.
+			ctx.EvalMultInPlace(ctxt, 2.0 / (upper_bound - lower_bound));
+		}
+	}
+
+	// #12 always Paterson-Stockmeyer — CUDA has NO degree<5 linear dispatch (ApproxModEval.cu:370-404).
+	uint32_t n	= lbcrypto::Degree(coefficients);
+	auto f2coef = coefficients;
+	f2coef.resize(n + 1);
+
+	auto degs  = lbcrypto::ComputeDegreesPS(n);
+	uint32_t k = degs[0];
+	uint32_t m = degs[1];
+
+	std::vector<Ciphertext<DCRTPoly>> T(k);
+	// CUDA copies the (already-mapped) ctxt into T[0] (ApproxModEval.cu:455), then rescales if NSD2.
+	T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*ctxt);
+	if (T[0]->GetNoiseScaleDeg() == 2)
+		ctx.RescaleInPlace(T[0]);
+
+	for (uint32_t i = 2; i <= k; ++i) {
+		if (i % 2 == 1) {
+			// T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
+			T[i - 1] = ctx.EvalMult(T[i / 2], T[i / 2 - 1]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]);
+			// CUDA: ctxt.adjustForAddOrSub(*T[i-1]); if(ctxt.NL==1) T[i-1].rescale(); T[i-1].sub(ctxt).
+			// The facade EvalSub performs the adjust+depth-fix internally (Task 02 parity).
+			ctx.EvalSubInPlace(T[i - 1], ctxt);
+		} else {
+			// T_{2i}(y) = 2*T_i(y)^2 - 1
+			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
+			ctx.EvalAddInPlace(T[i - 1], T[i - 1]);
+			ctx.EvalAddInPlace(T[i - 1], -1.0);
+		}
+	}
+
+	for (size_t i = 1; i <= k; ++i) {
+		if (T[i - 1]->GetNoiseScaleDeg() == 2)
+			ctx.RescaleInPlace(T[i - 1]);
+	}
+	// FIXEDMANUAL drops all T[i] to T[k-1]'s level here; under FIXEDAUTO the GPU spec leaves the
+	// T-equalization to the lazy adjust inside the later EvalMult/EvalAdd (ApproxModEval.cu:563-583).
+
+	// Build T2[0..m-1]: T2[i] = T_{k*2^i}(y); T2[0] is a placeholder = T[k-1].
+	std::vector<Ciphertext<DCRTPoly>> T2(m);
+	T2[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*T.back());
+	for (uint32_t i = 1; i < m; ++i) {
+		// FIXEDMANUAL pre/post rescales (ApproxModEval.cu:605-613) skipped on the FIXEDAUTO path.
+		T2[i] = ctx.EvalSquare(T2[i - 1]);
+		ctx.EvalAddInPlace(T2[i], T2[i]);
+		ctx.EvalAddInPlace(T2[i], -1.0);
+	}
+
+	// T2km1 = T_{k(2m-1)}(y).
+	Ciphertext<DCRTPoly> T2km1 = std::make_shared<CiphertextImpl<DCRTPoly>>(*T2[0]);
+	// FIXEDMANUAL drops T2km1 to T2[1]'s level (ApproxModEval.cu:646-648); skipped on FIXEDAUTO.
+	for (uint32_t i = 1; i < m; ++i) {
+		// T_{k(2m-1)} = 2*T_{k(2^{m-1}-1)}(y)*T_{k*2^{m-1}}(y) - T_k(y)
+		T2km1 = ctx.EvalMult(T2km1, T2[i]);
+		ctx.EvalAddInPlace(T2km1, T2km1);
+		// CUDA: T2[0].adjustForAddOrSub(T2km1); if(T2[0].NL==1) T2km1.rescale(); T2km1.sub(*T2[0]);
+		// if(T2[0].NL==2 && i<m-1) T2km1.rescale(). The facade EvalSub does the adjust; the trailing
+		// rescale matters only for m>3 (deep path), where we additionally rescale T2km1 below.
+		ctx.EvalSubInPlace(T2km1, T2[0]);
+		if (T2[0]->GetNoiseScaleDeg() == 2 && i < m - 1)
+			ctx.RescaleInPlace(T2km1);
+	}
+
+	// Paterson-Stockmeyer recursion; top-level call uses level_offset=0, max_m=m.
+	Ciphertext<DCRTPoly> result = hazeInnerEvalChebyshevPS(ctx, f2coef, k, m, T, T2, 0, static_cast<int>(m));
+
+	// result - T2km1 (ApproxModEval.cu:700).
+	return ctx.EvalSub(result, T2km1);
+}
 
 // ---- EvalChebyshevSeries ----
 

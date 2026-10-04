@@ -267,9 +267,35 @@ class HazeEngine final : public Engine {
 		hazebk::LimbChain b;
 		hazebk::LimbChain a;
 	};
+
+	/// @brief Hoisting handle (#19): the input-only prefix of hybridKeyswitch — the per-digit
+	/// ModUp+NTT decomposition of one degree-1 component (c1), in EVAL form over Q∥P. This is the
+	/// shared "ModUp once" of CUDA's rotate_hoisted (Ciphertext.cpp:965 c1.modupInto): it depends
+	/// ONLY on (c1, towers), NOT on any key, so it is computed once and reused across every rotation
+	/// index / key row (the per-key dot product is the cheap part). digitsEval holds numDigits
+	/// blocks of qpTowers limbs; the metadata mirrors the values hybridKeyswitch would recompute.
+	struct HoistedDigits {
+		hazebk::LimbChain digitsEval; // [numDigits * qpTowers] EVAL-form digits over Q∥P
+		size_t towers	= 0;		  // Q-prefix length the decomposition was built at
+		size_t numDigits = 0;
+		size_t qpTowers = 0;		  // towers + |P| (the Q∥P row count per digit)
+		std::vector<uint64_t> qpBase; // Q-prefix ∥ P moduli (the per-op MRP base for step 3)
+	};
+	/// @brief #19 step 1-2: factor the key-independent ModUp/per-digit-NTT prefix of
+	/// hybridKeyswitch out of the per-key work. `numPartQ` is the key's digit count (alpha
+	/// partition is keyed off it); the result is the reusable HoistedDigits handle.
+	HoistedDigits hoistedKeyswitchPrefix(const hazebk::LimbChain& src, size_t towers, size_t numPartQ);
+	/// @brief #19 step 3: per-key dot product of a precomputed HoistedDigits handle against
+	/// `key`, then (ext=false) ModDown(drop P)+NTT to base-Q, or (ext=true, #10) KEEP the
+	/// extended Q∥P basis and SKIP the ModDown (CUDA rotate_hoisted ext=true,
+	/// Ciphertext.cpp:994-998). The returned KsContribution chains are at `digits.towers` Q
+	/// primes (ext=false) or `digits.qpTowers` Q∥P rows in EVAL form (ext=true).
+	KsContribution hybridKeyswitchFromDigits(const HoistedDigits& digits, KsKey& key, bool ext = false);
 	/// @brief Hybrid keyswitch of `src` (degree-1 component, EVAL form, first `towers` Q
 	/// primes) against `key` — same math for relin (ct×ct) and automorphism (rotation)
-	/// keys. Returns the (b, a) contribution in EVAL form at `towers` Q primes.
+	/// keys. Returns the (b, a) contribution in EVAL form at `towers` Q primes. Now a thin
+	/// composition of hoistedKeyswitchPrefix + hybridKeyswitchFromDigits (so relin and
+	/// non-hoisted rotation callers stay byte-identical).
 	KsContribution hybridKeyswitch(const hazebk::LimbChain& src, size_t towers, KsKey& key);
 
 	/// @brief OpenFHE AdjustLevelsAndDepthToOneInPlace: adjustForAddOrSub, then rescale both
@@ -281,6 +307,22 @@ class HazeEngine final : public Engine {
 	/// without a pre-extracted key fall back to FindAutomorphismIndex + the lazy auto-key
 	/// cache (bootstrap rotations).
 	Operand rotateCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step);
+	/// @brief Resolve the slots-aware rotation key + automorphism index for `step` (the
+	/// normalyzeIndex + rotKeyIndex_ alternate-key search from rotateCore, #7). Returns the
+	/// RotKey* and its autoIndex when a pre-extracted key matches (fast-rotation path); returns
+	/// nullptr when the step has no registered key (fast rotation has no host fallback — that is
+	/// the plain-rotate path's job).
+	struct RotKeyResolved {
+		KsKey* key		   = nullptr;
+		uint32_t autoIndex = 0;
+	};
+	RotKeyResolved resolveRotationKey(int32_t step, size_t slots);
+	/// @brief Fast rotation of `x` reusing a precomputed HoistedDigits handle (#19): per index
+	/// it does ONLY the cheap per-key step (hybridKeyswitchFromDigits) + the same c0+ks.b /
+	/// AutomorphMrp assembly as rotateCore, so the result is byte-identical to evalRotate(x,step)
+	/// while the expensive ModUp/NTT decomposition is shared across indexes. Requires a
+	/// pre-extracted key for `step` (resolveRotationKey); throws if absent.
+	Operand fastRotateFromDigits(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int32_t step, const HoistedDigits& digits);
 	/// @brief ct×pt with the multPt adjust rules (Ciphertext.cpp:356-421): full polynomial
 	/// MulMrp of both components against the pt chain (never the slot-constant shortcut).
 	Operand multPtCore(const Operand& ct, const hazebk::HazePtPayload& pt);
@@ -312,16 +354,36 @@ class HazeEngine final : public Engine {
 	struct BootPrecom {
 		uint32_t slots = 0;
 		bool isLT	   = false; // levelBudget {1,1} (the acceptance path)
+		// OpenFHE precom->BTSlotsEncoding (ckksrns-fhe.cpp:125). CUDA's Engine path is ALWAYS
+		// ModRaise-first (Bootstrap.cu:169) and forwards btsfirstboot into this flag (default
+		// false). bootstrapStaged selects the ModRaise-first port when false (CUDA-matching) and
+		// keeps the StC-first port when true (the CPU oracle's BTSlotsEncoding=true configs).
+		bool btSlotsEncoding = false;
 		uint32_t bStep = 0;		// m_dim1 / m_paramsEnc.g; 0 -> ceil(sqrt(slots))
 		uint32_t correctionFactor = 0;
-		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts
-		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts
+		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts (isLT)
+		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts (isLT)
+		// Multi-stage FFT precom (levelBudget != {1,1}, !isLT). Per-stage plaintext vectors
+		// (m_U0hatTPreFFT / m_U0PreFFT) plus the BSGS params (m_paramsEnc / m_paramsDec). The
+		// driver iterates stages with plain EvalRotate (Task 06 hoists). decode (StC) uses Dec.
+		struct FFTParams {
+			uint32_t lvlb = 0, layersCollapse = 0, remCollapse = 0;
+			uint32_t numRotations = 0, b = 0, g = 0;
+			uint32_t numRotationsRem = 0, bRem = 0, gRem = 0;
+		};
+		FFTParams paramsEnc, paramsDec;
+		std::vector<std::vector<Plaintext>> u0hatTPreFFT; // CtS per-stage plaintexts (!isLT)
+		std::vector<std::vector<Plaintext>> u0PreFFT;	  // StC per-stage plaintexts (!isLT)
 		std::vector<double> coefficients; // Chebyshev table for the key distribution
 		double k		 = 0.0;
 		uint32_t numIter = 0; // double-angle iterations
 	};
 	std::unordered_map<uint32_t, BootPrecom> boot_;
 	uint64_t plaintextModulus_ = 0;
+	/// @brief Hybrid-keyswitch digit count (cryptoParams->GetNumPartQ()), a context constant
+	/// shared by every relin/rotation key. Captured at loadContext so the hoisting prefix (#19)
+	/// can build the shared digit decomposition without a specific key in hand.
+	size_t numPartQ_ = 0;
 
 	/// @brief Host-only extraction of the OpenFHE bootstrap precomputation for `slots`
 	/// (m_bootPrecomMap fields + Chebyshev config; ExtractBootPrecom).
@@ -337,9 +399,54 @@ class HazeEngine final : public Engine {
 	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
 	/// of OpenFHE EvalLinearTransform).
 	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);
-	/// @brief Shared staged bootstrap (sparse path; OpenFHE FHECKKSRNS::EvalBootstrap is
-	/// the oracle).
+	/// @brief Shared staged bootstrap dispatcher. Selects the CUDA-matching ModRaise-first
+	/// variant (Bootstrap.cu:169) when bp.btSlotsEncoding is false — the path the Engine always
+	/// runs — and the StC-first variant (EvalBootstrapStCFirst port) when true.
 	Ciphertext<DCRTPoly> bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief ModRaise-first (normal) bootstrap — CUDA FIDESlib::CKKS::Bootstrap (Bootstrap.cu:169);
+	/// the variant CudaEngine::evalBootstrap always dispatches. Selected for btSlotsEncoding=false.
+	Ciphertext<DCRTPoly> bootstrapModRaiseFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief StC-first (slim) bootstrap — OpenFHE EvalBootstrapStCFirst port; kept for the
+	/// CPU-oracle's btSlotsEncoding=true configs (CUDA never selects this through the Engine).
+	Ciphertext<DCRTPoly> bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief Multi-stage FFT CoeffsToSlots / SlotsToCoeffs driver (levelBudget != {1,1}),
+	/// iterating the per-stage LTstep vectors (CoeffsToSlots.cu:75-151). decode=false → CtS.
+	Ciphertext<DCRTPoly> evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, uint32_t slots, bool decode);
+
+	// ---- Chebyshev Paterson-Stockmeyer cores (parity #12-#15; CUDA src/CKKS/ApproxModEval.cu
+	// + Ciphertext.cpp evalLinearWSumMutable are the spec). ----
+
+	/// @brief Fused weighted-sum producing a result Operand directly at `targetTowers` (NSD=2):
+	/// out = sum_i weights[i]*ops[i], computed via multScalar (bootstrap-prescale encoding,
+	/// towersIn = ops[i].towers) + add-accumulate, exactly reproducing CUDA
+	/// Ciphertext::evalLinearWSumMutable (Ciphertext.cpp:1168). CUDA grows a fresh ct to the
+	/// target level and fills it; haze cannot grow (setCiphertextLevel only drops), so this
+	/// produces the result at `targetTowers` directly. NoiseFactor = ScalingFactorReal[level]^2
+	/// where level = |Q| - targetTowers. All ops[i] must have towers >= targetTowers.
+	Operand evalLinearWSumMutableCore(size_t targetTowers,
+	  const std::vector<Operand>& ops,
+	  const std::vector<double>& weights);
+	/// @brief Facade wrapper: extract operands from `ctxs`, call evalLinearWSumMutableCore at the
+	/// CUDA target level, and wrap the result back into a value-type Ciphertext parented to ctx.
+	Ciphertext<DCRTPoly> evalLinearWSumMutableFacade(CryptoContextImpl<DCRTPoly>& ctx,
+	  size_t targetTowers,
+	  const std::vector<Ciphertext<DCRTPoly>>& ctxs,
+	  const std::vector<double>& weights);
+	/// @brief Port of CUDA innerEvalChebyshevPS (ApproxModEval.cu:138) — Paterson-Stockmeyer
+	/// recursion threading level_offset (q@level_offset, s@level_offset+1) and max_m (cu caching
+	/// when max_m-m<=1). Returns the recursive PS result; the caller subtracts T2km1.
+	Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+	  const std::vector<double>& coefficients,
+	  uint32_t k, uint32_t m,
+	  const std::vector<Ciphertext<DCRTPoly>>& T,
+	  const std::vector<Ciphertext<DCRTPoly>>& T2,
+	  int level_offset, int max_m);
+	/// @brief Port of CUDA evalChebyshevSeries (ApproxModEval.cu:370) — always PS (no degree
+	/// dispatch, #12), CUDA centering affine map (#13), T/T2/T2km1 build, then InnerEvalChebyshevPS.
+	Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
+	  const Ciphertext<DCRTPoly>& ct,
+	  std::vector<double>& coeffs,
+	  double a, double b);
 
 	// ---- context state ----
 	bool loaded_	  = false;
