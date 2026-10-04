@@ -26,8 +26,8 @@ namespace fideslib {
 /// inputs, ciphertexts declared via MarkOutput (or implicitly by the first Decrypt of a
 /// computed value) are its outputs, and every other computed value is a program-local.
 /// The single flush happens at the first readback; tagging only declared outputs keeps
-/// readback DMA minimal on real hardware. Compute consuming a device-computed value after
-/// the program executed is a hard error — flushes are exceptionally expensive in deployment.
+/// readback DMA minimal on real hardware. Any compute after the program has executed (the
+/// first readback) is a hard error — flushes are exceptionally expensive in deployment.
 ///
 /// CKKS algorithm logic (level/scale management, keyswitch, bootstrap staging) lives inside
 /// this engine: haze's API is polynomial-level (per-residue MRP ops). Ciphertext data is
@@ -164,22 +164,10 @@ class HazeEngine final : public Engine {
 	/// mark them Flushed and set executed_. All subsequent reads of declared outputs are pure
 	/// shadow D2H: N decrypts, 1 flush, declared up front.
 	void materialize();
-	/// @brief Op guard: consuming a device-computed value (Recorded/Flushed) after the program
-	/// executed is the one-program hard error. Ops whose device operands are all freshly Uploaded
-	/// legitimately start a new program (host-in-the-loop re-encryption) — the caller resets
-	/// executed_ via beginNewProgramIfExecuted() after guarding every operand.
+	/// @brief Op guard: the context runs exactly one program. Any compute after the single
+	/// flush (the first readback) is the one-program hard error — there is no fresh-input exception;
+	/// multi-step host-in-the-loop work must use a fresh context.
 	void requireComputable(hazebk::HazePayload& p, const char* op);
-	/// @brief After all operands of an op passed requireComputable while executed_ was set,
-	/// the op starts a legitimately new program over fresh inputs only.
-	void beginNewProgramIfExecuted();
-
-	/// @brief Re-deposit an uploaded chain's shadow before its first use in the current epoch.
-	/// haze's lookup_or_create EXTRACTS an uploaded shadow when the addr has no binding (i.e.
-	/// in any epoch after the H2D that eager-bound it), and the epoch's flush then destroys
-	/// it — so a value H2D'd once would survive exactly one post-flush program of reuse. A
-	/// D2H+H2D round-trip refreshes the shadow and eager-binds the addr in the current epoch,
-	/// keeping uploaded inputs (ciphertexts, plaintexts, key digits) reusable across programs.
-	void refreshChainIfStale(hazebk::LimbChain& ch);
 
 	/// @brief Ensure ct is device-resident (lazy load) and return its payload.
 	std::shared_ptr<hazebk::HazePayload> ensureCt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
@@ -361,9 +349,6 @@ class HazeEngine final : public Engine {
 	std::vector<std::weak_ptr<hazebk::HazePayload>> outputs_;
 	/// @brief The in-flight program has executed (its single flush happened).
 	bool executed_ = false;
-	/// @brief Monotonic epoch counter, bumped at every flush (materialize). Compared against
-	/// LimbChain::epochStamp to decide when an uploaded shadow must be re-deposited.
-	uint64_t epochSeq_ = 0;
 	/// @brief Program directory of this context (cleaned up at teardown unless kept).
 	std::string programDir_;
 

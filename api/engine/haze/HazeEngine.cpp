@@ -317,8 +317,6 @@ void HazeEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext
 	payload->towers		   = rows0.size();
 	payload->c0			   = LimbChain(rows0);
 	payload->c1			   = LimbChain(rows1);
-	payload->c0.epochStamp = epochSeq_;
-	payload->c1.epochStamp = epochSeq_;
 	payload->noiseScaleDeg = host->GetNoiseScaleDeg();
 	payload->scalingFactor = host->GetScalingFactor();
 	payload->slots		   = host->GetSlots();
@@ -341,7 +339,6 @@ void HazeEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Plaintext& 
 	auto payload			  = std::make_shared<HazePtPayload>();
 	payload->towers			  = rows.size();
 	payload->chain			  = LimbChain(rows);
-	payload->chain.epochStamp = epochSeq_;
 	payload->noiseScaleDeg = ptImpl->GetNoiseScaleDeg();
 	payload->scalingFactor = ptImpl->GetScalingFactor();
 	payload->slots		   = ptImpl->GetSlots();
@@ -398,38 +395,12 @@ void HazeEngine::materialize() {
 	}
 	outputs_.clear();
 	executed_ = true;
-	++epochSeq_; // the flush cleared every epoch binding; uploaded shadows are now one-use
-}
-
-void HazeEngine::refreshChainIfStale(LimbChain& ch) {
-	if (ch.empty() || ch.epochStamp == epochSeq_) {
-		return;
-	}
-	std::vector<uint64_t> buf(ringDim_);
-	for (std::size_t t = 0; t < ch.size(); ++t) {
-		hazeCheck(hazeMemcpy(buf.data(), ch[t], polyBytes_, HAZE_MEMCPY_DEVICE_TO_HOST), "hazeMemcpy(D2H shadow refresh)");
-		hazeCheck(hazeMemcpy(ch[t], buf.data(), polyBytes_, HAZE_MEMCPY_HOST_TO_DEVICE), "hazeMemcpy(H2D shadow refresh)");
-	}
-	ch.epochStamp = epochSeq_;
 }
 
 void HazeEngine::requireComputable(HazePayload& p, const char* op) {
-	if (executed_ && p.state != Residency::Uploaded) {
-		throw std::runtime_error(std::string("haze backend: ") + op + ": compute after readback is a new epoch; restructure the program so all compute precedes the first Decrypt");
-	}
-	if (p.state == Residency::Uploaded) {
-		refreshChainIfStale(p.c0);
-		refreshChainIfStale(p.c1);
-	}
-}
-
-void HazeEngine::beginNewProgramIfExecuted() {
-	// Reached only after every device operand of the op passed requireComputable, i.e. all
-	// are freshly Uploaded: host-in-the-loop (decrypt → host step → re-encrypt) legitimately
-	// starts a new program with fresh inputs only.
+	(void)p; // operand residency no longer matters: any compute after the single flush is illegal
 	if (executed_) {
-		executed_ = false;
-		outputs_.clear();
+		throw std::runtime_error(std::string("haze backend: ") + op + ": compute after readback is a new epoch; restructure the program so all compute precedes the first Decrypt");
 	}
 }
 
@@ -528,8 +499,6 @@ std::any HazeEngine::cloneCiphertextBackend(CryptoContextImpl<DCRTPoly>& /*ctx*/
 		};
 		clone->c0			  = LimbChain(pull(srcPayload->c0));
 		clone->c1			  = LimbChain(pull(srcPayload->c1));
-		clone->c0.epochStamp  = epochSeq_;
-		clone->c1.epochStamp  = epochSeq_;
 		clone->state		  = Residency::Uploaded;
 	}
 	return std::make_any<std::shared_ptr<HazePayload>>(std::move(clone));
@@ -938,7 +907,6 @@ void HazeEngine::rebindPayload(HazePayload& dst, LimbChain c0, LimbChain c1, con
 std::shared_ptr<HazePtPayload> HazeEngine::ensurePt(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt) {
 	ctx.LoadPlaintext(pt);
 	auto payload = devicePtPayload(pt);
-	refreshChainIfStale(payload->chain); // pts are always Uploaded; reusable across programs
 	return payload;
 }
 
@@ -951,7 +919,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalAdd");
 	requireComputable(*p2, "EvalAdd");
-	beginNewProgramIfExecuted();
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
@@ -976,7 +943,6 @@ void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalAddInPlace");
 	requireComputable(*p2, "EvalAddInPlace");
-	beginNewProgramIfExecuted();
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
@@ -1001,7 +967,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalSub");
 	requireComputable(*p2, "EvalSub");
-	beginNewProgramIfExecuted();
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
@@ -1026,7 +991,6 @@ void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalSubInPlace");
 	requireComputable(*p2, "EvalSubInPlace");
-	beginNewProgramIfExecuted();
 
 	Operand a = asOperand(p1);
 	Operand b = asOperand(p2);
@@ -1049,7 +1013,6 @@ void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 Ciphertext<DCRTPoly> HazeEngine::evalNegate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalNegate");
-	beginNewProgramIfExecuted();
 	Operand res = negateCore(asOperand(p));
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1057,7 +1020,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalNegate(CryptoContextImpl<DCRTPoly>& ctx, co
 void HazeEngine::evalNegateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalNegateInPlace");
-	beginNewProgramIfExecuted();
 	Operand res = negateCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1065,7 +1027,6 @@ void HazeEngine::evalNegateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalAdd(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(asOperand(p), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1073,7 +1034,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const
 void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalAddInPlace(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(asOperand(p), scalar);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1081,7 +1041,6 @@ void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(asOperand(p), -scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1089,7 +1048,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(asOperand(p), -scalar);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1099,7 +1057,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, doubl
 	// triple-multScalar trick, which bumps NSD).
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar, ct)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1107,7 +1064,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, doubl
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scalar, Ciphertext<DCRTPoly>& ct1) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar, ct)");
-	beginNewProgramIfExecuted();
 	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1116,7 +1072,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const
 	auto p	  = ensureCt(ctx, ct);
 	auto ptp  = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalAdd(pt)");
-	beginNewProgramIfExecuted();
 	Operand res = applyPt(asOperand(p), *ptp, /*subtract=*/false);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1125,7 +1080,6 @@ void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	auto p	  = ensureCt(ctx, ct1);
 	auto ptp  = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalAddInPlace(pt)");
-	beginNewProgramIfExecuted();
 	Operand res = applyPt(asOperand(p), *ptp, /*subtract=*/false);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1134,7 +1088,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const
 	auto p	  = ensureCt(ctx, ct);
 	auto ptp  = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalSub(pt)");
-	beginNewProgramIfExecuted();
 	Operand res = applyPt(asOperand(p), *ptp, /*subtract=*/true);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1144,7 +1097,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plain
 	auto p	  = ensureCt(ctx, ct);
 	auto ptp  = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalSub(pt, ct)");
-	beginNewProgramIfExecuted();
 	Operand res = applyPt(negateCore(asOperand(p)), *ptp, /*subtract=*/false);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
@@ -1152,7 +1104,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plain
 Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMult(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
 	return wrapDeviceResult(ctx, ct1, std::move(res.p));
 }
@@ -1160,7 +1111,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, cons
 void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMultInPlace(scalar)");
-	beginNewProgramIfExecuted();
 	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1227,13 +1177,7 @@ LimbChain addChain(size_t polyBytes, const std::vector<uint64_t>& base, const vo
 
 void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	if (key.uploaded) {
-		for (auto& ch : key.aDigits) {
-			refreshChainIfStale(ch); // key digits are uploaded inputs too (see refreshChainIfStale)
-		}
-		for (auto& ch : key.bDigits) {
-			refreshChainIfStale(ch);
-		}
-		return;
+		return; // uploaded once; reused within the single program (see the one-program contract)
 	}
 	const size_t digits = key.host.a_limbs.size();
 	key.aDigits.clear();
@@ -1243,8 +1187,6 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	for (size_t d = 0; d < digits; ++d) {
 		key.aDigits.emplace_back(key.host.a_limbs[d]); // H2D: full Q∥P rows
 		key.bDigits.emplace_back(key.host.b_limbs[d]);
-		key.aDigits.back().epochStamp = epochSeq_;
-		key.bDigits.back().epochStamp = epochSeq_;
 	}
 	key.uploaded = true;
 }
@@ -1460,7 +1402,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, cons
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalMult");
 	requireComputable(*p2, "EvalMult");
-	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
 		throw std::runtime_error("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
 	}
@@ -1496,7 +1437,6 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	auto p2 = ensureCt(ctx, ct2);
 	requireComputable(*p1, "EvalMultInPlace");
 	requireComputable(*p2, "EvalMultInPlace");
-	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
 		throw std::runtime_error("haze backend: EvalMult requires EvalMultKeyGen before LoadContext");
 	}
@@ -1529,7 +1469,6 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 Ciphertext<DCRTPoly> HazeEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSquare");
-	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
 		throw std::runtime_error("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
 	}
@@ -1560,7 +1499,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, co
 void HazeEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSquareInPlace");
-	beginNewProgramIfExecuted();
 	if (!haveRelinKey_) {
 		throw std::runtime_error("haze backend: EvalSquare requires EvalMultKeyGen before LoadContext");
 	}
@@ -1591,7 +1529,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, cons
 	auto p	 = ensureCt(ctx, ct1);
 	auto ptp = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalMult(pt)");
-	beginNewProgramIfExecuted();
 	Operand res = multPtCore(asOperand(p), *ptp);
 	return wrapDeviceResult(ctx, ct1, std::move(res.p));
 }
@@ -1600,7 +1537,6 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	auto p	 = ensureCt(ctx, ct1);
 	auto ptp = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalMultInPlace(pt)");
-	beginNewProgramIfExecuted();
 	Operand res = multPtCore(asOperand(p), *ptp);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1611,7 +1547,6 @@ Ciphertext<DCRTPoly> HazeEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const
 	// the level accounting identical to the CPU oracle.
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "Rescale");
-	beginNewProgramIfExecuted();
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDMANUAL) {
 		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext); // Clone (no-op rescale)
@@ -1622,12 +1557,11 @@ Ciphertext<DCRTPoly> HazeEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const
 
 void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) {
 	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "RescaleInPlace"); // guard before the no-op early-return, matching rescale()
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDMANUAL) {
 		return; // OpenFHE: ModReduceInPlace is a no-op outside FIXEDMANUAL
 	}
-	requireComputable(*p, "RescaleInPlace");
-	beginNewProgramIfExecuted();
 	Operand res = rescaleCore(asOperand(p));
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -1691,7 +1625,6 @@ HazeEngine::Operand HazeEngine::rotateCore(CryptoContextImpl<DCRTPoly>& ctx, con
 Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotate");
-	beginNewProgramIfExecuted();
 	Operand res = rotateCore(ctx, asOperand(p), index);
 	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
 }
@@ -1699,7 +1632,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, co
 void HazeEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 	auto p = ensureCt(ctx, ciphertext);
 	requireComputable(*p, "EvalRotateInPlace");
-	beginNewProgramIfExecuted();
 	Operand res = rotateCore(ctx, asOperand(p), index);
 	rebindPayload(*p, std::move(res.p->c0), std::move(res.p->c1), res);
 }
@@ -2313,7 +2245,6 @@ Ciphertext<DCRTPoly> HazeEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>
   double a, double b) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalChebyshevSeries");
-	beginNewProgramIfExecuted();
 	return hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
 }
 
@@ -2323,7 +2254,6 @@ void HazeEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx,
   double a, double b) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalChebyshevSeriesInPlace");
-	beginNewProgramIfExecuted();
 	ct = hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
 }
 
@@ -2339,7 +2269,6 @@ void HazeEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
   int rowSize) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "ConvolutionTransformInPlace");
-	beginNewProgramIfExecuted();
 	ct = hazeConvolutionTransform(ctx, ct, pts, indexes, bStep, gStep, stride, rowSize, nullptr, 0);
 }
 
@@ -2355,7 +2284,6 @@ void HazeEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPoly>&
   int rowSize) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "SpecialConvolutionTransformInPlace");
-	beginNewProgramIfExecuted();
 	ct = hazeConvolutionTransform(ctx, ct, pts, indexes, bStep, gStep, stride, rowSize, &mask, maskRotationStride);
 }
 

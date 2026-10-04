@@ -93,141 +93,124 @@ int main() {
 	// Step 6: Evaluation and decryption.
 	// =====================================================
 
-	// Homomorphic ciphertext-ciphertext addition.
-	{
-		std::cout << "==== Ciphertext-Ciphertext addition ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
-		auto res = cc->EvalAdd(c1, c2);
-		std::cout << "\tcAdd levels: " << res->GetLevel() << std::endl;
+	// A record/replay backend (haze) records ONE program per context and executes it at the
+	// first readback, so every operation is computed first and declared with MarkOutput (a
+	// no-op on CPU/CUDA); all the results are then decrypted together below. The op sequence
+	// is identical to computing-and-decrypting each in turn, so the values are unchanged.
 
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 + c2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	// Homomorphic ciphertext-ciphertext addition.
+	std::cout << "==== Ciphertext-Ciphertext addition ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
+	auto cAdd = cc->EvalAdd(c1, c2);
+	std::cout << "\tcAdd levels: " << cAdd->GetLevel() << std::endl;
+	cc->MarkOutput(cAdd);
 
 	// Homomorphic ciphertext-plaintext addition.
-	{
-		std::cout << "==== Ciphertext-Plaintext addition ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
-		auto res = cc->EvalAdd(c1, ptxt2);
-		std::cout << "\tcAdd levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 + ptxt2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Plaintext addition ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
+	auto cAddPt = cc->EvalAdd(c1, ptxt2);
+	std::cout << "\tcAdd levels: " << cAddPt->GetLevel() << std::endl;
+	cc->MarkOutput(cAddPt);
 
 	// Homomorphic ciphertext-ciphertext subtraction.
-	{
-		std::cout << "==== Ciphertext-Ciphertext subtraction ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
-		auto res = cc->EvalSub(c1, c2);
-		std::cout << "\tcSub levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 - c2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Ciphertext subtraction ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
+	auto cSub = cc->EvalSub(c1, c2);
+	std::cout << "\tcSub levels: " << cSub->GetLevel() << std::endl;
+	cc->MarkOutput(cSub);
 
 	// Homomorphic ciphertext-plaintext subtraction.
-	{
-		std::cout << "==== Ciphertext-Plaintext subtraction ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
-		auto res = cc->EvalSub(c1, ptxt2);
-		std::cout << "\tcSub levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 - ptxt2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Plaintext subtraction ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
+	auto cSubPt = cc->EvalSub(c1, ptxt2);
+	std::cout << "\tcSub levels: " << cSubPt->GetLevel() << std::endl;
+	cc->MarkOutput(cSubPt);
 
 	// Homomorphic ciphertext-ciphertext multiplication.
-	{
-		std::cout << "==== Ciphertext-Ciphertext multiplication ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
-		auto res = cc->EvalMult(c1, c2);
-		std::cout << "\tcMul levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 * c2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Ciphertext multiplication ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tc2 levels: " << c2->GetLevel() << std::endl;
+	auto cMul = cc->EvalMult(c1, c2);
+	std::cout << "\tcMul levels: " << cMul->GetLevel() << std::endl;
+	cc->MarkOutput(cMul);
 
 	// Homomorphic ciphertext-plaintext multiplication.
-	{
-		std::cout << "==== Ciphertext-Plaintext multiplication ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
-		auto res = cc->EvalMult(c1, ptxt2);
-		std::cout << "\tcMul levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 * ptxt2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Plaintext multiplication ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	std::cout << "\tptxt2 levels: " << ptxt2->GetLevel() << std::endl;
+	auto cMulPt = cc->EvalMult(c1, ptxt2);
+	std::cout << "\tcMul levels: " << cMulPt->GetLevel() << std::endl;
+	cc->MarkOutput(cMulPt);
 
 	// Homomorphic ciphertext-scalar multiplication.
-	{
-		std::cout << "==== Ciphertext-Scalar multiplication ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		auto res = cc->EvalMult(c1, 4.0);
-		std::cout << "\tcMul levels: " << res->GetLevel() << std::endl;
-
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, res, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tc1 * 4 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	std::cout << "==== Ciphertext-Scalar multiplication ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	auto cScalar = cc->EvalMult(c1, 4.0);
+	std::cout << "\tcMul levels: " << cScalar->GetLevel() << std::endl;
+	cc->MarkOutput(cScalar);
 
 	// Homomorphic rotations.
-	{
-		std::cout << "==== Rotations ====" << std::endl;
-		std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
-		auto cRot1 = cc->EvalRotate(c1, 1);
-		auto cRot2 = cc->EvalRotate(c1, -2);
-		std::cout << "\tcRot1 levels: " << cRot1->GetLevel() << std::endl;
-		std::cout << "\tcRot2 levels: " << cRot2->GetLevel() << std::endl;
-		// Both rotations are read back from one device program: declare them up front.
-		cc->MarkOutput(cRot1);
-		cc->MarkOutput(cRot2);
+	std::cout << "==== Rotations ====" << std::endl;
+	std::cout << "\tc1 levels: " << c1->GetLevel() << std::endl;
+	auto cRot1 = cc->EvalRotate(c1, 1);
+	auto cRot2 = cc->EvalRotate(c1, -2);
+	std::cout << "\tcRot1 levels: " << cRot1->GetLevel() << std::endl;
+	std::cout << "\tcRot2 levels: " << cRot2->GetLevel() << std::endl;
+	cc->MarkOutput(cRot1);
+	cc->MarkOutput(cRot2);
 
-		// Decrypt the result.
-		Plaintext result;
-		cc->Decrypt(keys.secretKey, cRot1, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tcRot1 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl;
+	// Decrypt every result. The first Decrypt executes the recorded program once; the rest
+	// are pure readbacks of the declared outputs.
+	Plaintext result;
 
-		cc->Decrypt(keys.secretKey, cRot2, &result);
-		result->SetLength(batchSize);
-		std::cout << "\tcRot2 = " << result;
-		std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
-	}
+	cc->Decrypt(keys.secretKey, cAdd, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 + c2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cAddPt, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 + ptxt2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cSub, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 - c2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cSubPt, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 - ptxt2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cMul, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 * c2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cMulPt, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 * ptxt2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cScalar, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tc1 * 4 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
+
+	cc->Decrypt(keys.secretKey, cRot1, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tcRot1 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl;
+
+	cc->Decrypt(keys.secretKey, cRot2, &result);
+	result->SetLength(batchSize);
+	std::cout << "\tcRot2 = " << result;
+	std::cout << "\tEstimated precision in bits: " << result->GetLogPrecision() << std::endl << std::endl;
 
 	return 0;
 }

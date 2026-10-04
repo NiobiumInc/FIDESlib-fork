@@ -234,7 +234,6 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 
 	auto pIn = ensureCt(ctx, ciphertext);
 	requireComputable(*pIn, "EvalBootstrap");
-	beginNewProgramIfExecuted();
 
 	const uint32_t slots = static_cast<uint32_t>(pIn->slots);
 	const uint32_t N	 = static_cast<uint32_t>(ringDim_);
