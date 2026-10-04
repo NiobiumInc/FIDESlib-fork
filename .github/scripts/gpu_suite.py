@@ -57,13 +57,20 @@ def summarize(message, location=True):
 
 
 def parse(report):
-    """Returns {test: (status, message)}, status being passed, failed or skipped."""
+    """Returns {test: (status, message)}, status being passed, failed, skipped or disabled.
+
+    A disabled test is one whose name starts with DISABLED_: gtest lists it in
+    the report as suppressed without running it. Its message is its file:line.
+    """
     results = {}
     for suite in ET.parse(report).getroot().iter("testsuite"):
         for case in suite.iter("testcase"):
             name = f"{suite.get('name')}.{case.get('name')}"
             failure = case.find("failure")
-            if failure is not None:
+            if case.get("result") == "suppressed":
+                where = os.path.basename(case.get("file") or "")
+                results[name] = ("disabled", f"{where}:{case.get('line')}" if where else "")
+            elif failure is not None:
                 text = failure.get("message") or failure.text or ""
                 results[name] = ("failed", summarize(text))
             elif case.find("skipped") is not None or case.get("result") == "skipped":
@@ -102,17 +109,17 @@ def run(binary, gtest_filter, report):
 
 
 def counts(results):
-    by = {"passed": 0, "failed": 0, "skipped": 0}
+    by = {"passed": 0, "failed": 0, "skipped": 0, "disabled": 0}
     for status, _ in results.values():
         by[status] += 1
-    return len(results), by["passed"], by["failed"], by["skipped"]
+    return len(results), by["passed"], by["failed"], by["skipped"], by["disabled"]
 
 
 def count_row(label, results, status):
     if results is None:
-        return f"| {label} | crashed (exit {status}, no report) | | | |"
-    total, passed, failed, skipped = counts(results)
-    return f"| {label} | {total} | {passed} | {failed} | {skipped} |"
+        return f"| {label} | crashed (exit {status}, no report) | | | | |"
+    total, passed, failed, skipped, disabled = counts(results)
+    return f"| {label} | {total} | {passed} | {failed} | {skipped} | {disabled} |"
 
 
 def report_only(binary, patterns, report):
@@ -192,7 +199,7 @@ def main():
         lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {RETRIES + 1} attempts.")
     else:
         lines.append("**Check: failed.** The suite did not finish; see the job log.")
-    lines += ["", "| Pass | Tests | Passed | Failed | Skipped |", "|---|---:|---:|---:|---:|"]
+    lines += ["", "| Pass | Tests | Passed | Failed | Skipped | Disabled |", "|---|---:|---:|---:|---:|---:|"]
     lines.append(count_row("Check", gate, gate_status))
     for label, results, status in retry_rows:
         lines.append(count_row(label, results, status))
@@ -221,6 +228,17 @@ def main():
                   "| Reason | Tests |", "|---|---|"]
         for reason, names in sorted(self_skipped.items(), key=lambda item: -len(item[1])):
             lines.append(f"| {reason} | " + ", ".join(f"`{n}`" for n in sorted(names)) + " |")
+
+    # Tests disabled in the source never run; list them so one that hides a
+    # known bug stays visible.
+    disabled = sorted((name, where) for name, (status, where) in (gate or {}).items()
+                      if status == "disabled")
+    if disabled:
+        print(f"::notice::{len(disabled)} tests are disabled in the source and did not run. See the job summary.")
+        lines += ["", "### Disabled in the source", "",
+                  "Their names start with `DISABLED_`, so gtest lists them without running them.", "",
+                  "| Test | Location |", "|---|---|"]
+        lines += [f"| `{name}` | {where} |" for name, where in disabled]
 
     if flaky_pass and flaky_pass[1] is not None:
         flaky_failed = [(n, m) for n, (s, m) in flaky_pass[1].items() if s == "failed"]
