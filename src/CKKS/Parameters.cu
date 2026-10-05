@@ -28,7 +28,8 @@ Parameters Parameters::adaptTo(RawParams& raw) const {
 		.ScalingFactorRealBig = raw.ScalingFactorRealBig,
 		.scalingTechnique	  = raw.scalingTechnique,
 		.raw				  = raw,
-		.batch				  = batch };
+		.batch				  = batch,
+		.reducedNoise		  = reducedNoise };
 	// std::cout << "Adapt out" << std::endl;
 	return res;
 }

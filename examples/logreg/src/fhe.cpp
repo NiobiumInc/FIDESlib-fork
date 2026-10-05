@@ -48,6 +48,7 @@ uint32_t create_context(bool inference) {
 	params.SetSecretKeyDist(sparse_encaps ? fideslib::SPARSE_TERNARY : fideslib::UNIFORM_TERNARY);
 	params.SetNumLargeDigits(digits);
 	params.SetBackend(fideslib::BackendFromEnv());
+	params.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise()); // matches the oracle's variant
 	params.SetMultiplicativeDepth(depth);
 
 	cc = GenCryptoContext(params);

@@ -39,12 +39,10 @@ namespace fideslib {
 /// class knowing anything about timing. Keep the protected members below available for that.
 class HazeEngine : public Engine {
   public:
-	/// @param reducedNoise  Use the centered (ReducedNoise) FBC variant, matching an OpenFHE
-	///                      reference built with WITH_REDUCED_NOISE — required for bit-exact parity.
-	/// Defaults off so a bare HazeEngine matches the libhaze defaults; the facade selects it from
-	/// CCParams (SetReducedNoise) at GenCryptoContext. The hardware data format is not selectable
-	/// here — recordings are always ordinary-form and the replay target applies its own format.
-	explicit HazeEngine(bool reducedNoise = false) : reducedNoise_(reducedNoise) {}
+	/// @param reducedNoise  See CCParams::SetReducedNoise for the cross-backend contract. The
+	///                      hardware data format is not selectable here — recordings are always
+	///                      ordinary-form and the replay target applies its own format.
+	explicit HazeEngine(bool reducedNoise) : Engine(reducedNoise) {}
 
 	const char* name() const override {
 		return "haze (FHETCH)";
@@ -568,8 +566,6 @@ class HazeEngine : public Engine {
 	/// @brief Current tower count of a live Ciphertext, per Haze's device-side payload.
 	size_t towersOf(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
 
-	// ---- FBC mode (constructor-selected, forwarded to libhaze at bring-up) ----
-	bool reducedNoise_ = false;
 	/// @brief See setDropInputHostAfterUpload.
 	bool dropInputHostAfterUpload_ = false;
 

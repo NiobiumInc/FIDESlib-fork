@@ -38,6 +38,7 @@ int main() {
 	parameters.SetBatchSize(batchSize);
 	// GPU Settings. Devices and autoload configuration.
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

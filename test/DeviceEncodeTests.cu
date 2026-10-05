@@ -101,6 +101,7 @@ class DeviceEncodeTest : public testing::Test {
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(fideslib::FLEXIBLEAUTO);
 		params.SetBackend(fideslib::Backend::CUDA);
+		params.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
 		cc = fideslib::GenCryptoContext(params);
 		cc->Enable(fideslib::PKE);

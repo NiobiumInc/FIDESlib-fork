@@ -11,6 +11,8 @@
 #include "engine/Backend.hpp"
 #include "engine/Engine.hpp"
 
+#include <optional>
+
 namespace fideslib::Serial {
 
 bool SerializeToFile(const std::string& filename, const fideslib::CryptoContext<fideslib::DCRTPoly>& obj, const SerType& sertype) {
@@ -74,6 +76,10 @@ bool SerializeToFile(const std::string& filename, const fideslib::CryptoContext<
 	}
 	bootstrapData += "}\n";
 	devFile.write(bootstrapData.c_str(), bootstrapData.size());
+	// Persist the FBC variant the engine was built with; read-back has no default to
+	// reconstruct it from.
+	std::string reducedNoiseData = std::string(kReducedNoiseLabel) + " " + std::to_string(obj->engine_->reducedNoise() ? 1 : 0) + "\n";
+	devFile.write(reducedNoiseData.c_str(), reducedNoiseData.size());
 	devFile.close();
 	return true;
 }
@@ -106,6 +112,9 @@ bool SerializeToFile(const std::string& filename, const fideslib::PrivateKey<fid
 	}
 }
 
+// Returns false if the context file or its .dev sidecar is unreadable or incomplete, including a
+// missing or malformed ReducedNoise line. Throws instead if the stored variant mismatches this
+// build's own (OpenFheEngine refuses it at construction) -- the file is fine, this build just cannot honour it.
 bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fideslib::DCRTPoly>& obj, const SerType& sertype) {
 
 	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> context;
@@ -132,11 +141,10 @@ bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fi
 	gpu_context.multiplicative_depth = context->GetCryptoParameters()->GetElementParams()->GetParams().size() - 1;
 	auto ptr						 = std::make_shared<CryptoContextImpl<DCRTPoly>>(std::move(gpu_context));
 	ptr->self_reference				 = std::weak_ptr<CryptoContextImpl<DCRTPoly>>(ptr);
-	// Install a valid (CPU) engine up front so the context never dispatches through a
-	// null engine_ if an error path below returns early; overwritten with the
-	// serialized backend once the .dev metadata is parsed.
-	ptr->engine_ = MakeEngine(Backend::CPU);
-	obj			 = ptr;
+	// Only truncation (an early EOF) and the ReducedNoise line are validated below, both before
+	// the engine is built or obj is published, so either is refused rather than leaving a
+	// half-built context visible. The variant is part of the engine's identity, like Backend, and
+	// has no default to reconstruct from a missing line.
 
 	// Deserialize GPU device information if available.
 	std::ifstream devFile(filename + ".dev", std::ios::binary);
@@ -168,9 +176,6 @@ bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fi
 			devices.push_back(devId);
 		}
 	}
-	// Rebuild the engine for the serialized backend and hand it the device list.
-	ptr->engine_ = MakeEngine(backend);
-	ptr->engine_->setDevices(devices);
 	// Third line: AutoLoadCiphertexts
 	if (std::getline(devFile, line)) {
 		std::istringstream iss(line);
@@ -224,7 +229,30 @@ bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fi
 			ptr->slots_bootstrap.push_back(slot);
 		}
 	}
+	// Eighth line: ReducedNoise. Required -- a .dev file predating this field cannot say which FBC
+	// variant the engine was built for, so it is refused rather than defaulted.
+	const std::optional<bool> reducedNoise = [&]() -> std::optional<bool> {
+		std::string reducedNoiseLine;
+		if (!std::getline(devFile, reducedNoiseLine)) {
+			return std::nullopt;
+		}
+		std::istringstream iss(reducedNoiseLine);
+		std::string label;
+		int flag;
+		if (!(iss >> label >> flag) || label != kReducedNoiseLabel || (flag != 0 && flag != 1)) {
+			return std::nullopt;
+		}
+		return flag != 0;
+	}();
+	if (!reducedNoise.has_value()) {
+		return false;
+	}
 	devFile.close();
+
+	// Rebuild the engine for the serialized backend now that every .dev field is known.
+	ptr->engine_ = MakeEngine(backend, *reducedNoise);
+	ptr->engine_->setDevices(devices);
+	obj = ptr;
 
 	return res;
 }

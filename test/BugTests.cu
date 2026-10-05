@@ -20,6 +20,7 @@
 // scaleMod 59, firstMod 60, dnum 3, 1024 slots, FLEXIBLEAUTO.
 #include <gtest/gtest.h>
 #include <fideslib.hpp>
+#include "OpenFheVariant.hpp" // fideslib::LinkedOpenFheReducedNoise
 #include <cmath>
 #include <cstdlib>
 #include <cuda.h>
@@ -40,6 +41,7 @@ TEST(Bug, CatchBugTest) {
 	parameters.SetNumLargeDigits(3); // dnum
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetBackend(Backend::CUDA); // CudaEngine defaults to device 0
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

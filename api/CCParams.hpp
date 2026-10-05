@@ -3,6 +3,7 @@
 
 #include <any>
 #include <cinttypes>
+#include <optional>
 #include <sys/types.h>
 #include <vector>
 
@@ -53,9 +54,9 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	void SetPlaintextAutoload(bool autoload);
 	void SetCiphertextAutoload(bool autoload);
 
-	/// @brief haze backend only: enable the reduced-noise (centered) FBC variant, matching an
-	/// OpenFHE reference built with WITH_REDUCED_NOISE. Required for bit-exact parity on haze;
-	/// off by default. Ignored by the CPU/CUDA backends.
+	/// @brief Selects the FBC variant: true for OpenFHE's WITH_REDUCED_NOISE centered variant.
+	/// Required (GenCryptoContext refuses unset); cpu refuses a value that differs from the linked
+	/// OpenFHE.
 	void SetReducedNoise(bool enable);
 
 	// ---- Getters ----
@@ -70,7 +71,7 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	SecretKeyDist keyDist	= UNIFORM_TERNARY;
 	bool plaintextAutoload	= false;
 	bool ciphertextAutoload = true;
-	bool reducedNoise		= false;
+	std::optional<bool> reducedNoise;
 };
 
 } // namespace fideslib

@@ -12,25 +12,14 @@
 #include <string>
 #include <vector>
 
+#include "TestEngineConfig.hpp" // FIDESlib::Testing::{ConfigureTestEngine, GetTestBackend, TestBackend}
 #include "fideslib.hpp"
 
 using namespace fideslib;
+using FIDESlib::Testing::ConfigureTestEngine;
+using FIDESlib::Testing::GetTestBackend;
+using FIDESlib::Testing::TestBackend;
 
-// Mirrors ApiTests.cpp's backend gating; kept as an independent copy since the two files do
-// not share internal linkage (each `static` function below has its own translation-unit-local
-// definition).
-enum class TestBackend { CPU, CUDA, HAZE };
-static TestBackend GetTestBackend() {
-	const char* b = std::getenv("FIDESLIB_TEST_BACKEND");
-	if (b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA))
-		return TestBackend::CUDA;
-	if (b != nullptr && std::string(b) == "haze" && IsBackendAvailable(Backend::HAZE))
-		return TestBackend::HAZE;
-	return TestBackend::CPU;
-}
-static bool TestUseCuda() {
-	return GetTestBackend() == TestBackend::CUDA;
-}
 static bool TestUseDevice() {
 	return GetTestBackend() != TestBackend::CPU;
 }
@@ -66,12 +55,7 @@ class KeyAccessTest : public ::testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDAUTO);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -108,12 +92,7 @@ class NoEvalMultKeyTest : public ::testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDAUTO);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true);
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

@@ -104,9 +104,7 @@ int main(int argc, char **argv) {
     parameters.SetBackend(backend);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
-    // Centered FBC: required for bit-exact parity against the hardware datapath.
-    // Ignored by the CPU/CUDA backends.
-    parameters.SetReducedNoise(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
     cc->Enable(PKE);

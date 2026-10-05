@@ -133,6 +133,7 @@ void sparse_bootstrap() {
 
 	CCParams<CryptoContextCKKSRNS> params;
 	params.SetBackend(BackendFromEnv());
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	params.SetSecurityLevel(SecurityLevel::HEStd_NotSet);
 	params.SetRingDim(ring_dim);
 	params.SetMultiplicativeDepth(multDepth);
@@ -203,6 +204,7 @@ void uniform_bootstrap() {
 
 	CCParams<CryptoContextCKKSRNS> params;
 	params.SetBackend(BackendFromEnv());
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	params.SetSecurityLevel(SecurityLevel::HEStd_NotSet);
 	params.SetRingDim(ring_dim);
 	params.SetMultiplicativeDepth(multDepth);
@@ -282,6 +284,7 @@ int main() {
 		parameters.SetNumLargeDigits(dnum);
 		parameters.SetBatchSize(batchSize);
 		parameters.SetBackend(BackendFromEnv());
+		parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 		parameters.SetPlaintextAutoload(false);
 		parameters.SetCiphertextAutoload(true);
 

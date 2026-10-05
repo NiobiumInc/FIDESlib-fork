@@ -9,8 +9,17 @@
 #include <algorithm>
 #include <any>
 #include <cassert>
+#include <stdexcept>
+#include <string>
 
 namespace fideslib {
+
+OpenFheEngine::OpenFheEngine(bool reducedNoise) : Engine(reducedNoise) {
+	if (reducedNoise != LinkedOpenFheReducedNoise()) {
+		throw std::runtime_error("cpu backend cannot honour reducedNoise=" + std::string(reducedNoise ? "true" : "false") +
+		  ": the linked openfhe was built with WITH_REDUCED_NOISE=" + (LinkedOpenFheReducedNoise() ? "ON" : "OFF"));
+	}
+}
 
 // Most methods here are thin shims over OpenFHE, which makes OpenFHE the reference oracle: if CPU and
 // CUDA disagree on, say, evalMult, the CUDA kernel is the suspect. The exceptions are the ops OpenFHE has

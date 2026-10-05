@@ -394,6 +394,7 @@ int main(int argc, char* argv[]) {
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBatchSize(batchSize);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 	parameters.SetPlaintextAutoload(false);
 	parameters.SetCiphertextAutoload(true);
 

@@ -54,6 +54,7 @@ CCParams<CryptoContextCKKSRNS> parameters;
 	parameters.SetNumLargeDigits(3);
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
 #if NATIVEINT == 128 && !defined(__EMSCRIPTEN__)
 	ScalingTechnique rescaleTech = FIXEDAUTO;

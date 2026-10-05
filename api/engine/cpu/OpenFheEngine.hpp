@@ -1,6 +1,7 @@
 #ifndef API_OPENFHEENGINE_HPP
 #define API_OPENFHEENGINE_HPP
 
+#include "OpenFheVariant.hpp" // fideslib::LinkedOpenFheReducedNoise
 #include "engine/Engine.hpp"
 
 namespace fideslib {
@@ -9,6 +10,10 @@ namespace fideslib {
 /// (convolution, accumulate) are reimplemented. All CPU operation code lives in OpenFheEngine.cpp.
 class OpenFheEngine final : public Engine {
   public:
+	/// @brief Throws if reducedNoise disagrees with LinkedOpenFheReducedNoise(): the linked OpenFHE
+	/// has only one variant to run, so a mismatched request cannot be honoured, only refused.
+	explicit OpenFheEngine(bool reducedNoise);
+
 	const char* name() const override {
 		return "OpenFHE (CPU)";
 	}

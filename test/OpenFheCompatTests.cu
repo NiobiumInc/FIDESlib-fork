@@ -24,6 +24,7 @@ TEST(OpenFHECompatTests, EvalFastRotation) {
     parameters.SetRingDim(128);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -78,6 +79,7 @@ TEST(OpenFHECompatTests, EvalRotate) {
     parameters.SetRingDim(128);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -132,6 +134,7 @@ TEST(OpenFHECompatTests, AccumulateSum) {
     parameters.SetRingDim(128);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -193,6 +196,7 @@ TEST(OpenFHECompatTests, EvalBootstrap) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -262,6 +266,7 @@ TEST(OpenFHECompatTests, EvalBootstrapDense) {
     parameters.SetRingDim(ringDim);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -326,6 +331,7 @@ TEST(OpenFHECompatTests, EvalBootstrapLT) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -391,6 +397,7 @@ TEST(OpenFHECompatTests, EvalBootstrapSlots64) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -456,6 +463,7 @@ TEST(OpenFHECompatTests, EvalBootstrapFixedManual) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -523,6 +531,7 @@ TEST(OpenFHECompatTests, EvalBootstrapDenseFixedManual) {
     parameters.SetRingDim(ringDim);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -591,6 +600,7 @@ TEST(OpenFHECompatTests, DISABLED_EvalBootstrapSparseEncaps) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -656,6 +666,7 @@ TEST(OpenFHECompatTests, EvalBootstrapFlexExt) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -722,6 +733,7 @@ TEST(OpenFHECompatTests, EvalBootstrapDenseFlexExt) {
     parameters.SetRingDim(ringDim);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -785,6 +797,7 @@ TEST(OpenFHECompatTests, EvalBootstrapLTFixedManual) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -851,6 +864,7 @@ TEST(OpenFHECompatTests, EvalBootstrapSparseSecret) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -919,6 +933,7 @@ TEST(OpenFHECompatTests, DISABLED_EvalBootstrapFixedAuto) {
     parameters.SetRingDim(1 << 12);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -979,6 +994,7 @@ static CryptoContext<DCRTPoly> MakeSmallContext(uint32_t multDepth, ScalingTechn
     parameters.SetRingDim(128);
     parameters.SetPlaintextAutoload(false);
     parameters.SetCiphertextAutoload(true);
+    parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
     cc->Enable(PKE);

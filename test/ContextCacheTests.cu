@@ -55,4 +55,39 @@ TEST(ContextCacheBootConfig, SparseAndUniformDoNotAlias) {
 	FIDESlib::CKKS::DeregisterAllContexts();
 }
 
+// The cache is keyed on FIDESlib::CKKS::Parameters, which carries reducedNoise through operator<.
+// Two contexts differing only in that flag must not alias -- an off context silently serving an
+// on-flagged caller (or vice versa) would desync the FBC variant from what the caller asked for.
+TEST(ContextCacheReducedNoise, OnAndOffDoNotAlias) {
+	lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
+	parameters.SetMultiplicativeDepth(25);
+	parameters.SetScalingModSize(50);
+	parameters.SetBatchSize(8);
+	parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
+	parameters.SetRingDim(1 << 12);
+	parameters.SetScalingTechnique(lbcrypto::FLEXIBLEAUTO);
+
+	auto cc = lbcrypto::GenCryptoContext(parameters);
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	cc->Enable(lbcrypto::ADVANCEDSHE);
+	cc->Enable(lbcrypto::FHE);
+
+	FIDESlib::CKKS::RawParams raw = FIDESlib::CKKS::GetRawParams(cc, FIDESlib::UNIFORM);
+
+	FIDESlib::CKKS::Parameters off{ .logN = 16, .L = 6, .dnum = 2, .primes = std::vector(p64), .Sprimes = std::vector(sp64), .batch = 100, .reducedNoise = false };
+	FIDESlib::CKKS::Parameters on = off;
+	on.reducedNoise				  = true;
+
+	FIDESlib::CKKS::Context gpuOff = FIDESlib::CKKS::GenCryptoContextGPU(off.adaptTo(raw), devices);
+	FIDESlib::CKKS::Context gpuOn  = FIDESlib::CKKS::GenCryptoContextGPU(on.adaptTo(raw), devices);
+
+	EXPECT_NE(gpuOff, gpuOn) << "reducedNoise on/off contexts aliased in the cache";
+	EXPECT_FALSE(gpuOff->precom.constants.at(0).reduced_noise);
+	EXPECT_TRUE(gpuOn->precom.constants.at(0).reduced_noise);
+
+	FIDESlib::CKKS::DeregisterAllContexts();
+}
+
 } // namespace FIDESlib::Testing

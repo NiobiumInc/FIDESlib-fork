@@ -64,6 +64,7 @@ struct Constants {
 	uint64_t inv_root_shoup[MAXP];
 
 	int dnum;
+	bool reduced_noise;
 	uint64_t P[MAXP];
 	uint64_t P_shoup[MAXP];
 	uint64_t P_inv[MAXP];
@@ -156,6 +157,8 @@ struct Global {
 	uint64_t DecompAndModUp_pre_scale_shoup[MAXD][MAXP][MAXP];
 	uint64_t DecompAndModUp_matrix[MAXP][MAXP][MAXP];
 	uint64_t DecompAndModUp_matrix_shoup[MAXP][MAXP][MAXP];
+	// ReducedNoise FBC: -Q_{d,s} mod p_t, see SetupConstants's fill for what d/s/t index.
+	uint64_t DecompAndModUp_negQ[MAXD][MAXP][MAXP];
 
 	union {
 		CKKS::Scheme::Global ckks;
@@ -186,6 +189,7 @@ struct Global {
 		uint64_t DecompAndModUp_pre_scale_shoup[MAXD * MAXP * MAXP];
 		uint64_t DecompAndModUp_matrix[MAXP * /*MAXD */ MAXP * MAXP];
 		uint64_t DecompAndModUp_matrix_shoup[MAXP * /*MAXD */ MAXP * MAXP];
+		uint64_t DecompAndModUp_negQ[MAXD * MAXP * MAXP];
 	};
 
 	Globals* globals[MAXD];

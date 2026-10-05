@@ -67,10 +67,10 @@ struct DeviceEncodedSlots {
 	uint32_t slots		   = 0;
 };
 
-/// @brief One implementation per backend. Stateless: each method receives the
-/// owning context. A backend's method bodies live entirely in its own
-/// translation unit (engine/cpu for the CPU/OpenFHE backend, engine/cuda for the
-/// CUDA backend), so CPU and CUDA code are separated by file rather than
+/// @brief One implementation per backend. Each method receives the owning context; the FBC
+/// variant it was constructed with is the only state Engine itself owns. A backend's method
+/// bodies live entirely in its own translation unit (engine/cpu for the CPU/OpenFHE backend,
+/// engine/cuda for the CUDA backend), so CPU and CUDA code are separated by file rather than
 /// interleaved per function.
 class Engine {
   protected:
@@ -79,11 +79,18 @@ class Engine {
 	[[noreturn]] void notImplemented(const char* op) const;
 
   public:
+	/// @param reducedNoise  The FBC variant this engine computes; see CCParams::SetReducedNoise.
+	explicit Engine(bool reducedNoise) : reducedNoise_(reducedNoise) {}
+
 	// ---- Lifecycle ----
 	virtual ~Engine()				 = default;
 	virtual const char* name() const = 0;
 	/// @brief Which backend this engine is (for explicit serialization; never inferred from devices).
 	virtual Backend backend() const = 0;
+	/// @brief The FBC variant this engine computes.
+	bool reducedNoise() const {
+		return reducedNoise_;
+	}
 
 	// ---- Negation ----
 	virtual Ciphertext<DCRTPoly> evalNegate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
@@ -381,6 +388,9 @@ class Engine {
 	virtual void teardown();
 	virtual void setDevices(const std::vector<int>& devices);
 	virtual std::vector<int> devices() const;
+
+  private:
+	const bool reducedNoise_;
 };
 
 } // namespace fideslib
