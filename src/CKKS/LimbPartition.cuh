@@ -65,6 +65,36 @@ class LimbPartition {
 	void* bufferDECOMPandDIGIT_handle = nullptr;
 	void* bufferGATHER_handle		  = nullptr;
 
+	/// @brief The byte size each of the four buffers above was allocated with. 0 == no buffer.
+	///
+	/// THE SIZE HAS TO TRAVEL WITH THE POINTER, for two reasons.
+	///
+	/// (1) `GPUfree` is not size-agnostic. Its prologue rewrites any `bytes < 64 * 1024` to 1024
+	/// and forces `cache = true` (CudaUtils.cu, GPUfree), and every free list it can reach is
+	/// keyed by `bytes` -- `size_to_memory[id][bytes]` in the default pool,
+	/// `freed_mt[id][lane][bytes]` in the concurrent one. A free that passes 0 therefore takes a
+	/// multi-megabyte block that `GPUmalloc` never pooled at all (cache defaults to false, so a
+	/// >= 64 KiB allocation goes straight to `cudaMallocAsync`) and lists it in the 1024-byte size
+	/// class, from which the next 1024-byte allocation will hand it out. Passing the TRUE size
+	/// makes the two prologues agree: below 64 KiB both round to the same power of two and pool,
+	/// at or above it neither pools, and the block is released exactly the way it was taken.
+	///
+	/// (2) The size is not always recoverable at the free site. `generateLimbSingleMalloc` sizes
+	/// `bufferLIMB` from `meta.size()`, while `generateLimbConstant`, which frees it, computes its
+	/// own `limbsize` as `getLimbSize(*level)` -- a different number for any polynomial not at the
+	/// top level. Recomputing at the free site would be a second, quieter version of the same bug.
+	///
+	/// Every site that assigns one of the four pointers assigns its size field in the same
+	/// statement, and every free site asserts the field is set before using it.
+	size_t bufferDECOMPandDIGIT_bytes = 0;
+	size_t bufferSPECIAL_bytes		  = 0;
+	size_t bufferLIMB_bytes			  = 0;
+	/// Whether `bufferLIMB` came from the exact-size pool class (GPUmallocExact: generateLimbArena) or
+	/// from the non-pooled path (generateLimbSingleMalloc). The free MUST take the path the allocation
+	/// took: cudaFreeAsync on a pointer inside a pool chunk is 'invalid argument' (observed in testing).
+	bool bufferLIMB_pooled			  = false;
+	size_t bufferGATHER_bytes		  = 0;
+
 	/*
 	LimbPartition(LimbPartition && lp) :
 		device(lp.device),
@@ -97,6 +127,21 @@ class LimbPartition {
 	  bool ext);
 	void binomialMult(LimbPartition& c1, LimbPartition& c2, const LimbPartition& d0, const LimbPartition& d1, bool extend_ins, bool square);
 	void generateLimbToLevel(int new_level);
+
+	/// @brief Release the NTT scratch of every Q limb of this partition, keeping the limb data.
+	///
+	/// For a partition that will never be transformed again — today, a device-encoded plaintext once
+	/// its encode NTT has run (RNSPoly::loadCoefficients). Halves such a polynomial's device
+	/// footprint: v + aux becomes v alone.
+	///
+	/// STREAM ORDERING IS THE CALLER'S: the releases are stream-ordered on `s`, so `s` must already
+	/// be fenced against the limb streams. NTT(batch, /*sync=*/true) leaves exactly that fence
+	/// behind on its way out (it closes with s.wait(STREAM(limb[i]))), which is the same guarantee
+	/// loadCoefficients already relies on to free its staging buffer.
+	///
+	/// SPECIAL (P-basis) limbs are deliberately untouched: nothing that owns extended limbs is done
+	/// transforming when this is called, and a device encode is Q-basis only.
+	void freeNTTScratch();
 
 	enum GENERATION_MODE { AUTOMATIC, SINGLE_BUFFER, DUAL_BUFFER };
 
@@ -195,7 +240,27 @@ class LimbPartition {
 	void mult1Add2(const LimbPartition& partition1, const LimbPartition& partition2);
 
 	void generateLimbSingleMalloc();
+
+	/// @brief One pooled buffer for `limbsize` value limbs (FIDESLIB_PT_ARENA): the limbs are views
+/// into it (no Limb::aux; the encode runs its NTT through the chunk scratch), `bufferLIMB` owns it
+/// and the destructor frees it whole. Fresh partition only (no limbs, no buffer).
+void generateLimbArena(int limbsize);
 	void generateLimbConstant();
+
+	/// @brief Make this freshly constructed partition a NON-OWNING VIEW of `src`: its first
+	/// getLimbSize(*level) Q limbs and all of its special limbs.
+	///
+	/// Every view limb is a `Limb` built with the buffer constructor (the one `generate` uses for a
+	/// partition's single buffer) over the source limb's own `v.data`, so its `v` and `aux` are
+	/// unmanaged VectorGPUs and its destructor frees nothing. The partition's own `bufferLIMB` and
+	/// `bufferSPECIAL` stay null, so ~LimbPartition frees only what every partition allocates for
+	/// itself in its constructor: the small device pointer table (`bufferAUXptrs`). That table is
+	/// filled here -- `limbptr` and `SPECIALlimbptr`, which is how every kernel finds a limb -- and
+	/// `auxptr` is left unfilled, as it is for a constant-grown plaintext (generateLimbConstant).
+	///
+	/// LIFETIME IS THE CALLER'S: the view reads `src`'s device memory for as long as it exists, so
+	/// `src` must outlive it. Read-only use only: a view is a plaintext operand, never a destination.
+	void aliasLimbsOf(const LimbPartition& src);
 
 	void loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data, const std::vector<std::vector<uint64_t>>& moduli);
 
@@ -273,8 +338,22 @@ class LimbPartition {
 
 	static void addBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb, int stride, double usage, bool sub, bool exta, bool extb);
 
-	static void
-	LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in, const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride, double usage, bool ext);
+	/// @param prepared_pt_q  A device diagonal table for this (partition, giant-step chunk)
+	///   that was uploaded once and outlives the call — see CKKS/PreparedLT.cuh. When given (with
+	///   @p prepared_pt_p alongside it for an `ext` call), the diagonal third of the pointer table
+	///   is neither rebuilt on the host nor re-uploaded; the per-call output and baby-rotation
+	///   thirds are built and uploaded exactly as before. nullptr (the default) is today's
+	///   behaviour, byte for byte.
+	static void LTdotProductPtBatch(std::vector<LimbPartition*>& out,
+	  const std::vector<LimbPartition*>& in,
+	  const std::vector<LimbPartition*>& pt,
+	  int bStep,
+	  int gStep,
+	  int stride,
+	  double usage,
+	  bool ext,
+	  void*** prepared_pt_q = nullptr,
+	  void*** prepared_pt_p = nullptr);
 
 	static void fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 	  const std::vector<LimbPartition*>& in,

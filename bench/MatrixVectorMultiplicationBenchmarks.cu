@@ -37,7 +37,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, GPUMatVecMult)(benchmark::State& state) {
 	for (int i = 0; i < n; ++i) {
 		ptxt.emplace_back(cc->MakeCKKSPackedPlaintext(x[i]));
 	}
-	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>;
+	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
 	std::vector<Cipher> ct;
 	for (int i = 0; i < n; ++i) {
 		ct.emplace_back(cc->Encrypt(keys.publicKey, ptxt1));
@@ -99,7 +99,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, GPUMatVecMultScalar)(benchmark::State& state)
 	// Encoding as plaintexts
 	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
 
-	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>;
+	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
 	std::vector<Cipher> ct;
 	for (int i = 0; i < 8; ++i) {
 		ct.emplace_back(cc->Encrypt(keys.publicKey, ptxt1));
@@ -154,7 +154,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, GPUMatVecMultWSum)(benchmark::State& state) {
 	// Encoding as plaintexts
 	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
 
-	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>;
+	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
 	std::vector<Cipher> ct;
 	for (int i = 0; i < 8; ++i) {
 		ct.emplace_back(cc->Encrypt(keys.publicKey, ptxt1));
@@ -216,7 +216,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, CPUMatVecMult)(benchmark::State& state) {
 		ptxt.emplace_back(cc->MakeCKKSPackedPlaintext(x[i]));
 	}
 
-	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>;
+	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
 	std::vector<Cipher> ct;
 	for (int i = 0; i < 8; ++i) {
 		ct.emplace_back(cc->Encrypt(keys.publicKey, ptxt1));
@@ -263,7 +263,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, CPUMatVecMultScalar)(benchmark::State& state)
 	// Encoding as plaintexts
 	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
 
-	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>;
+	using Cipher = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
 	std::vector<Cipher> ct;
 	for (int i = 0; i < 8; ++i) {
 		ct.emplace_back(cc->Encrypt(keys.publicKey, ptxt1));

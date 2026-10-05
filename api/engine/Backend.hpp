@@ -19,10 +19,9 @@ class Engine;
 /// @brief Whether a backend was compiled into this build.
 bool IsBackendAvailable(Backend backend);
 
-/// @brief Construct the engine for a backend; throws if it was not compiled in. reducedNoise and
-/// montgomery are haze-only FBC options (see CCParams::SetReducedNoise / SetMontgomery); ignored
-/// by the CPU/CUDA backends.
-std::unique_ptr<Engine> MakeEngine(Backend backend, bool reducedNoise = false, bool montgomery = false);
+/// @brief Construct the engine for a backend; throws if it was not compiled in. reducedNoise is a
+/// haze-only FBC option (see CCParams::SetReducedNoise); ignored by the CPU/CUDA backends.
+std::unique_ptr<Engine> MakeEngine(Backend backend, bool reducedNoise = false);
 
 } // namespace fideslib
 

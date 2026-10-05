@@ -5,10 +5,13 @@
 
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
+#include "CKKS/PreparedLT.cuh"
 #include "CKKS/RNSPoly.cuh"
 
+#include <cstdlib>
 #include <omp.h>
 #include <stdexcept>
+#include <string>
 
 namespace FIDESlib::CKKS {
 
@@ -78,9 +81,76 @@ void RNSPoly::multScalarBatchManyToOne(std::vector<RNSPoly*>& polya,
 	}
 }
 
-void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in, const std::vector<RNSPoly*>& pt, int bStep, int gStep, int stride, double usage, bool ext) {
+namespace {
+// Verification hook for the resident diagonal table (FIDESLIB_R2_VERIFY_TABLE=1, default off).
+//
+// The resident diagonal table is built from the api layer's view of the diagonals and consumed deep
+// inside the batch kernel dispatch, and the two index it by arithmetic written in two different
+// files. There is no way to prove they agree by inspection, and a disagreement would be a WRONG
+// ANSWER rather than a crash — so this rebuilds, on the host, exactly the entries
+// LimbPartition::LTdotProductPtBatch would have built and compares them against what the table
+// holds. Off by default and read once; on, it costs one host pass over the diagonal pointers per
+// call and turns any drift into a throw naming the entry. Run a gate once with it set.
+bool R2VerifyTable() {
+	static const bool on = [] {
+		const char* v = std::getenv("FIDESLIB_R2_VERIFY_TABLE");
+		return v != nullptr && std::atoi(v) != 0;
+	}();
+	return on;
+}
+
+void R2CheckChunk(const PreparedLTTable& prepared, int partition, int chunk, const std::vector<LimbPartition*>& pts, int bStep, int g_len) {
+	const auto& image = prepared.hostImage(partition);
+	const int base	  = prepared.chunkOffset(chunk, false);
+	const int sbase	  = prepared.ext() ? prepared.chunkOffset(chunk, true) : 0;
+	const int num_LT  = prepared.numLT();
+	for (int t = 0; t < num_LT; ++t) {
+		for (int j = 0; j < g_len; ++j) {
+			for (int k = 0; k < bStep; ++k) {
+				const int local		   = t * g_len * bStep + j * bStep + k;
+				const LimbPartition* p = pts[static_cast<size_t>(local)];
+				void* const want	   = p ? static_cast<void*>(p->limbptr.data) : nullptr;
+				if (static_cast<void*>(image[static_cast<size_t>(base + local)]) != want) {
+					throw std::runtime_error("LTdotProductPtBatch: the prepared diagonal table disagrees with the call at partition " +
+					  std::to_string(partition) + " chunk " + std::to_string(chunk) + " entry " + std::to_string(local) + " (Q basis)");
+				}
+				if (prepared.ext()) {
+					void* const wantS = p ? static_cast<void*>(p->SPECIALlimbptr.data) : nullptr;
+					if (static_cast<void*>(image[static_cast<size_t>(sbase + local)]) != wantS) {
+						throw std::runtime_error("LTdotProductPtBatch: the prepared diagonal table disagrees with the call at partition " +
+						  std::to_string(partition) + " chunk " + std::to_string(chunk) + " entry " + std::to_string(local) + " (P basis)");
+					}
+				}
+			}
+		}
+	}
+}
+} // namespace
+
+void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out,
+  const std::vector<RNSPoly*>& in,
+  const std::vector<RNSPoly*>& pt,
+  int bStep,
+  int gStep,
+  int stride,
+  double usage,
+  bool ext,
+  const PreparedLTTable* prepared) {
 	ContextData& cc = out[0]->cc;
-	if (gStep <= 8) {
+	// The resident diagonal table is indexed by (GPU partition, giant-step CHUNK), and the
+	// chunking is the loop below — so this is the one place that knows which chunk a given
+	// LimbPartition call is. Check the shape here, once, rather than letting a table built for
+	// another transform be indexed as if it were this one: a wrong table is a wrong answer.
+	if (prepared != nullptr) {
+		const int num_LT = static_cast<int>(out.size()) / (2 * gStep);
+		if (prepared->bStep() != bStep || prepared->gStep() != gStep || prepared->stride() != stride || prepared->ext() != ext || prepared->numLT() != num_LT) {
+			throw std::runtime_error("LTdotProductPtBatch: the prepared diagonal table was built for a different transform shape");
+		}
+		if (prepared->partitions() != static_cast<int>(cc.GPUid.size()))
+			throw std::runtime_error("LTdotProductPtBatch: the prepared diagonal table was built for a different GPU partition count");
+	}
+	// One chunk covers the whole transform here; the `else` below is the multi-chunk form.
+	if (gStep <= PreparedLTTable::kGiantChunk) {
 #pragma omp parallel for num_threads(out[0]->cc.GPUid.size())
 		for (size_t i = 0; i < out[0]->cc.GPUid.size(); ++i) {
 			assert(omp_get_num_threads() == (int)out[0]->cc.GPUid.size());
@@ -103,7 +173,11 @@ void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<
 					pts.push_back(nullptr);
 			}
 
-			LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, gStep, stride, usage, ext);
+			if (prepared && R2VerifyTable())
+				R2CheckChunk(*prepared, static_cast<int>(i), 0, pts, bStep, gStep);
+			LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, gStep, stride, usage, ext,
+			  prepared ? prepared->ptQ(static_cast<int>(i), 0) : nullptr,
+			  prepared ? prepared->ptP(static_cast<int>(i), 0) : nullptr);
 		}
 
 		for (auto i : out) {
@@ -112,8 +186,9 @@ void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<
 	} else {
 		if (1) {
 			int num_LT = out.size() / (2 * gStep);
-			for (int g_in = 0; g_in < gStep; g_in += 8) {
-				int g_internal = std::min(8, gStep - g_in);
+			for (int g_in = 0; g_in < gStep; g_in += PreparedLTTable::kGiantChunk) {
+				int g_internal	 = std::min(PreparedLTTable::kGiantChunk, gStep - g_in);
+				const int chunk_ = g_in / PreparedLTTable::kGiantChunk;
 				// int num_out	   = num_LT * stride * g_in;
 #pragma omp parallel for num_threads(out[0]->cc.GPUid.size())
 				for (size_t i = 0; i < out[0]->cc.GPUid.size(); ++i) {
@@ -151,7 +226,11 @@ void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<
 
 					outs[0]->s.wait(out[0]->GPU[i].s);
 					pts[0]->s.wait(pt[0]->GPU[i].s);
-					LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, g_internal, stride, usage, ext);
+					if (prepared && R2VerifyTable())
+						R2CheckChunk(*prepared, static_cast<int>(i), chunk_, pts, bStep, g_internal);
+					LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, g_internal, stride, usage, ext,
+					  prepared ? prepared->ptQ(static_cast<int>(i), chunk_) : nullptr,
+					  prepared ? prepared->ptP(static_cast<int>(i), chunk_) : nullptr);
 					out[0]->GPU[i].s.wait(outs[0]->s);
 					pt[0]->GPU[i].s.wait(pts[0]->s);
 				}

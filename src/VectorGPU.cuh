@@ -41,6 +41,12 @@ template <typename T> class VectorGPU {
 	VectorGPU(const VectorGPU<T>& v)			   = delete;
 	VectorGPU(T* data, const int size, const int device, const int offset = 0);
 	VectorGPU(Stream& stream, const int size, const int device, const T* src = nullptr);
+	/// @brief True if this vector owns live memory that free() would actually release.
+	///
+	/// False for a view onto someone else's buffer, for a zero-size vector, and for one already
+	/// freed. Lets a caller tell "I released this" from "free() was a no-op" without repeating
+	/// VectorGPU's ownership rules.
+	bool owns() const { return managed && !freeing; }
 	void free(Stream& stream);
 	~VectorGPU();
 };

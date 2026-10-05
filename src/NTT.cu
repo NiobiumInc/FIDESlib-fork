@@ -768,6 +768,39 @@ __global__ void NTT_(const Global::Globals* Globals,
 
 #undef VVV
 
+// Batched forward NTT: one launch for `batch` polynomials x `limbs` limbs. See NTT.cuh for the
+// indexing contract. The body is the void** NTT_ above with `blockIdx.y` replaced by
+// `blockIdx.z * limbs + blockIdx.y` in the POINTER TABLES ONLY -- the prime still comes from
+// blockIdx.y, because limb j of every polynomial in the batch is the same tower.
+template <bool second, ALGO algo>
+__global__ void NTTBatch_(const Global::Globals* Globals,
+  void** __restrict__ dat,
+  const int __grid_constant__ primeid_init,
+  void** __restrict__ res,
+  const int __grid_constant__ limbs) {
+	const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
+	const int k		  = (int)blockIdx.z * limbs + (int)blockIdx.y;
+
+	assert(primeid >= 0 && primeid < MAXP);
+	if (ISU64(primeid)) {
+		NTT__<uint64_t, second, algo, NTT_NONE>(Globals, (uint64_t*)dat[k], primeid, (uint64_t*)res[k], nullptr, -1, nullptr, nullptr);
+	} else {
+		NTT__<uint32_t, second, algo, NTT_NONE>(Globals, (uint32_t*)dat[k], primeid, (uint32_t*)res[k], nullptr, -1, nullptr, nullptr);
+	}
+}
+
+template __global__ void NTTBatch_<false, ALGO_SHOUP>(const Global::Globals* Globals,
+  void** __restrict__ dat,
+  const int __grid_constant__ primeid_init,
+  void** __restrict__ res,
+  const int __grid_constant__ limbs);
+
+template __global__ void NTTBatch_<true, ALGO_SHOUP>(const Global::Globals* Globals,
+  void** __restrict__ dat,
+  const int __grid_constant__ primeid_init,
+  void** __restrict__ res,
+  const int __grid_constant__ limbs);
+
 template <typename T, int WARP_SIZE>
 __global__ void
 NTT_1D(const Global::Globals* Globals, T* dat, const T* psi_dat, const int __grid_constant__ N, const int __grid_constant__ primeid, const int __grid_constant__ logN) {

@@ -18,3 +18,8 @@ OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotateAllLevels/*
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.RotateAllLevels/*
 # Failed in one of three full runs on an RTX 5090.
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.HoistedRotate/1
+# Brought in with Niobium's branches. A stress test for blocks freed on a
+# different stream than they were used on: on the CI GPU it failed all three
+# attempts in two of three runs, with and without the upstream merge, and
+# passed in the other.
+PoolStressTest.AllocateOnOneStreamFreeOnAnother

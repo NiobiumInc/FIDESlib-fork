@@ -33,13 +33,30 @@ LimbChain::LimbChain(std::size_t count, std::size_t polyBytes) {
 	}
 }
 
-LimbChain::LimbChain(const std::vector<std::vector<uint64_t>>& rows) {
+LimbChain::LimbChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base) {
+	if (base.size() != rows.size()) {
+		throw std::runtime_error("haze backend: LimbChain upload base names " + std::to_string(base.size()) + " prime(s) for " + std::to_string(rows.size()) + " row(s)");
+	}
 	ptrs_.assign(rows.size(), nullptr);
+	// Allocation is still one polynomial at a time, so keep the rollback: on a mid-loop failure
+	// the destructor does not run (the object never finished constructing).
 	try {
+		std::size_t bytes = 0;
+		std::vector<const void*> srcs;
+		srcs.reserve(rows.size());
 		for (std::size_t i = 0; i < rows.size(); ++i) {
-			const std::size_t bytes = rows[i].size() * sizeof(uint64_t);
-			hazeCheck(hazeMalloc(&ptrs_[i], bytes), "hazeMalloc");
-			hazeCheck(hazeMemcpy(ptrs_[i], rows[i].data(), bytes, HAZE_MEMCPY_HOST_TO_DEVICE), "hazeMemcpy(H2D)");
+			const std::size_t rowBytes = rows[i].size() * sizeof(uint64_t);
+			if (i == 0) {
+				bytes = rowBytes;
+			} else if (rowBytes != bytes) {
+				throw std::runtime_error("haze backend: LimbChain rows disagree on length");
+			}
+			hazeCheck(hazeMalloc(&ptrs_[i], rowBytes), "hazeMalloc");
+			srcs.push_back(rows[i].data());
+		}
+		if (!rows.empty()) {
+			// One MRP input entry for the whole chain, each residue under its declared prime.
+			hazeCheck(hazeMemcpyMrp(ptrs_.data(), srcs.data(), bytes, HAZE_MEMCPY_HOST_TO_DEVICE, base.data(), base.size()), "hazeMemcpyMrp(H2D)");
 		}
 	} catch (...) {
 		freeAll();

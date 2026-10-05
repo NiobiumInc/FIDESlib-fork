@@ -5,7 +5,7 @@ cmake_policy(VERSION 3.21.3...3.30)
 
 # Set target architectures.
 if (NOT DEFINED FIDESLIB_ARCH)
-    set(FIDESLIB_ARCH "80-real;86-real;89-real;90-real;90-virtual;100-real;120-real" CACHE STRING "Set the backend architecture target.")
+    set(FIDESLIB_ARCH "75-real;80-real;86-real;89-real;90-real;90-virtual;100-real;120-real" CACHE STRING "Set the backend architecture target.")
 endif ()
 
 # Set build type.
@@ -41,18 +41,29 @@ option(FIDESLIB_COMPILE_BENCHMARKS "Set ON to compile the FIDESlib benchmark sui
 # Option to compile the test suite.
 option(FIDESLIB_COMPILE_TESTS "Set ON to compile the FIDESlib test suite." ON)
 
+# Build a shared, redistributable libfideslib instead of the static fideslib.a.
+# The shared build absorbs OpenFHE's static archives whole and exports its own
+# symbols plus lbcrypto's, so a consumer needs no separate OpenFHE install. OFF
+# by default: existing consumers link $FIDESLIB_DIR/lib64/fideslib.a directly.
+option(FIDESLIB_BUILD_SHARED "Build libfideslib as a redistributable shared library." OFF)
+
 # CUDA backend. ON (default) requires the CUDA toolchain and builds the CUDA engine; OFF builds
 # CPU-only (CPU/OpenFHE is always available, no CUDA toolchain needed). Future accelerator backends
 # are added as their own FIDESLIB_ENABLE_<backend> flag.
 option(FIDESLIB_ENABLE_CUDA "Build the CUDA backend (CPU/OpenFHE is always available)." ON)
 
-# haze (FHETCH) backend. OFF by default. Requires a built haze tree pointed at by FIDESLIB_HAZE_DIR.
+# haze (FHETCH) backend. OFF by default. When ON, the vendored deps/niobium-haze
+# submodule is built automatically (see the FIDESLIB_ENABLE_HAZE block below).
 # HAZE is orthogonal to CUDA — both may be ON simultaneously.
 option(FIDESLIB_ENABLE_HAZE "Enable the haze (FHETCH) backend (Niobium accelerator)." OFF)
-# Path to a built haze tree. When FIDESLIB_ENABLE_HAZE is ON this must point at a directory
-# containing build/libhaze.so and include/ (haze.h, haze_types.h) plus the replay_bridge headers
-# under replay_bridge/include/. Set via -DFIDESLIB_HAZE_DIR=<path>.
-set(FIDESLIB_HAZE_DIR "" CACHE PATH "Path to a built haze tree (contains build/libhaze.so and include/).")
+# Optional override: point at an externally-built haze tree (containing build/libhaze.{so,dylib},
+# include/, and replay_bridge/include/) to skip the vendored auto-build. Empty (default) uses the
+# vendored deps/niobium-haze submodule. Set via -DFIDESLIB_HAZE_DIR=<path>.
+set(FIDESLIB_HAZE_DIR "" CACHE PATH "Override: externally-built haze tree (empty uses the vendored submodule).")
+# Override the library path itself. FIDESLIB_HAZE_DIR assumes haze's in-tree layout
+# (<dir>/build/libhaze.so); a release build configures haze into its own build
+# directory, so the headers and the artifact no longer share a root.
+set(FIDESLIB_HAZE_LIB "" CACHE FILEPATH "Override: path to libhaze.{so,dylib} (empty derives it from FIDESLIB_HAZE_DIR).")
 
 # Export compile commands for debugging.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
@@ -63,8 +74,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
-set(CMAKE_C_COMPILER "gcc")
-set(CMAKE_CXX_COMPILER "g++")
+# Bare names, resolved through PATH. Only applied when the caller has not chosen a
+# compiler: an unconditional set() here silently overrode CC/CXX and any
+# -DCMAKE_CXX_COMPILER on the command line.
+if (NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
+    set(CMAKE_C_COMPILER "gcc")
+endif ()
+if (NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+    set(CMAKE_CXX_COMPILER "g++")
+endif ()
 
 ############### CUDA Configuration ###################
 
@@ -167,9 +185,24 @@ include_directories(${OpenFHE_INCLUDE}/binfhe)
 
 # Use Clang's OpenMP implementation.
 
+if (APPLE)
+    # Homebrew's libomp is keg-only (off the default search path), unlike Linux's
+    # system-wide libgomp. Every target's compile+link line gets FIX_OMP_FLAGS below,
+    # so this is computed once here and reused by the find_package(OpenMP) hints
+    # further down for the FIDESLIB_BUILD_SHARED target.
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        set(_LIBOMP_PREFIX "/opt/homebrew/opt/libomp")
+    else ()
+        set(_LIBOMP_PREFIX "/usr/local/opt/libomp")
+    endif ()
+endif ()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     # Use Clang's OpenMP implementation.
     set(FIX_OMP_FLAGS "-fopenmp=libomp")
+    if (APPLE)
+        set(FIX_OMP_FLAGS "${FIX_OMP_FLAGS} -L${_LIBOMP_PREFIX}/lib -I${_LIBOMP_PREFIX}/include")
+    endif ()
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(FIX_OMP_FLAGS "-fopenmp")
 endif ()
@@ -190,9 +223,14 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CheckIPOSupported)
     check_ipo_supported(RESULT supported OUTPUT error)
 
-    if (supported)
+    # Overridable: gcc-13 ICEs linking large host binaries against LTO
+    # bytecode, so consumers must be able to keep Release -O3 with IPO off.
+    option(FIDESLIB_ENABLE_IPO "Enable IPO/LTO in Release builds" ON)
+    if (supported AND FIDESLIB_ENABLE_IPO)
         message(STATUS "IPO / LTO enabled")
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    elseif (NOT FIDESLIB_ENABLE_IPO)
+        message(STATUS "IPO / LTO disabled (FIDESLIB_ENABLE_IPO=OFF)")
     else ()
         message(STATUS "IPO / LTO not supported: <${error}>")
     endif ()
@@ -216,7 +254,9 @@ set(CMAKE_INSTALL_PREFIX "${FIDESLIB_INSTALL_PREFIX}")
 set(INSTALL_INCLUDE_DIR "${CMAKE_INSTALL_INCLUDEDIR}/${PROJECT_NAME}")
 set(INSTALL_LIBRARY_DIR "${CMAKE_INSTALL_LIBDIR}")
 set(INSTALL_BINARY_DIR "${CMAKE_INSTALL_BINDIR}")
-set(INSTALL_DATA_DIR "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}/cmake")
+# lib/cmake/<pkg> is where find_package() looks with only CMAKE_PREFIX_PATH set,
+# so a relocated package needs no -Dfideslib_DIR.
+set(INSTALL_DATA_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
 
 
 ############### NVTX ###################
@@ -251,7 +291,11 @@ endif ()
 file(GLOB_RECURSE HEADER_FILES_PUBLIC ${API_DIR}/*.hpp)
 set_source_files_properties(${HEADER_FILES_PUBLIC} ${SOURCE_FILES_API} PROPERTIES LANGUAGE CXX)
 
-add_library(fideslib STATIC)
+if (FIDESLIB_BUILD_SHARED)
+    add_library(fideslib SHARED)
+else ()
+    add_library(fideslib STATIC)
+endif ()
 
 if (NOT FIDESLIB_ENABLE_CUDA)
     target_sources(fideslib PRIVATE ${SOURCE_FILES_API})
@@ -281,21 +325,91 @@ target_include_directories(fideslib
         # api/ is the include root so headers use api-relative paths (e.g. "engine/cuda/CudaEngine.hpp").
         PUBLIC $<BUILD_INTERFACE:${API_DIR}>
 )
+# The installed public headers include OpenFHE by paths relative to core/ and pke/
+# ("lattice/hal/lat-backend.h", "key/evalkey-fwd.h"), so all five roots have to be
+# on a consumer's include path, not just include/openfhe. That holds for the static
+# build as much as the shared one: api/Ciphertext.hpp includes OpenFHE either way.
+# <prefix>/include/fideslib for the API headers, and <prefix>/include itself so the
+# haze C ABI resolves as <haze/haze.h> -- the spelling consumers already use.
+target_include_directories(fideslib PUBLIC
+        $<INSTALL_INTERFACE:${INSTALL_INCLUDE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# Mirror only the OpenFHE roots this install actually has. CMake errors at generate
+# time on a non-existent INTERFACE_INCLUDE_DIRECTORIES entry, and third-party/include
+# is absent from installs built without NTL/tcmalloc.
+foreach (_ofhe_sub "" "/core" "/pke" "/binfhe" "/third-party/include")
+    if (EXISTS "${OpenFHE_INCLUDE}${_ofhe_sub}")
+        target_include_directories(fideslib PUBLIC
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/openfhe${_ofhe_sub}>)
+    endif ()
+endforeach ()
 if (FIDESLIB_ENABLE_CUDA)
     target_include_directories(fideslib PRIVATE nvtx/c/include)
 endif ()
 
-target_link_libraries(fideslib
-        PRIVATE "${OpenFHE_LIBDIR}/libOPENFHEpke_static.a"
-        PRIVATE "${OpenFHE_LIBDIR}/libOPENFHEbinfhe_static.a"
-        PRIVATE "${OpenFHE_LIBDIR}/libOPENFHEcore_static.a"
+set(_FIDESLIB_OPENFHE_ARCHIVES
+        "${OpenFHE_LIBDIR}/libOPENFHEpke_static.a"
+        "${OpenFHE_LIBDIR}/libOPENFHEbinfhe_static.a"
+        "${OpenFHE_LIBDIR}/libOPENFHEcore_static.a"
 )
+if (FIDESLIB_BUILD_SHARED)
+    # Absorb OpenFHE WHOLE. Two reasons: the public headers expose lbcrypto types
+    # (api/Ciphertext.hpp:57 returns std::vector<lbcrypto::DCRTPoly>&), so consumers
+    # must be able to resolve lbcrypto symbols from this .so; and linking the archives
+    # as ordinary PRIVATE items records their absolute build-host paths in the
+    # exported target, which is what makes the current package non-relocatable.
+    # $<LINK_LIBRARY:WHOLE_ARCHIVE,...> rather than raw linker flags: CMake picks
+    # --whole-archive or -force_load per platform, and -- unlike target_link_options --
+    # it does not also feed the CUDA device-link step, where each archive would arrive
+    # as -Xcompiler=<path>.a and reach gcc as a source file.
+    target_link_libraries(fideslib PRIVATE
+            "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_FIDESLIB_OPENFHE_ARCHIVES}>")
+    # OPENFHEcore_static calls dlopen/dlsym for its pluggable PRNG engine.
+    # OpenFHE's own CMakeLists.txt adds -ldl for that within its own configure run,
+    # but that does not carry over here: this is a separate top-level CMake project
+    # linking the raw .a directly. Only glibc >= 2.34 merges libdl into libc, so this
+    # is silently fine there and a hard link failure on an older glibc.
+    target_link_libraries(fideslib PRIVATE ${CMAKE_DL_LIBS})
+    # OpenFHE is built WITH_OPENMP=ON, so libgomp is a genuine runtime dependency.
+    # COMPONENTS CXX: with CUDA enabled as a language, a bare find_package(OpenMP)
+    # also demands OpenMP_CUDA, which no toolkit provides here.
+    if (APPLE)
+        # Homebrew's libomp is keg-only (not on the default include/library search
+        # path), so a bare find_package(OpenMP) fails to detect it. deps/openfhe-src's
+        # own CMakeLists.txt (see its "OpenMP logic" section) works around this the
+        # same way, and does so successfully against the same toolchain. _LIBOMP_PREFIX
+        # is set above, next to FIX_OMP_FLAGS, which already puts -L/-I on every
+        # target's compile+link line -- this block only needs to satisfy find_package's
+        # own REQUIRED check.
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -lomp -Wno-unused-command-line-argument")
+        set(OpenMP_CXX_LIB_NAMES "libomp")
+        set(OpenMP_libomp_LIBRARY "${_LIBOMP_PREFIX}/lib/libomp.dylib")
+    endif ()
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(fideslib PRIVATE OpenMP::OpenMP_CXX)
+else ()
+    foreach (_a IN LISTS _FIDESLIB_OPENFHE_ARCHIVES)
+        target_link_libraries(fideslib PRIVATE "${_a}")
+    endforeach ()
+endif ()
 
 if (FIDESLIB_ENABLE_CUDA)
-    target_link_libraries(fideslib
-            PRIVATE CUDA::cudart
-            PRIVATE CUDA::cuda_driver
-    )
+    if (FIDESLIB_BUILD_SHARED)
+        # Absorb the CUDA runtime so the package does not require a CUDA toolkit
+        # installation on the target. The driver is the one piece that cannot travel:
+        # libcuda.so.1 ships with the NVIDIA kernel driver and is version-locked to it,
+        # so it is linked against the toolkit stub here and resolved from the system at
+        # run time -- which is exactly where it exists on any machine with a CUDA card.
+        target_link_libraries(fideslib
+                PRIVATE CUDA::cudart_static
+                PRIVATE CUDA::cuda_driver
+        )
+    else ()
+        target_link_libraries(fideslib
+                PRIVATE CUDA::cudart
+                PRIVATE CUDA::cuda_driver
+        )
+    endif ()
 
     if (nccl_FOUND)
         message(STATUS "FIDESlib linked against NCCL")
@@ -306,44 +420,115 @@ if (FIDESLIB_ENABLE_CUDA)
 endif ()
 
 if (FIDESLIB_ENABLE_HAZE)
-    if (NOT FIDESLIB_HAZE_DIR)
-        message(FATAL_ERROR "FIDESLIB_ENABLE_HAZE=ON but FIDESLIB_HAZE_DIR is not set. "
-                            "Set -DFIDESLIB_HAZE_DIR=<path-to-built-haze-tree>.")
+    # haze (FHETCH) backend. Vendored as a submodule at deps/niobium-haze and built
+    # automatically below. Set -DFIDESLIB_HAZE_DIR=<path> to instead consume an
+    # externally-built haze tree (skips the auto-build).
+    if (FIDESLIB_HAZE_DIR)
+        set(_HAZE_DIR "${FIDESLIB_HAZE_DIR}")
+        set(_HAZE_VENDORED OFF)
+    else ()
+        set(_HAZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/niobium-haze")
+        set(_HAZE_VENDORED ON)
     endif ()
 
-    # haze artifact layout (from make build MODE=release in the haze tree):
-    #   <FIDESLIB_HAZE_DIR>/build/libhaze.so     — the single shipped shared library;
-    #                                               absorbs libnbfhetch + replay_bridge objects.
-    #   <FIDESLIB_HAZE_DIR>/include/haze/         — haze.h, haze_types.h (core API)
-    #   <FIDESLIB_HAZE_DIR>/replay_bridge/include/ — haze/replay_bridge.h (hazeReplayBridge* ABI)
-    set(_HAZE_SO "${FIDESLIB_HAZE_DIR}/build/libhaze.so")
-    if (NOT EXISTS "${_HAZE_SO}")
-        message(FATAL_ERROR "haze library not found at ${_HAZE_SO}. "
-                            "Build haze first (make build MODE=release in the haze tree) "
-                            "or adjust FIDESLIB_HAZE_DIR.")
+    # haze artifact layout (produced by `make build MODE=release` in the haze tree):
+    #   <dir>/build/libhaze.{so,dylib} — the single shipped shared library; absorbs
+    #                                    libnbfhetch + replay_bridge + instrumented OpenFHE.
+    #   <dir>/include/haze/            — haze.h, haze_types.h (core API)
+    #   <dir>/replay_bridge/include/   — haze/replay_bridge.h (hazeReplayBridge* ABI)
+    if (FIDESLIB_HAZE_LIB)
+        set(_HAZE_SO "${FIDESLIB_HAZE_LIB}")
+    else ()
+        set(_HAZE_SO "${_HAZE_DIR}/build/libhaze${CMAKE_SHARED_LIBRARY_SUFFIX}")
     endif ()
 
-    # Single imported target: libhaze.so absorbs both the core haze API and the
+    if (_HAZE_VENDORED)
+        if (NOT EXISTS "${_HAZE_DIR}/Makefile")
+            message(FATAL_ERROR "vendored haze missing at ${_HAZE_DIR}. Run: "
+                                "git submodule update --init --recursive deps/niobium-haze")
+        endif ()
+        # Auto-build the vendored haze via its Makefile. HAZE_BUILD_E2E_TESTS=0 skips the
+        # stock-OpenFHE + e2e build (not needed to produce libhaze). Builds at build time,
+        # so configure stays fast; requires cmake/ninja/make on PATH.
+        include(ExternalProject)
+        ExternalProject_Add(niobium_haze
+            SOURCE_DIR        "${_HAZE_DIR}"
+            BUILD_IN_SOURCE   1
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND     make build MODE=release HAZE_BUILD_E2E_TESTS=0
+            INSTALL_COMMAND   ""
+            # Always invoke haze's make: it is timestamp-incremental, so this is a
+            # cheap no-op when nothing changed and recompiles only what a submodule
+            # bump touched (a haze update thus triggers a haze rebuild automatically).
+            BUILD_ALWAYS      1
+            BUILD_BYPRODUCTS  "${_HAZE_SO}"
+        )
+    else ()
+        if (NOT EXISTS "${_HAZE_SO}")
+            message(FATAL_ERROR "haze library not found at ${_HAZE_SO}. Build haze first "
+                                "(make build MODE=release in the haze tree) or adjust FIDESLIB_HAZE_DIR.")
+        endif ()
+    endif ()
+
+    # Single imported target: libhaze absorbs both the core haze API and the
     # replay_bridge symbols (hazeReplayBridge* are OBJECT-library-absorbed at link time).
     add_library(haze::haze SHARED IMPORTED GLOBAL)
     set_target_properties(haze::haze PROPERTIES
         IMPORTED_LOCATION "${_HAZE_SO}"
         INTERFACE_INCLUDE_DIRECTORIES
-            "${FIDESLIB_HAZE_DIR}/include;${FIDESLIB_HAZE_DIR}/replay_bridge/include"
+            "${_HAZE_DIR}/include;${_HAZE_DIR}/replay_bridge/include"
     )
+    if (_HAZE_VENDORED)
+        # Auto-built: libhaze does not exist at configure time, so CMake does not add
+        # its directory to consumers' rpath implicitly. Bake it in explicitly so
+        # build-tree executables (fideslib-test, dummy, ...) find libhaze (loaded via
+        # @rpath) in the vendored build dir -- true whether fideslib itself is shared
+        # or static. This never reaches a packaged/installed consumer:
+        # build-release.sh always passes FIDESLIB_HAZE_DIR explicitly, so
+        # _HAZE_VENDORED is OFF for that build, and $ORIGIN/patchelf handle the
+        # shipped tarball instead. (An external FIDESLIB_HAZE_DIR tree already exists
+        # at configure time, so CMake's implicit imported-location rpath covers that
+        # non-vendored case on its own.)
+        set_property(TARGET haze::haze APPEND PROPERTY
+            INTERFACE_LINK_OPTIONS "-Wl,-rpath,${_HAZE_DIR}/build")
+        add_dependencies(fideslib niobium_haze)
+    endif ()
 
     target_compile_definitions(fideslib PUBLIC FIDESLIB_ENABLE_HAZE)
     target_link_libraries(fideslib PUBLIC haze::haze)
 
-    message(STATUS "haze (FHETCH) backend enabled: ${_HAZE_SO}")
+    message(STATUS "haze (FHETCH) backend enabled: ${_HAZE_SO} (vendored: ${_HAZE_VENDORED})")
 endif ()
 
-target_link_options(fideslib PRIVATE -static-libstdc++ -static-libgcc)
+# -static-libstdc++ in a SHARED library whose public API is C++ would put two copies
+# of the C++ runtime on either side of the ABI boundary: mismatched allocation
+# ownership, dynamic_cast/catch failing on RTTI identity, two unwinder state machines.
+# The shared build relies on gcc-toolset's libstdc++_nonshared.a for its ABI floor
+# instead. Keep the flags for the static build, where the consumer links it all.
+if (NOT FIDESLIB_BUILD_SHARED AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(fideslib PRIVATE -static-libstdc++ -static-libgcc)
+endif ()
 
-set_target_properties(fideslib PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        PREFIX ""
-)
+if (FIDESLIB_BUILD_SHARED)
+    set_target_properties(fideslib PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+            VERSION "${PROJECT_VERSION}"
+            SOVERSION "${PROJECT_VERSION_MAJOR}"
+    )
+    # libhaze ships beside libfideslib in the package, so resolve it relative to the
+    # loading library rather than by absolute path.
+    if (APPLE)
+        set_target_properties(fideslib PROPERTIES INSTALL_RPATH "@loader_path")
+    else ()
+        set_target_properties(fideslib PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif ()
+else ()
+    # PREFIX "" yields "fideslib.a"; downstream trees hardcode that name.
+    set_target_properties(fideslib PROPERTIES
+            POSITION_INDEPENDENT_CODE ON
+            PREFIX ""
+    )
+endif ()
 if (FIDESLIB_ENABLE_CUDA)
     set_target_properties(fideslib PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -417,6 +602,32 @@ if (FIDESLIB_ENABLE_CUDA)
     )
 endif ()
 
+# OpenFHE headers: api/Ciphertext.hpp and api/CryptoContext.hpp include them, so
+# they are part of this package's compile interface whether or not we like it, in
+# the static build as much as the shared one.
+install(
+        DIRECTORY "${OpenFHE_INCLUDE}/"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/openfhe"
+)
+
+# A redistributable package has to carry the pieces the link line depends on, or it
+# is only usable on the build host.
+if (FIDESLIB_BUILD_SHARED)
+    if (FIDESLIB_ENABLE_HAZE)
+        # libhaze.so is a sibling runtime dependency; nothing installed it before, so
+        # every consumer was pinned to the haze build tree by rpath.
+        install(FILES "${_HAZE_SO}" DESTINATION "${INSTALL_LIBRARY_DIR}")
+        install(
+                DIRECTORY "${_HAZE_DIR}/include/haze"
+                DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+        )
+        install(
+                DIRECTORY "${_HAZE_DIR}/replay_bridge/include/haze"
+                DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+        )
+    endif ()
+endif ()
+
 install(
         EXPORT ${PROJECT_NAME}Targets
         FILE ${PROJECT_NAME}Targets.cmake
@@ -424,10 +635,29 @@ install(
         DESTINATION "${INSTALL_DATA_DIR}"
 )
 
+# A redistributable package resolves libhaze from inside itself ($ORIGIN), so the
+# build-host haze paths must not be written into the shipped config at all -- they
+# would be dead absolute strings naming this machine.
+if (FIDESLIB_BUILD_SHARED)
+    set(_FIDESLIB_CFG_HAZE_LIB "")
+    set(_FIDESLIB_CFG_HAZE_DIR "")
+else ()
+    # _HAZE_SO/_HAZE_DIR (set above), not the raw FIDESLIB_HAZE_LIB/DIR cache
+    # variables: the raw variables are empty in the default vendored-submodule case
+    # (no override given), which left a static build with the default vendored haze
+    # unable to find it at find_package() time even though it built and installed
+    # correctly. _HAZE_SO/_HAZE_DIR already resolve that default.
+    set(_FIDESLIB_CFG_HAZE_LIB "${_HAZE_SO}")
+    set(_FIDESLIB_CFG_HAZE_DIR "${_HAZE_DIR}")
+endif ()
+
+# PATH_VARS turns each of these into a PACKAGE_<name> variable resolved relative to
+# the package at load time, which is what makes the installed config relocatable.
 configure_package_config_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/${PROJECT_NAME}Config.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
         INSTALL_DESTINATION "${INSTALL_DATA_DIR}"
+        PATH_VARS INSTALL_INCLUDE_DIR INSTALL_LIBRARY_DIR INSTALL_BINARY_DIR INSTALL_DATA_DIR
 )
 
 configure_file(
@@ -477,6 +707,13 @@ if (FIDESLIB_COMPILE_TESTS)
 
     if (FIDESLIB_ENABLE_CUDA)
         file(GLOB_RECURSE TEST_SOURCE ${TEST_SOURCE_DIR}/*.cpp ${TEST_SOURCE_DIR}/*.cu)
+        # The multi-GPU tests include nccl.h unconditionally, so on a machine
+        # without NCCL the whole suite failed to build (single-GPU CI runners).
+        # Leave them out when NCCL is absent; the library itself already builds
+        # without NCCL support in that case (see the nccl_FOUND check above).
+        if (NOT nccl_FOUND)
+            list(FILTER TEST_SOURCE EXCLUDE REGEX "/(Microbench|PeerUtilsTests)\\.(cu|cpp)$")
+        endif ()
         set_source_files_properties(${TEST_SOURCE} PROPERTIES LANGUAGE CUDA)
 
         add_executable(fideslib-test)
@@ -507,6 +744,9 @@ if (FIDESLIB_COMPILE_TESTS)
         add_executable(fideslib-cpu-test)
         target_sources(fideslib-cpu-test PRIVATE
                 ${TEST_SOURCE_DIR}/ApiTests.cpp
+                ${TEST_SOURCE_DIR}/ApiKeyAccessTests.cpp
+                ${TEST_SOURCE_DIR}/ApiBootstrapToLevelTests.cpp
+                ${TEST_SOURCE_DIR}/ApiPreparedLinearTransformTests.cpp
                 ${TEST_SOURCE_DIR}/ApiParityTest.cpp)
         target_link_libraries(fideslib-cpu-test PRIVATE gtest gtest_main fideslib)
         set_target_properties(fideslib-cpu-test PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -559,4 +799,23 @@ if (FIDESLIB_COMPILE_BENCHMARKS AND FIDESLIB_ENABLE_CUDA)
             POSITION_INDEPENDENT_CODE ON
     )
 
+endif ()
+
+############### Atomic-op timing harness ###################
+# In-tree so it links the `fideslib` target directly. The installed package
+# exports a dependency on the imported `haze::haze` target, which a consuming
+# project outside this tree cannot resolve without haze's own package config.
+
+option(FIDESLIB_COMPILE_ATOMIC_OPS_ENGINE
+       "Build the single-source atomic-op timing harness (examples/atomic-ops-engine)." OFF)
+
+if (FIDESLIB_COMPILE_ATOMIC_OPS_ENGINE)
+    add_executable(atomic_ops_engine examples/atomic-ops-engine/src/atomic_ops_engine.cpp)
+    set_source_files_properties(examples/atomic-ops-engine/src/atomic_ops_engine.cpp
+            PROPERTIES LANGUAGE CXX)
+    target_link_libraries(atomic_ops_engine PRIVATE fideslib)
+    set_target_properties(atomic_ops_engine PROPERTIES
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            POSITION_INDEPENDENT_CODE ON
+    )
 endif ()

@@ -1,4 +1,11 @@
+@PACKAGE_INIT@
+
 ############### Configuration ###################
+
+# Every path below is derived from PACKAGE_PREFIX_DIR (set by @PACKAGE_INIT@) rather
+# than from the configure-time CMAKE_INSTALL_PREFIX, so the package works wherever it
+# is unpacked. The previous template baked absolute build-host paths in, and appended
+# PROJECT_NAME to a directory that already ended in it (include/fideslib/fideslib).
 
 get_filename_component(FIDESLIB_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
 if(NOT FIDESLIB_BINARY_DIR)
@@ -11,37 +18,70 @@ include(CMakeFindDependencyMacro)
 
 ############### Exports ###################
 
-set(FIDESLIB_INCLUDE_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_INCLUDE_DIR@/@PROJECT_NAME@")
-set(FIDESLIB_LIBRARIES_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_LIBRARY_DIR@")
-set(FIDESLIB_BINARY_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_BINARY_DIR@")
-set(FIDESLIB_DATA_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_DATA_DIR@")
+set_and_check(FIDESLIB_INCLUDE_PATH   "@PACKAGE_INSTALL_INCLUDE_DIR@")
+set_and_check(FIDESLIB_LIBRARIES_PATH "@PACKAGE_INSTALL_LIBRARY_DIR@")
+set(FIDESLIB_BINARY_PATH "@PACKAGE_INSTALL_BINARY_DIR@")
+set(FIDESLIB_DATA_PATH   "@PACKAGE_INSTALL_DATA_DIR@")
 
-set(FIDESLIB_CXX_COMPILER "@CMAKE_CXX_COMPILER@")
+set(FIDESLIB_SHARED "@FIDESLIB_BUILD_SHARED@")
+set(FIDESLIB_WITH_CUDA "@FIDESLIB_ENABLE_CUDA@")
+set(FIDESLIB_WITH_HAZE "@FIDESLIB_ENABLE_HAZE@")
+
+# The toolchain this package was built with. Consumers should build with an ABI
+# compatible compiler; the value is reported, not imposed. Assigning it to
+# CMAKE_CXX_COMPILER after project() has no effect anyway, and a build-host path
+# (e.g. /usr/lib64/ccache/g++) will not exist on the machine that unpacks this.
+set(FIDESLIB_CXX_COMPILER_ID      "@CMAKE_CXX_COMPILER_ID@")
+set(FIDESLIB_CXX_COMPILER_VERSION "@CMAKE_CXX_COMPILER_VERSION@")
 set(FIDESLIB_CXX_FLAGS "@FIX_OMP_FLAGS@")
-
-message(STATUS "Using FIDESlib.")
+# Retained for source compatibility with the existing examples, which do
+# set(CMAKE_CXX_COMPILER ${FIDESLIB_CXX_COMPILER}). Empty in a relocatable package.
+set(FIDESLIB_CXX_COMPILER "")
 
 ############### Link dependencies ###############
 
-find_package(CUDAToolkit)
-
-# haze (FHETCH) backend — re-create the haze::haze imported target when the package
-# was built with FIDESLIB_ENABLE_HAZE=ON. Examples are standalone CMake projects that
-# link the installed static fideslib; they need haze::haze to be resolvable here so
-# libhaze.so propagates through fideslib's PUBLIC link requirements.
-set(FIDESLIB_HAZE_DIR "@FIDESLIB_HAZE_DIR@")
-if(FIDESLIB_HAZE_DIR AND NOT TARGET haze::haze)
-  # haze artifact layout: build/libhaze.so, include/, replay_bridge/include/
-  set(_HAZE_SO "${FIDESLIB_HAZE_DIR}/build/libhaze.so")
-  if(EXISTS "${_HAZE_SO}")
-    add_library(haze::haze SHARED IMPORTED GLOBAL)
-    set_target_properties(haze::haze PROPERTIES
-      IMPORTED_LOCATION "${_HAZE_SO}"
-      INTERFACE_INCLUDE_DIRECTORIES
-          "${FIDESLIB_HAZE_DIR}/include;${FIDESLIB_HAZE_DIR}/replay_bridge/include"
-    )
-  else()
-    message(WARNING "FIDESlib was built with haze support (FIDESLIB_HAZE_DIR=${FIDESLIB_HAZE_DIR}) "
-                    "but libhaze.so was not found at ${_HAZE_SO}.")
-  endif()
+# Only meaningful for a CUDA-enabled package; the CPU/HAZE build has no CUDA in its
+# link interface, and an unconditional lookup made every consumer probe for a toolkit
+# it does not use.
+if(FIDESLIB_WITH_CUDA)
+  find_dependency(CUDAToolkit)
 endif()
+
+# haze (FHETCH) backend. fideslib links haze::haze PUBLIC, so the target has to exist
+# for consumers. In a redistributable package libhaze ships inside the package itself;
+# fall back to the external haze tree the package was built against otherwise.
+if(FIDESLIB_WITH_HAZE AND NOT TARGET haze::haze)
+  set(_HAZE_CANDIDATES
+      "${FIDESLIB_LIBRARIES_PATH}/libhaze${CMAKE_SHARED_LIBRARY_SUFFIX}"
+      "@_FIDESLIB_CFG_HAZE_LIB@"
+      "@_FIDESLIB_CFG_HAZE_DIR@/build/libhaze${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  set(_HAZE_SO "")
+  foreach(_c IN LISTS _HAZE_CANDIDATES)
+    if(_c AND EXISTS "${_c}")
+      set(_HAZE_SO "${_c}")
+      break()
+    endif()
+  endforeach()
+
+  if(_HAZE_SO)
+    add_library(haze::haze SHARED IMPORTED GLOBAL)
+    set_target_properties(haze::haze PROPERTIES IMPORTED_LOCATION "${_HAZE_SO}")
+    # In-package layout puts the haze headers under <prefix>/include/haze, which the
+    # fideslib target's own INSTALL_INTERFACE include dir already covers. A build-tree
+    # haze keeps its split include/ + replay_bridge/include/ roots.
+    if(NOT _HAZE_SO STREQUAL "${FIDESLIB_LIBRARIES_PATH}/libhaze${CMAKE_SHARED_LIBRARY_SUFFIX}")
+      set_target_properties(haze::haze PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+          "@_FIDESLIB_CFG_HAZE_DIR@/include;@_FIDESLIB_CFG_HAZE_DIR@/replay_bridge/include")
+    endif()
+  else()
+    message(FATAL_ERROR
+            "fideslib was built with the haze backend but libhaze was not found. "
+            "Looked in: ${_HAZE_CANDIDATES}")
+  endif()
+  unset(_HAZE_CANDIDATES)
+  unset(_HAZE_SO)
+endif()
+
+check_required_components(@PROJECT_NAME@)
+
+message(STATUS "Using FIDESlib (shared=${FIDESLIB_SHARED}, cuda=${FIDESLIB_WITH_CUDA}, haze=${FIDESLIB_WITH_HAZE}).")

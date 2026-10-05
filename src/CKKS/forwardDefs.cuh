@@ -20,6 +20,7 @@ class RNSPoly;
 template <typename T> class Limb;
 class Parameters;
 class BootstrapPrecomputation;
+class PreparedLTTable;
 
 template <typename T>
 concept CiphertextPtr = std::same_as<T, std::shared_ptr<Ciphertext>> || std::same_as<T, Ciphertext*>;
@@ -35,7 +36,13 @@ enum ALGO { ALGO_NATIVE = 0, ALGO_NONE = 1, ALGO_SHOUP = 3, ALGO_BARRETT = 4, AL
 
 constexpr ALGO DEFAULT_ALGO = ALGO_BARRETT;
 
-enum BOOT_CONFIG { UNIFORM = 0, UNIFORM_2 = 1, SPARSE = 2, ENCAPS = 3, ENCAPS_2 = 4 };
+// in-context rework step 5: ENCAPS_2 removed — never selected (CudaEngine maps SPARSE_ENCAPSULATED -> ENCAPS)
+// and its config differed from stock only in an unused doubleAngleIts+1.
+enum BOOT_CONFIG { UNIFORM = 0, UNIFORM_2 = 1, SPARSE = 2, ENCAPS = 3 };
+
+constexpr bool MODRAISE_WITH_P0 = false;
+constexpr int MAXG				= 8;
+
 } // namespace FIDESlib
 
 // namespace FIDESlib::CKKS

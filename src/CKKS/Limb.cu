@@ -6,6 +6,7 @@
 #include "CKKS/Context.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
 #include "CKKS/Limb.cuh"
+#include "CudaUtils.cuh" // PinnedStagingUpload
 #include "ModMult.cuh"
 #include "NTT.cuh"
 #include "Rotation.cuh"
@@ -17,7 +18,16 @@ Limb<T>::Limb(Limb<T>&& l) noexcept : cc(l.cc), primeid(l.primeid), stream(l.str
 
 template <typename T> Limb<T>::~Limb() noexcept {
 	v.free(stream);
+	// May already have been released by freeAux(); VectorGPU::free is idempotent.
 	aux.free(stream);
+}
+
+template <typename T> void* Limb<T>::freeAux(Stream& s) {
+	const bool owned = aux.owns();
+	aux.free(s);
+	// Released -> the slot must read nullptr (which is also what a never-allocated, constant-grown
+	// limb's slot already holds). A view -> nothing was freed, so the address stays valid and stays.
+	return owned ? nullptr : (void*)aux.data;
 }
 
 template <typename T>
@@ -31,10 +41,13 @@ Limb<T>::Limb(ContextData& context, const int id, Stream& stream, const int prim
 	}
 	// assert(stream.ptr() != nullptr);
 	// assert(stream.ev != nullptr);
-	int dev;
-	cudaGetDevice(&dev);
 	assert(this->v.size == cc.N);
-	assert(dev == v.device);
+	if (DeviceChecks()) { // FIDESLIB_DEVICE_CHECKS=0 skips the driver query the assert consumes
+		int dev = -1;
+		cudaGetDevice(&dev);
+		assert(dev == v.device);
+		(void)dev;
+	}
 }
 
 /**
@@ -53,10 +66,13 @@ Limb<T>::Limb(ContextData& context, T* data, const int offset, const int id, Str
 	// assert(stream.ptr() != nullptr);
 	// assert(stream.ev != nullptr);
 
-	int dev;
-	cudaGetDevice(&dev);
 	assert(this->v.size == cc.N);
-	assert(dev == v.device);
+	if (DeviceChecks()) { // FIDESLIB_DEVICE_CHECKS=0 skips the driver query the assert consumes
+		int dev = -1;
+		cudaGetDevice(&dev);
+		assert(dev == v.device);
+		(void)dev;
+	}
 }
 
 template <typename T> Global::Globals* Limb<T>::getGlobals() {
@@ -64,6 +80,7 @@ template <typename T> Global::Globals* Limb<T>::getGlobals() {
 }
 
 template <typename T> void Limb<T>::store(std::vector<T>& dat) const {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kStore);
 	dat.resize(v.size);
 
 	// cudaHostRegister((void*)dat.data(), dat.size() * sizeof(T), cudaHostRegisterDefault);
@@ -75,26 +92,61 @@ template <typename T> void Limb<T>::store(std::vector<T>& dat) const {
 	// cudaHostUnregister((void*)dat.data());
 }
 
+/**
+ * Lifetime contract for the H2D transfers below.
+ *
+ * Default (pageable) path: the source is ordinary pageable host memory, so cudaMemcpyAsync is not
+ * truly asynchronous on the host side -- the driver stages the bytes through its own pinned buffer
+ * and does not return until that staging copy has been made. The source is therefore free to die as
+ * soon as the call returns, which is what lets the converting branch hand the kernel a
+ * function-local vector.
+ *
+ * The same-width branch does not even need that guarantee: it transfers straight out of the
+ * caller's vector, which by definition outlives the call, instead of copying it into a local
+ * first. That is strictly safer than what it replaces, not less safe.
+ *
+ * Pinned path (FIDESLIB_PINNED_STAGING=1): PinnedStagingUpload copies the source into a slot of the
+ * device's pinned staging ring before it issues the transfer, so the bytes leaving for the device
+ * are the ring's, not the caller's. The source is therefore free to die as soon as the call
+ * returns -- the same contract as the pageable path, established explicitly here instead of
+ * inherited from driver behaviour, and it is the RING SLOT, not a stream synchronization, that
+ * establishes it. (The earlier single-slot version did synchronize; it does not any more, and
+ * nothing about this contract depended on that.) The upload itself stays asynchronous and ordered
+ * within `st`, exactly as the pageable cudaMemcpyAsync below is. PinnedStagingUpload declines
+ * (returns false) whenever it cannot do all that, and we fall back to the pageable copy.
+ *
+ * If the pageable path is ever moved onto pinned/registered memory WITHOUT going through
+ * PinnedStagingUpload (i.e. transferring straight out of caller-owned pinned memory), the
+ * converting branch must gain an owned staging buffer or a cudaStreamSynchronize before returning.
+ *
+ * THREADING: the ring is thread-safe per device, so nothing here forbids concurrent loads. In this
+ * library they do not happen on one device anyway -- RNSPoly::load / loadConstant are serial loops
+ * and RNSPoly::loadDecompDigit's omp loop is one thread PER GPU, so each thread reaches a different
+ * device's ring. (Applications may encode plaintexts on worker threads, but the device load is a
+ * separate step on the consumer thread.)
+ */
 template <typename T> template <typename Q> void Limb<T>::load(const std::vector<Q>& dat_) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kLoad);
 	assert(dat_.size() <= v.size);
-	int device = -1;
-	cudaGetDevice(&device);
-	// std::cout << v.device << " " << device << ",";
-	std::vector<T> dat;
-	if constexpr (!std::is_same<T, Q>().value) {
-		dat.assign(v.size, 0);
-		for (size_t i = 0; i < dat.size(); ++i) {
-			dat[i] = dat_[i];
-		}
-	} else {
-		dat = dat_;
-	}
+	cudaStream_t st = stream.ptr();
 
-	// cudaHostRegister((void *) dat.data(), dat.size() * sizeof(T), cudaHostRegisterDefault);
-	// cudaDeviceSynchronize();
-	cudaMemcpyAsync(v.data, dat.data(), dat.size() * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
-	// cudaDeviceSynchronize();
-	// cudaHostUnregister((void *) dat.data());
+	if constexpr (std::is_same_v<T, Q>) {
+		// No conversion needed: no intermediate at all.
+		const size_t bytes = dat_.size() * sizeof(T);
+		if (!PinnedStagingUpload(v.data, dat_.data(), bytes, v.device, st))
+			cudaMemcpyAsync(v.data, dat_.data(), bytes, cudaMemcpyHostToDevice, st);
+	} else {
+		// Widths differ, so a converted staging vector is unavoidable. It is sized to the full limb
+		// and zero-filled, so a short input leaves the tail zeroed; the previous version looped to
+		// v.size while indexing dat_, reading past its end whenever dat_ was short.
+		std::vector<T> dat(v.size, 0);
+		for (size_t i = 0; i < dat_.size(); ++i) {
+			dat[i] = static_cast<T>(dat_[i]);
+		}
+		const size_t bytes = dat.size() * sizeof(T);
+		if (!PinnedStagingUpload(v.data, dat.data(), bytes, v.device, st))
+			cudaMemcpyAsync(v.data, dat.data(), bytes, cudaMemcpyHostToDevice, st);
+	}
 }
 
 template void Limb<uint32_t>::load<uint32_t>(const std::vector<uint32_t>& dat_);
@@ -111,12 +163,19 @@ template <typename T> void Limb<T>::load(const VectorGPU<T>& dat) {
 
 template <typename T> template <typename Q> void Limb<T>::load_convert(const std::vector<Q>& dat_raw) {
 	assert(dat_raw.size() <= v.size);
-	std::vector<T> dat(dat_raw.size());
 
-	for (size_t i = 0; i < dat.size(); ++i)
-		dat[i] = static_cast<T>(dat_raw[i]);
-
-	load(dat);
+	if constexpr (std::is_same_v<T, Q>) {
+		// static_cast<T> is the identity here, so materialising a converted copy of the caller's
+		// buffer only to memcpy it is pure overhead. Hand the caller's buffer straight to load(),
+		// whose same-width branch transfers out of it directly.
+		load(dat_raw);
+	} else {
+		std::vector<T> dat(dat_raw.size());
+		for (size_t i = 0; i < dat.size(); ++i)
+			dat[i] = static_cast<T>(dat_raw[i]);
+		// `dat` outlives the transfer: see the lifetime contract on Limb<T>::load above.
+		load(dat);
+	}
 }
 
 template void Limb<uint32_t>::load_convert<uint64_t>(const std::vector<uint64_t>& dat_raw);
@@ -138,6 +197,59 @@ template <typename T> template <typename Q> void Limb<T>::store_convert(std::vec
 template void Limb<uint32_t>::store_convert<uint64_t>(std::vector<uint64_t>& dat_raw);
 
 template void Limb<uint64_t>::store_convert<uint64_t>(std::vector<uint64_t>& dat_raw);
+
+/**
+ * @brief Device encode, one limb: OpenFHE's CKKSPackedEncoding::FitToNativeVector, on the GPU.
+ *
+ * Reproduces, coefficient by coefficient, the host loop in OpenFHE's
+ * src/pke/lib/encoding/ckkspackedencoding.cpp (FitToNativeVector), which is the ONLY step between
+ * the encoder's `temp` array and the RNS towers:
+ *
+ *     NativeInteger n(vec[i]);
+ *     if (n > bigValueHf) (*nativeVec)[gap * i] = n.ModSub(diff, modulus);
+ *     else                (*nativeVec)[gap * i] = n.Mod(modulus);
+ *
+ * with `diff = bigBound - modulus` and `bigValueHf = bigBound >> 1`. `ModSub(b, q)` in OpenFHE
+ * reduces BOTH operands first and then subtracts with a borrow-correcting add, which is what the
+ * `(r >= d) ? r - d : r + q - d` below is; writing it as `(n - diff) % q` instead would be wrong,
+ * because `n - diff` underflows for the small-`n` half of the negative branch.
+ *
+ * Deliberately NOT a `gap`-strided scatter: this entry point takes the caller's already-expanded
+ * length-N coefficient vector (gap == 1 after expansion), so the zero-fill for sparse encodings is
+ * the caller's job and is visible in the uploaded buffer. Keeping the stride out of the kernel is
+ * what lets every limb share one buffer with a plain contiguous read.
+ *
+ * ALGO_BARRETT (not ALGO_BARRETT_FP64, which is an unimplemented device-side assert) reduces via
+ * Neal_reduce_64, whose error bound holds for any input below prime^2 — biased coefficients are
+ * bounded by 2^63 - 2^9 - 1 and the primes here are ~2^55 and up, so the input is far inside the
+ * valid domain and the single conditional subtraction at the end of the reduce is sufficient.
+ */
+template <typename T>
+__global__ void fit_to_native_(T* __restrict__ dst, const uint64_t* __restrict__ biased, const int primeid, const uint64_t bigValueHf, const uint64_t diff) {
+	const int i		 = blockIdx.x * blockDim.x + threadIdx.x;
+	const uint64_t n = biased[i];
+	const uint64_t q = C_.primes[primeid];
+
+	uint64_t r = modreduce<ALGO_BARRETT>((__uint128_t)n, primeid);
+	if (n > bigValueHf) {
+		const uint64_t d = modreduce<ALGO_BARRETT>((__uint128_t)diff, primeid);
+		r				 = (r >= d) ? (r - d) : (r + q - d);
+	}
+	dst[i] = static_cast<T>(r);
+}
+
+template <> void Limb<uint64_t>::loadCoefficients(const uint64_t* biased, const uint64_t bigValueHf, const uint64_t diff) {
+	dim3 blockDim{ block };
+	dim3 gridDim{ (uint32_t)(cc.N) / block };
+	fit_to_native_<uint64_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, biased, primeid, bigValueHf, diff);
+}
+
+template <> void Limb<uint32_t>::loadCoefficients(const uint64_t* biased, const uint64_t bigValueHf, const uint64_t diff) {
+	dim3 blockDim{ block };
+	dim3 gridDim{ (uint32_t)(cc.N) / block };
+	// The residue is < prime < 2^32 for a 32-bit tower, so the narrowing store in the kernel is exact.
+	fit_to_native_<uint32_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, biased, primeid, bigValueHf, diff);
+}
 
 template <typename T> void Limb<T>::add(const LimbImpl& l) {
 	switch (l.index()) {
@@ -243,6 +355,7 @@ template <> void Limb<uint32_t>::mult(const LimbImpl& _l1, const LimbImpl& _l2, 
 }
 
 template <typename T> template <ALGO algo> void Limb<T>::INTT() {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kNtt);
 	assert(primeid >= 0);
 	constexpr int M = sizeof(T) == 8 ? 4 : 8;
 
@@ -262,6 +375,7 @@ template <typename T> template <ALGO algo> void Limb<T>::INTT() {
 }
 
 template <typename T> template <ALGO algo> void Limb<T>::NTT() {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kNtt);
 
 	if constexpr (0) {
 		assert(primeid >= 0);
@@ -280,7 +394,11 @@ template <typename T> template <ALGO algo> void Limb<T>::NTT() {
 		cudaLaunchCooperativeKernel(get_NTT_reference(false) /*(void *) test_kernel*/ /*(void *) NTT_<T, false, algo>*/, gridDim, blockDim, args, bytes, stream.ptr());
 		// CudaCheckErrorModNoSync;
 	} else if constexpr (1) {
-		static std::map<int, cudaGraphExec_t> exec;
+		// thread_local, not a bare function-local static (same reasoning as LimbPartition::multPt):
+		// this is reached by every NTT, and `exec[primeid]` is a std::map insertion the first time a
+		// prime is seen. With FIDESLIB_CONCURRENT_OPS several host threads reach it at once; the
+		// default mode has one thread, one map, so its behaviour is unchanged.
+		static thread_local std::map<int, cudaGraphExec_t> exec;
 
 		run_in_graph<false>(exec[primeid], stream, [&]() {
 			assert(primeid >= 0);
@@ -396,7 +514,11 @@ template <> void Limb<uint64_t>::NTT_multpt_fused(const LimbImpl& _l, const Limb
 	assert(_l.index() == U64);
 	assert(_pt.index() == U64);
 
-	static std::map<int, cudaGraphExec_t> exec;
+	// thread_local, not a bare function-local static (same reasoning as LimbPartition::multPt):
+		// this is reached by every NTT, and `exec[primeid]` is a std::map insertion the first time a
+		// prime is seen. With FIDESLIB_CONCURRENT_OPS several host threads reach it at once; the
+		// default mode has one thread, one map, so its behaviour is unchanged.
+		static thread_local std::map<int, cudaGraphExec_t> exec;
 
 	// run_in_graph<false>(exec[primeid], stream, [&]()
 	{

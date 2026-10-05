@@ -57,4 +57,39 @@ std::vector<int> GetConvolutionTransformRotationIndices(int rowSize, int bStep, 
 	return res;
 }
 
+// Moved from src/CKKS/LinearTransform.cu (FIDESlib::CKKS::GetLinearTransformRotationIndices), with
+// the ceil(double) giant-step count replaced by the equivalent integer form.
+//
+// The transform rotates the ciphertext by i*stride for i in [0, bStep) (all from ONE hoisted ModUp),
+// then folds the gStep partial sums with a rotation by bStep*stride per step, then applies `offset`
+// once at the end. That is exactly {i*stride : i in [1, bStep]} plus `offset` — index 0 is the
+// identity and needs no key.
+std::vector<int> GetLinearTransformRotationIndices(int bStep, int stride, int offset) {
+	std::vector<int> res(static_cast<size_t>(bStep) + (offset != 0));
+	for (int i = 1; i <= bStep; ++i)
+		res[static_cast<size_t>(i) - 1] = i * stride;
+	if (offset != 0)
+		res[static_cast<size_t>(bStep)] = offset;
+	return res;
+}
+
+// Moved from src/CKKS/LinearTransform.cu (FIDESlib::CKKS::GetLinearTransformPlaintextRotationIndices).
+//
+// Diagonal k is consumed inside giant step j = k / bStep, i.e. AFTER the fold has already rotated the
+// running sum by j*bStep*stride and the final `offset`. The caller therefore has to pre-rotate the
+// diagonal by the inverse of that, so the encoded plaintext lines up with the ciphertext slot the
+// kernel multiplies it into. res[k] is the rotation to apply to logical diagonal k before encoding.
+std::vector<int> GetLinearTransformPlaintextRotationIndices(int rowSize, int bStep, int stride, int offset) {
+	std::vector<int> res(static_cast<size_t>(rowSize));
+	const int gStep = (rowSize + bStep - 1) / bStep;
+
+	for (int j = 0; j < gStep; j++) {
+		for (int i = 0; i < bStep; ++i) {
+			if (i + j * bStep < rowSize)
+				res[static_cast<size_t>(i + j * bStep)] = -bStep * j * stride - offset;
+		}
+	}
+	return res;
+}
+
 } // namespace fideslib

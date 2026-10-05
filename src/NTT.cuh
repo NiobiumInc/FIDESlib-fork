@@ -88,6 +88,31 @@ __global__ void NTT_(const Global::Globals* Globals,
   void** __restrict__ res2					  = nullptr,
   void** __restrict__ kskb					  = nullptr);
 
+/// @brief Forward NTT over a BATCH of polynomials that share one modulus chain, in ONE launch.
+///
+/// Same transform as the void** NTT_ above, with one extra grid dimension. blockIdx.y still selects
+/// the LIMB (and therefore the prime, exactly as there: primeid_flattened[primeid_init + y], so the
+/// caller passes the same PARTITION(id, 0) it passes to ApplyNTT), and blockIdx.z selects which
+/// polynomial of the batch, so the pointer tables are flat and indexed `blockIdx.z * limbs +
+/// blockIdx.y`. The per-block work is byte for byte the work NTT_ does -- this calls the same
+/// NTT__ device function with the same arguments, and NTT__ reads only blockIdx.x/gridDim.x -- so
+/// the result is bit-identical to running NTT_ once per polynomial.
+///
+/// NTT_NONE only: the fused modes all carry a second operand whose table would need the same
+/// re-indexing, and nothing batches them. Instantiated for ALGO_SHOUP alone, which is what
+/// RNSPoly::NTT uses.
+///
+/// @param dat    Flat table of `batch * limbs` source pointers (first stage: the limbs; second: the
+///               NTT scratch).
+/// @param res    Flat table of `batch * limbs` destination pointers, same indexing.
+/// @param limbs  Limbs per polynomial on this partition == gridDim.y.
+template <bool second, ALGO algo>
+__global__ void NTTBatch_(const Global::Globals* Globals,
+  void** __restrict__ dat,
+  const int __grid_constant__ primeid_init,
+  void** __restrict__ res,
+  const int __grid_constant__ limbs);
+
 // ------------------------------------- 1D NTT version ----------------------------------------
 
 template <typename T, int WARP_SIZE = 32>

@@ -68,13 +68,31 @@ void CCParams<CryptoContextCKKSRNS>::SetKeySwitchTechnique(KeySwitchTechnique te
 void CCParams<CryptoContextCKKSRNS>::SetSecretKeyDist(SecretKeyDist dist) {
 	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(host);
 
-	// Record the requested distribution as-is. The CUDA backend's restriction against sparse-ternary keys
-	// is enforced at context construction (GenCryptoContext), so an unsupported choice fails loudly
-	// there rather than being silently downgraded here.
-	if (dist == SecretKeyDist::SPARSE_TERNARY) {
+	// In-context encapsulation: SPARSE_ENCAPSULATED now maps onto the STOCK lbcrypto
+	// SPARSE_ENCAPSULATED enum, not UNIFORM_TERNARY. That is what makes stock's own
+	// EvalBootstrapKeyGen emit the 2N-2 / 2N-4 switching keys (in-context, the 2N-4 being the
+	// two-prime (q0,p) sparse-switch key) and makes stock EvalBootstrap run the in-context
+	// KeySwitchSparse dance instead of a plain uniform bootstrap. See ckksrns-fhe.cpp.
+	//
+	// ***SECURITY LANDMINE*** — read before touching this. stock KeyGenInternal
+	// (src/pke/lib/schemebase/base-pke.cpp) puts SPARSE_ENCAPSULATED in the SAME case as
+	// SPARSE_TERNARY and draws the MAIN secret at Hamming weight 192 — the ~123-bit sparse
+	// instance this entire workstream exists to AVOID. Encapsulation's whole point is a UNIFORM
+	// main key with the sparse h=32 key confined to the mod-raise. The main key is therefore kept
+	// uniform in CryptoContextImpl<DCRTPoly>::KeyGen(), which temporarily forces UNIFORM_TERNARY
+	// around the secret draw and then asserts (loudly, when a real security level is claimed) that
+	// the resulting main secret is uniform, not h=192. Do NOT map SPARSE_ENCAPSULATED here without
+	// that keygen-time guard in place — it would be a silent security regression, not a refactor.
+	switch (dist) {
+	case SecretKeyDist::SPARSE_TERNARY:
 		params.SetSecretKeyDist(lbcrypto::SPARSE_TERNARY);
-	} else {
+		break;
+	case SecretKeyDist::SPARSE_ENCAPSULATED:
+		params.SetSecretKeyDist(lbcrypto::SPARSE_ENCAPSULATED);
+		break;
+	default:
 		params.SetSecretKeyDist(lbcrypto::UNIFORM_TERNARY);
+		break;
 	}
 	keyDist = dist;
 }
@@ -130,10 +148,6 @@ void CCParams<CryptoContextCKKSRNS>::SetCiphertextAutoload(bool autoload) {
 
 void CCParams<CryptoContextCKKSRNS>::SetReducedNoise(bool enable) {
 	this->reducedNoise = enable;
-}
-
-void CCParams<CryptoContextCKKSRNS>::SetMontgomery(bool enable) {
-	this->montgomery = enable;
 }
 
 } // namespace fideslib

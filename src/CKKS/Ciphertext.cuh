@@ -8,6 +8,7 @@
 #include "RNSPoly.cuh"
 #include "forwardDefs.cuh"
 #include "openfhe-interface/RawCiphertext.cuh"
+#include <optional>
 #include <source_location>
 
 namespace FIDESlib::CKKS {
@@ -46,6 +47,15 @@ class Ciphertext {
 	ContextData& cc;
 	/** @brief The two polynomial components of the ciphertext (c0 and c1). */
 	RNSPoly c0, c1;
+	/**
+	 * @brief Optional third polynomial component, present only while the ciphertext is degree 2
+	 *        (i.e. between multNoRelin() and relinearize()).
+	 *
+	 * It is acquired from the context's auxiliary-polynomial POOL (Context::getAuxilarPoly) and
+	 * returned to it on release, exactly like c0 and c1 — it is never the shared keyswitch scratch
+	 * (Context::getKeySwitchAux), which every key-switch overwrites.
+	 */
+	std::optional<RNSPoly> c2;
 	/** @brief Accumulated noise factor for this ciphertext. */
 	double NoiseFactor = 0;
 	/** @brief Discrete noise level indicator. */
@@ -82,6 +92,13 @@ class Ciphertext {
 
 	/** @brief Destructor. Releases any allocated resources. */
 	~Ciphertext();
+
+	/**
+	 * @brief OpenFHE NumberCiphertextElements: 3 while a third component is present, 2 otherwise.
+	 */
+	[[nodiscard]] int numElements() const {
+		return c2.has_value() ? 3 : 2;
+	}
 
 	/**
 	 * @brief Copies only the metadata fields from another ciphertext.
@@ -263,6 +280,27 @@ class Ciphertext {
 	 * @param moddown Perform modulus down‑conversion if true.
 	 */
 	void mult(const Ciphertext& b, bool rescale = false, bool moddown = true);
+
+	/**
+	 * @brief Tensor product with NO key-switch, leaving a degree-2 ciphertext.
+	 *
+	 * Shares mult()'s level/scale prologue, then computes the three-term product
+	 * (c0·b.c0, c0·b.c1 + c1·b.c0, c1·b.c1) with the third term kept in `c2`. Metadata is merged
+	 * exactly as mult() does. The caller must relinearize() before any operation that needs a
+	 * degree-1 ciphertext.
+	 *
+	 * @param b Ciphertext multiplier.
+	 */
+	void multNoRelin(const Ciphertext& b);
+
+	/**
+	 * @brief Key-switches `c2` with the evaluation key and folds it back into (c0, c1), returning the
+	 *        ciphertext to degree 1.
+	 *
+	 * A no-op when the ciphertext is already degree 1, mirroring OpenFHE's RelinearizeInPlace. All
+	 * metadata (level, noise level, scaling factor, slots) is left untouched.
+	 */
+	void relinearize();
 
 	/**
 	 * @brief Multiplies two ciphertexts and stores the result in *this*.
@@ -449,9 +487,65 @@ class Ciphertext {
 	 *
 	 * @param indexes Vector of rotation indexes.
 	 * @param results Vector to receive resulting ciphertext pointers.
-	 * @param ext     If true, extends ciphertexts before rotation.
+	 * @param ext     If true, the results are left in the extended Q*P basis
+	 *                (isModUp() == true, values scaled by P) so that several of
+	 *                them can be added and brought back with a single moddown().
+	 *                Such results are not valid inputs for any other operation
+	 *                (rescale, multPt, store, ...) until they, or the sum they
+	 *                were added into, have been moddown'ed; see Accumulate() for
+	 *                the intended pattern. If false, each result is moddown'ed
+	 *                and ready to use.
 	 */
 	void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+
+	/**
+	 * @brief ONE index of rotate_hoisted, against a ModUp the CALLER owns and keeps alive.
+	 *
+	 * rotate_hoisted amortises the ModUp of c1 -- the digit decomposition and its NTTs, the
+	 * expensive shared half of a key switch -- across a set of indexes known up front. The
+	 * EvalFastRotationPrecompute / EvalFastRotation contract is the lazy shape of the same idea:
+	 * decompose once, then rotate one index at a time. This is that per-index half; the ModUp
+	 * lives in `src_c1_modup`, built once by the caller (api/engine/cuda/CudaEngine.cpp
+	 * evalFastRotationPrecompute) from `src`'s c1.
+	 *
+	 * @param src           Source ciphertext. *this* must already be a DISTINCT copy of it at the
+	 *                      same level (the precondition rotate_hoisted's `results` satisfy).
+	 * @param src_c1_modup  ModUp of `src.c1`. Read-only in the fused and single-GPU paths, so one
+	 *                      handle serves any number of indexes.
+	 * @param index         Rotation index; 0 is the identity.
+	 * @param ext           Leave the result in the extended (pre-ModDown) basis.
+	 * @throws std::invalid_argument if the precompute's level no longer matches `src` (a stale
+	 *         handle: the source was rescaled or levelled after the precompute was taken).
+	 */
+	void rotate_precomputed(const Ciphertext& src, RNSPoly& src_c1_modup, int index, bool ext);
+
+	/**
+	 * @brief The TRANSPOSE of rotate_hoisted: ONE index, MANY independent sources.
+	 *
+	 * rotate_hoisted shares one source's digit decomposition across many indexes. This shares one
+	 * INDEX -- that is, one rotation key's digit-NTTs and one automorphism -- across many sources.
+	 * Each source still needs its own ModUp (the decomposition is a property of the ciphertext, not
+	 * of the key), but those ModUps and the key-switch inner products that follow them go out as
+	 * ONE batched launch: RNSPoly::fusedHoistedRotateBatch with stride = B, n = 1, which loads the
+	 * key into shared memory once per block and reuses it across the B sources of the block's z
+	 * dimension.
+	 *
+	 * Every result is byte-identical to `Ciphertext::rotate(src, index)` on the same source: the
+	 * same key, the same automorphism index, the same ModDown, only the launch shape differs.
+	 *
+	 * PRECONDITIONS (the batched kernel takes ONE limb layout for the whole batch):
+	 *   - `srcs` and `results` are the same size, and every `results[i]` is a DISTINCT ciphertext
+	 *     from every source (no aliasing: the kernel reads all sources and writes all results).
+	 *   - every source is degree 1, at the SAME level, with the same keyID, slot count and ModUp
+	 *     state. The caller (CudaEngine::evalRotateMany) checks this and falls back to a loop of
+	 *     rotate() when it does not hold, so the api contract stays unconditional.
+	 *   - `index` is non-zero and has a rotation key.
+	 *
+	 * @param srcs    Sources, all at one level. Not modified.
+	 * @param results Destinations, one per source, distinct from them.
+	 * @param index   The single rotation index, pre-normalisation.
+	 */
+	static void rotate_many(const std::vector<Ciphertext*>& srcs, const std::vector<Ciphertext*>& results, int index);
 
 	/**
 	 * @brief Evaluates a linear weighted sum (mutable version) over `n` ciphertexts.
@@ -535,7 +629,7 @@ class Ciphertext {
 	 *
 	 * @param ciphertext Source ciphertext.
 	 */
-	void reinterpretContext(const Ciphertext& ciphertext);
+	// reinterpretContext removed — in-context ENCAPS has a single context (dual-context dance gone).
 
 	/**
 	 * @brief Performs a key‑switch operation using the provided switching key.
@@ -626,7 +720,79 @@ class Ciphertext {
 	 * @param power Exponent of the monomial.
 	 */
 	void multMonomial(int power);
+
+  private:
+	/**
+	 * @brief The level/scale alignment that must precede a ciphertext-ciphertext tensor product,
+	 *        shared by mult() and multNoRelin().
+	 *
+	 * Every path here is rescale / multScalar / dropToLevel — the helper never key-switches, so it
+	 * cannot consume the shared keyswitch scratch.
+	 *
+	 * @param b The other multiplicand.
+	 * @return `false` when *this could not be aligned to `b`; the caller must then retry against an
+	 *         adjusted copy of `b` (see mult()).
+	 */
+	bool adjustBeforeMult(const Ciphertext& b);
+
+	/**
+	 * @brief The key-switch-and-fold tail shared by mult() and relinearize().
+	 *
+	 * Key-switches the degree-2 component held in `d2` with `kskEval` and folds both halves back
+	 * into (c0, c1). `d2` is overwritten with the c1 half, so it must be a scratch polynomial that
+	 * carries the DECOMP/DIGIT/GATHER buffers the hybrid key-switch needs — in practice always
+	 * Context::getKeySwitchAux().
+	 *
+	 * @param d2      Degree-2 component to key-switch, in place.
+	 * @param kskEval Evaluation (relinearization) key.
+	 * @param moddown Perform the modulus down-conversion as part of the key-switch.
+	 */
+	void foldKeySwitched(RNSPoly& d2, const KeySwitchingKey& kskEval, bool moddown);
+
+	/**
+	 * @brief Acquire c2 from the context's auxiliary-polynomial pool, empty (level -1, no limbs) and
+	 *        not mod-up, exactly as the constructor prepares c0 and c1.
+	 */
+	void acquireC2();
+
+	/** @brief Return c2 to the context's auxiliary-polynomial pool and clear it. */
+	void releaseC2();
+
+	/**
+	 * @brief Reject a degree-2 ciphertext for an operation defined only on degree-1 ones.
+	 *
+	 * A real throw rather than an assert: asserts are compiled out in Release, and several of the
+	 * guarded entry points are reachable straight from the public api.
+	 */
+	void requireDegree1(const char* op) const;
+
+	/**
+	 * @brief Reject a plaintext that could not be brought onto this ciphertext's level and depth.
+	 *
+	 * @param adjusted Result of adjustPlaintextToCiphertext.
+	 * @param original The plaintext handed to the operation, for the message.
+	 * @param op       Operation name, for the message.
+	 *
+	 * A real throw rather than an assert, for the same reason as requireDegree1: the assert this
+	 * replaces was compiled out in Release, leaving addPt/subPt to silently drop the plaintext.
+	 */
+	void requireAdjustedPt(bool ok, const Plaintext& adjusted, const Plaintext& original, const char* op) const;
 };
+
+/// @brief Record, in the BLOCK PROVENANCE TRACER, that the calling lane has just finished writing
+/// `ct` -- i.e. that every block backing `ct`'s limbs is an OUTPUT of this lane, written on that
+/// limb's stream.
+///
+/// WHY THIS EXISTS. The pool's own events say a block was freed by lane 0 and taken by lane 2.
+/// That is only half an interleaving: it does not say that the block in question was the one
+/// lane 2's bootstrap wrote its ANSWER into, which is what makes a dump readable as "lane 2 took
+/// this block at seq N on stream S and wrote its output into it, while lane 0's last read of it
+/// was fenced on stream S' at seq M". So the last op of a bootstrap marks its output here.
+///
+/// A no-op -- one cached-bool read -- unless FIDESLIB_POOL_TRACE=1 and FIDESLIB_CONCURRENT_OPS=1.
+/// It reads pointers and stream handles only: no launch, no copy, no synchronize, and it does not
+/// touch any stream's `updated` flag.
+void PoolTraceMarkCiphertextOutput(const Ciphertext& ct);
 
 } // namespace FIDESlib::CKKS
 

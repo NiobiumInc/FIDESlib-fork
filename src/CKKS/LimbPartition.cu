@@ -2,7 +2,9 @@
 // Created by carlosad on 27/04/24.
 //
 #include <algorithm>
+#include "CudaUtils.cuh"
 #include <array>
+#include <stdexcept>
 #include <variant>
 #include <vector>
 
@@ -38,7 +40,41 @@ LimbPartition::LimbPartition(LimbPartition&& l) noexcept
   DIGITlimbptr(std::move(l.DIGITlimbptr)),
   //      DIGITauxptr(std::move(l.DIGITlimbptr)),
   GATHERptr(std::move(l.GATHERptr)), bufferDECOMPandDIGIT(l.bufferDECOMPandDIGIT), bufferSPECIAL(l.bufferSPECIAL), bufferLIMB(l.bufferLIMB),
-  bufferGATHER(l.bufferGATHER), bufferDECOMPandDIGIT_handle(l.bufferDECOMPandDIGIT_handle), bufferGATHER_handle(l.bufferGATHER_handle) {
+  bufferGATHER(l.bufferGATHER), bufferDECOMPandDIGIT_handle(l.bufferDECOMPandDIGIT_handle), bufferGATHER_handle(l.bufferGATHER_handle),
+  bufferDECOMPandDIGIT_bytes(l.bufferDECOMPandDIGIT_bytes), bufferSPECIAL_bytes(l.bufferSPECIAL_bytes), bufferLIMB_bytes(l.bufferLIMB_bytes), bufferLIMB_pooled(l.bufferLIMB_pooled),
+  bufferGATHER_bytes(l.bufferGATHER_bytes) {
+	// THE INVARIANT THIS MOVE RESTS ON: the source holds NO LIMBS YET.
+	//
+	// `s(std::move(l.s))` leaves `l.s.ptr_` null (CudaUtils.cu, Stream::Stream(Stream&&)), and a
+	// `Limb` holds its stream as a `Stream&` (Limb.cuh:24) bound to the PARTITION's `s`
+	// (USE_PARTITION_STREAM, ~:188-224 below). A reference cannot be re-seated, so any limb that
+	// already existed in `l` would keep referring to the moved-from Stream and would from here on
+	// launch on the legacy default stream and free with `GPUfree(..., 0)` -- the unfenced pool
+	// hand-off described above `initStream`.
+	//
+	// Today that cannot happen, and this assert is what keeps it that way rather than a comment
+	// hoping so. The only element-wise move of a `LimbPartition` is `std::vector<LimbPartition>`
+	// reallocation inside `RNSPoly::RNSPoly` (RNSPoly.cpp:65-69), which emplaces one partition per
+	// GPU BEFORE `grow()` creates any limb; every other move of a polynomial moves the VECTOR
+	// (`GPU(std::move(src.GPU))`, RNSPoly.cpp:84), which steals the buffer and leaves each
+	// LimbPartition -- and therefore each `s` -- at the address its limbs already point at.
+	//
+	// Asserted on THIS, not on `l`: the limb vectors were transferred by the initializer list
+	// above, so a moved-from `l.limb` reads empty whatever it held, while a non-empty `limb` here
+	// is exactly "the source had limbs" -- the case that would leave a dangling `Stream&`.
+	// `DECOMPlimb` / `DIGITlimb` are sized to the digit count by the ordinary constructor and hold
+	// one EMPTY vector per digit until `generateDecompAndDigit` runs, so the outer vector being
+	// non-empty says nothing -- it is the inner ones that would carry limbs.
+	assert(limb.empty() && SPECIALlimb.empty() && GATHERlimb.empty());
+	assert(([&] {
+		for (const auto& d : DECOMPlimb)
+			if (!d.empty())
+				return false;
+		for (const auto& d : DIGITlimb)
+			if (!d.empty())
+				return false;
+		return true;
+	}()));
 	l.bufferSPECIAL				  = nullptr;
 	l.bufferLIMB				  = nullptr;
 	l.bufferDECOMPandDIGIT		  = nullptr;
@@ -46,6 +82,13 @@ LimbPartition::LimbPartition(LimbPartition&& l) noexcept
 	l.bufferGATHER				  = nullptr;
 	l.bufferDECOMPandDIGIT_handle = nullptr;
 	l.bufferGATHER_handle		  = nullptr;
+	// The size follows the pointer out of the source, so a moved-from partition cannot free a
+	// buffer it no longer owns with a size that says it does.
+	l.bufferDECOMPandDIGIT_bytes = 0;
+	l.bufferSPECIAL_bytes		 = 0;
+	l.bufferLIMB_bytes			 = 0;
+	l.bufferLIMB_pooled			 = false;
+	l.bufferGATHER_bytes		 = 0;
 }
 
 std::vector<VectorGPU<void*>> LimbPartition::generateDecompLimbptr(void** buffer, const std::vector<std::vector<LimbRecord>>& DECOMPmeta, const int device, int offset) {
@@ -67,9 +110,51 @@ void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
 	return malloc;
 }
 
+/// @brief The stream every Limb of this partition will launch on, fence with and free through.
+///
+/// `default_` is the `def_stream` flag of RNSPoly's constructor, and exactly two owners set it:
+/// `Plaintext` (Plaintext.cu:53, :59 -- `c0(this->cc, -1, false, true)`) and `KeySwitchingKey`
+/// (KeySwitchingKey.cu:60 -- `a(*cc, -1, false, true), b(*cc, -1, false, true)`). It used to mean
+/// `Stream::initDefault()` unconditionally, i.e. `ptr_ = 0` (CudaUtils.cu, Stream::initDefault).
+///
+/// THAT NULL IS NOT PRIVATE TO THE PARTITION. `LimbPartition::generate` binds EVERY limb it
+/// creates to the partition's stream (`USE_PARTITION_STREAM`, ~:188-224 below) and `Limb` holds it
+/// as a `Stream&` (Limb.cuh:24), so every limb of a plaintext or of a key-switching key:
+///   * LAUNCHES on `stream.ptr()`, which is 0 -- the legacy default stream;
+///   * ALLOCATES with `GPUmalloc(..., stream.ptr())` (VectorGPU.cu:84) and FREES with
+///     `GPUfree(..., stream.ptr())` (Limb.cu:20-22 -> VectorGPU.cu:54), both with 0.
+///
+/// DEFAULT MODE -- SOUND, AND UNCHANGED HERE. `initPool` creates every pooled stream with
+/// `cudaStreamCreateWithFlags(..., 0)`, i.e. BLOCKING, so the legacy default stream's implicit
+/// synchronization orders a null-stream launch after all work already issued on any of them and
+/// before all work issued on them afterwards. With one issuing thread host issue order IS the
+/// order, so the fences these limbs never ask for are supplied by the legacy stream, and that is
+/// why this has never shown serially. `ConcurrentOps()` is false there, the branch below is the
+/// branch it always took, and `initDefault()` is called with the same arguments as before: the
+/// default path is behaviourally identical, instruction for instruction.
+///
+/// CONCURRENT MODE -- THE ROOT OF THE RACE, WHICH IS WHY THE FLAG STOPS MEANING THE NULL STREAM.
+/// Two independent failures, both traced (FIDESLIB_POOL_TRACE):
+///   * THE POOL HAND-OFF IS NEVER FENCED. `GPUfree(ptr, ..., 0)` reaches the lane pool and
+///     `mine.wait(stream)` takes `Stream::wait(cudaStream_t)`'s `s == 0` early out, which issues
+///     nothing. The block goes back on the free list tagged with the freeing lane but owing no
+///     dependency; the next lane's `record_and_wait` then fences on a handshake stream that has
+///     never been recorded on, and writes the block while the previous owner's kernels are still
+///     reading it. Every one of the 96 traced pool FREE events carried stream = 0. The legacy
+///     stream does not cover this: the early out issues NOTHING on it, and the readers and the
+///     new writer are on two different blocking streams, which are not ordered against each other.
+///   * THE CROSS-LANE FENCES ARE HALF-MISSING AND HALF-GLOBAL. `x.wait(pt.s)` early-outs on
+///     `s.ptr_ == 0` and takes no dependency, while `pt.s.wait(x)` issues
+///     `cudaStreamWaitEvent(nullptr, e)` -- a barrier on the legacy stream, i.e. on every blocking
+///     stream on the device. That is the whole-lane serialization stage 8 measured when it tried
+///     to fence stream 0 from inside the pool instead of removing it here.
+/// So in the concurrent mode a `def_stream` partition takes an ordinary pooled stream, at the same
+/// priority as every other partition, and the fences the surrounding code already asks for become
+/// real ones. Nothing is locked, no atomic is added and nothing is synchronized to do it:
+/// `ConcurrentOps()` is one cached bool.
 Stream initStream(bool default_) {
 	Stream s;
-	if (default_) {
+	if (default_ && !ConcurrentOps()) {
 		s.initDefault();
 	} else {
 		s.init(50);
@@ -134,15 +219,34 @@ LimbPartition::~LimbPartition() {
 		assert(false);
 #endif
 	} else {
-		if (bufferDECOMPandDIGIT)
-			GPUfree(bufferDECOMPandDIGIT, id, 0, s.ptr());
+		if (bufferDECOMPandDIGIT) {
+			assert(bufferDECOMPandDIGIT_bytes > 0);
+			GPUfree(bufferDECOMPandDIGIT, id, (int)bufferDECOMPandDIGIT_bytes, s.ptr());
+			bufferDECOMPandDIGIT	   = nullptr;
+			bufferDECOMPandDIGIT_bytes = 0;
+		}
 		// cudaFreeAsync(bufferDECOMPandDIGIT, s.ptr());
 	}
-	if (bufferSPECIAL)
-		GPUfree(bufferSPECIAL, id, 0, s.ptr());
-	// cudaFreeAsync(bufferSPECIAL, s.ptr());
+	// bufferSPECIAL IS NOT A POOL BLOCK. Its one allocation is the raw `cudaMalloc` in
+	// generateSpecialLimb below, so it must not be handed to `GPUfree`: at its real size nothing
+	// pools it and `GPUfree` ends in `cudaFreeAsync`, which is defined only for memory that came
+	// from `cudaMallocAsync`. It goes back the way it came, after the stream its limbs were fenced
+	// into has drained -- `cudaMalloc` was synchronous, and so is this.
+	if (bufferSPECIAL) {
+		cudaStreamSynchronize(s.ptr());
+		cudaFree(bufferSPECIAL);
+		bufferSPECIAL		= nullptr;
+		bufferSPECIAL_bytes = 0;
+	}
 	if (bufferLIMB) {
-		GPUfree(bufferLIMB, id, 0, s.ptr());
+		assert(bufferLIMB_bytes > 0);
+		if (bufferLIMB_pooled)
+			GPUfreeExact(bufferLIMB, id, bufferLIMB_bytes, s.ptr());
+		else
+			GPUfree(bufferLIMB, id, (int)bufferLIMB_bytes, s.ptr());
+		bufferLIMB		 = nullptr;
+		bufferLIMB_bytes = 0;
+		bufferLIMB_pooled = false;
 		// cudaFreeAsync(bufferLIMB, s.ptr());
 	}
 	if (bufferAUXptrs)
@@ -159,8 +263,12 @@ LimbPartition::~LimbPartition() {
 		assert(false);
 #endif
 	} else {
-		if (bufferGATHER)
-			GPUfree(bufferGATHER, id, 0, s.ptr());
+		if (bufferGATHER) {
+			assert(bufferGATHER_bytes > 0);
+			GPUfree(bufferGATHER, id, (int)bufferGATHER_bytes, s.ptr());
+			bufferGATHER	   = nullptr;
+			bufferGATHER_bytes = 0;
+		}
 		// cudaFreeAsync(bufferGATHER, s.ptr());
 	}
 	limb.clear();
@@ -234,10 +342,10 @@ void LimbPartition::generate(std::vector<LimbRecord>& records,
 	}
 	if (size > 0) {
 		if (!noptr) {
-			cudaMemcpyAsync(ptrs.data + limbs_size, cpu_ptr.data(), size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+			UploadH2D(ptrs.data + limbs_size, cpu_ptr.data(), size * sizeof(void*), device, s.ptr());
 			CudaCheckErrorModNoSync;
 			if (auxptrs) {
-				cudaMemcpyAsync((*auxptrs).data + limbs_size, cpu_auxptr.data(), size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+				UploadH2D((*auxptrs).data + limbs_size, cpu_auxptr.data(), size * sizeof(void*), device, s.ptr());
 			}
 			CudaCheckErrorModNoSync;
 		}
@@ -289,7 +397,10 @@ void LimbPartition::generateSpecialLimb(const bool zero_out, const bool for_comm
 
 		if ((for_communication && cc.GPUid.size() > 0)) {
 			assert(SPECIALlimb.size() == 0);
-			cudaMalloc(&bufferSPECIAL, std::max(1ul, cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t)));
+			// RAW cudaMalloc, not the pool: the size is recorded so the free side can tell the two
+			// apart and call cudaFree rather than pushing a non-pool pointer into the pool.
+			bufferSPECIAL_bytes = std::max(1ul, cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t));
+			cudaMalloc(&bufferSPECIAL, bufferSPECIAL_bytes);
 			generate(SPECIALmeta, SPECIALlimb, SPECIALlimbptr, (int)SPECIALmeta.size() - 1, &SPECIALauxptr, bufferSPECIAL, 0, bufferSPECIAL, cc.N * SPECIALmeta.size());
 		} else {
 			assert(bufferSPECIAL == nullptr);
@@ -361,7 +472,24 @@ void LimbPartition::ApplyNTT(int batch,
 	}
 }
 
+// ApplyNTT / ApplyINTT are called from other translation units (the single-limb coefficient-domain
+// rebase helpers in Bootstrap.cu), so their instantiations have to actually land in the library
+// archive. The NTT<algo, mode> / INTT<algo, mode> instantiations below are NOT enough: they only
+// *implicitly* instantiate ApplyNTT/ApplyINTT, whose definitions live in this .cu (not in
+// LimbPartition.cuh). An implicit instantiation has vague (COMDAT) linkage, so once it is inlined
+// into its single in-file caller the out-of-line copy is dropped and no ApplyNTT/ApplyINTT symbol
+// survives in libfideslib.a -- an external caller then fails to link. Explicit instantiation over
+// the same (ALGO, MODE) grid as NTT/INTT forces the out-of-line copies to be emitted. Same reason
+// Rescale.cu explicitly instantiates SwitchModulus<uint32_t/uint64_t> for its outside launchers.
+#define YYY(algo, mode)                                                                                                                            \
+	template void LimbPartition::ApplyNTT<algo, mode>(int batch, NTT_fusion_fields fields, std::vector<LimbImpl>& limb, VectorGPU<void*>& limbptr, \
+	  VectorGPU<void*>& auxptr, ContextData& cc, const int primeid_init, const int limbsize);
+
+#include "ntt_types.inc"
+#undef YYY
+
 template <ALGO algo, NTT_MODE mode> void LimbPartition::NTT(int batch, bool sync, NTT_fusion_fields fields) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kNtt);
 	cudaSetDevice(device);
 	int limbsize = getLimbSize(*level);
 
@@ -377,6 +505,11 @@ template <ALGO algo, NTT_MODE mode> void LimbPartition::NTT(int batch, bool sync
 				for (int i = 0; i < limbsize; i += batch) {
 					s.wait(STREAM(limb[i]));
 				}
+			}
+		}
+		if (*level == cc.L + 1) {
+			if (SPECIALmeta.size() > 0 && SPECIALmeta.at(0).id == cc.L + 1) {
+				ApplyNTT<algo, mode>(batch, fields, SPECIALlimb, SPECIALlimbptr, SPECIALauxptr, cc, SPECIAL(id, 0), 1);
 			}
 		}
 	} else {
@@ -416,7 +549,15 @@ void LimbPartition::ApplyINTT(int batch,
 	}
 }
 
+#define WWW(algo, mode)                                                                                                                              \
+	template void LimbPartition::ApplyINTT<algo, mode>(int batch, INTT_fusion_fields fields, std::vector<LimbImpl>& limb, VectorGPU<void*>& limbptr, \
+	  VectorGPU<void*>& auxptr, ContextData& cc, const int primeid_init, const int limbsize);
+
+#include "ntt_types.inc"
+#undef WWW
+
 template <ALGO algo, INTT_MODE mode> void LimbPartition::INTT(int batch, bool sync, INTT_fusion_fields fields) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kNtt);
 	cudaSetDevice(device);
 	// TODO check level
 	const int limbsize = getLimbSize(*level);
@@ -590,17 +731,26 @@ void LimbPartition::rescale() {
 			int bytesSecond		= 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
 			int start = 0;
+			// Per-ISSUING-THREAD scratch (slot 0 is the context's own top_limb_*, i.e. exactly what
+			// this read before): the top-limb INTT stages through ONE device buffer on ONE stream,
+			// so two threads rescaling at once used to trample each other's coefficients.
+			Stream& top_s			 = cc.getTopLimbStream(id);
+			VectorGPU<void*>& top_p	 = cc.getTopLimbPtr(id);
 			for (int i = limbsize - 1; i < limbsize; i += cc.batch) {
-				cc.top_limb_stream.at(id).wait(s);
+				top_s.wait(s);
 				uint32_t num_limbs = 1;
 
-				INTT_<false, algo, INTT_NONE><<<dim3{ cc.N / (blockDimFirst.x * M * 2), num_limbs }, blockDimFirst, bytesFirst, cc.top_limb_stream.at(id).ptr()>>>(
-				  getGlobals(), limbptr.data + start + i, PARTITION(id, start + i), cc.top_limbptr.at(id).data);
+				INTT_<false, algo, INTT_NONE><<<dim3{ cc.N / (blockDimFirst.x * M * 2), num_limbs }, blockDimFirst, bytesFirst, top_s.ptr()>>>(
+				  getGlobals(), limbptr.data + start + i, PARTITION(id, start + i), top_p.data);
 
+				// Stage 2 reads the scratch that stage 1 writes, and they sit on different streams:
+				// the limb's stream must wait for the scratch stream HERE, before the launch. The
+				// s.wait(top_s) after the loop orders only what FOLLOWS the loop.
+				STREAM(limb.at(start + i)).wait(top_s);
 				INTT_<true, algo, INTT_NONE><<<dim3{ cc.N / (blockDimSecond.x * M * 2), num_limbs }, blockDimSecond, bytesSecond, STREAM(limb.at(start + i)).ptr()>>>(
-				  getGlobals(), cc.top_limbptr.at(id).data, PARTITION(id, start + i), limbptr.data + start + i);
+				  getGlobals(), top_p.data, PARTITION(id, start + i), limbptr.data + start + i);
 			}
-			s.wait(cc.top_limb_stream.at(id));
+			s.wait(top_s);
 		}
 	} else {
 		STREAM(top).wait(s);
@@ -654,16 +804,23 @@ void LimbPartition::multPt(const LimbPartition& p) {
 	cudaSetDevice(device);
 
 	constexpr bool capture = false;
-	static std::map<int, cudaGraphExec_t> exec_map;
+	// thread_local, not a bare function-local static: this is on the ct x pt path -- the hottest
+	// call in the library for a matmul-shaped circuit -- and `exec_map[limbsize]` is a
+	// std::map::operator[], i.e. a red-black tree INSERTION the first time a limb count is seen.
+	// Two host threads issuing ops on one context (FIDESLIB_CONCURRENT_OPS) reach it at once and
+	// corrupt the tree; a lookup concurrent with a rebalance is equally undefined. The map holds
+	// one graph per limb count, so a copy per issuing thread costs a handful of entries and the
+	// default mode is unaffected (one thread, one map).
+	static thread_local std::map<int, cudaGraphExec_t> exec_map;
 
 	{
-		LimbImpl& top = limb.back();
+		LimbImpl& top = limb.at(limbsize - 1);
 
 		cudaGraphExec_t& exec = exec_map[limbsize];
 
 		run_in_graph<capture>(exec, s, [&]() {
 			STREAM(top).wait(s);
-			SWITCH(top, mult(p.limb.back()));
+			SWITCH(top, mult(p.limb.at(limbsize - 1)));
 			SWITCH(top, INTT<ALGO_SHOUP>());
 
 			for (int32_t i = 0; i < limbsize - 1; i += cc.batch) {
@@ -723,7 +880,9 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
 			}
 		}
 		*/
-		Stream& s_d = cc.digitStream.at(d).at(id);
+		// Per-issuing-thread as well: this stream SCHEDULES the digit's mod-up, and two threads
+		// sharing it would fence each other's decomposition kernels into one serial chain.
+		Stream& s_d = cc.getDigitStream(d, id);
 		s_d.wait(s);
 
 		{
@@ -796,7 +955,7 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
 		}
 	}
 	for (size_t d = 0; d < DECOMPlimb.size(); ++d) {
-		s.wait(cc.digitStream[d][id]);
+		s.wait(cc.getDigitStream(d, id));
 	}
 
 	aux_partition.getS().wait(s);
@@ -809,9 +968,14 @@ void LimbPartition::freeSpecialLimbs() {
 	}
 	SPECIALlimb.clear();
 	if (bufferSPECIAL != nullptr) {
-		GPUfree(bufferSPECIAL, id, 0, s.ptr());
+		// Matching release for the raw `cudaMalloc` in generateSpecialLimb -- see the destructor.
+		// The loop above has already fenced `s` behind every limb that viewed this buffer.
+		assert(bufferSPECIAL_bytes > 0);
+		cudaStreamSynchronize(s.ptr());
+		cudaFree(bufferSPECIAL);
 		// cudaFreeAsync(bufferSPECIAL, s.ptr());
-		bufferSPECIAL = nullptr;
+		bufferSPECIAL		= nullptr;
+		bufferSPECIAL_bytes = 0;
 	}
 }
 
@@ -906,7 +1070,7 @@ void LimbPartition::generateAllDecompAndDigit(bool iskey) {
 			}
 
 			if (DECOMPmeta.at(i).size() * sizeof(void*) > 0)
-				cudaMemcpyAsync(DECOMPlimbptr[i].data, cpu_ptr.data(), DECOMPmeta.at(i).size() * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+				UploadH2D(DECOMPlimbptr[i].data, cpu_ptr.data(), DECOMPmeta.at(i).size() * sizeof(void*), device, s.ptr());
 		}
 		generateGatherLimb(iskey);
 		generateAllDigitLimb(bufferDECOMPandDIGIT, 0 /*cc.N * decomp_limbs*/);
@@ -1009,7 +1173,8 @@ void LimbPartition::generateLimbSingleMalloc() {
 	if (bufferLIMB == nullptr) {
 		assert(limb.size() == 0);
 
-		bufferLIMB = (uint64_t*)GPUmalloc(device, cc.N * limbsize * 2 * sizeof(uint64_t), s.ptr());
+		bufferLIMB_bytes = cc.N * limbsize * 2 * sizeof(uint64_t);
+		bufferLIMB		 = (uint64_t*)GPUmalloc(device, (int)bufferLIMB_bytes, s.ptr());
 		// cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * 2 * sizeof(uint64_t)), s.ptr());
 	}
 
@@ -1017,6 +1182,22 @@ void LimbPartition::generateLimbSingleMalloc() {
 
 	// generate(meta, limb, limbptr, (int)limbsize - 1, &auxptr, bufferLIMB, 0, bufferLIMB, cc.N * (limbsize));
 	generate(meta, limb, limbptr, (int)limbsize - 1, &auxptr, nullptr, 0, nullptr, cc.N * (limbsize));
+}
+
+void LimbPartition::generateLimbArena(const int limbsize) {
+	cudaSetDevice(device);
+	if (!limb.empty() || bufferLIMB != nullptr)
+		throw std::logic_error("FIDESlib: generateLimbArena needs a freshly constructed partition (no limbs, no buffer)");
+	if (limbsize <= 0 || (size_t)limbsize > meta.size())
+		throw std::logic_error("FIDESlib: generateLimbArena: limb count out of range");
+	// The exact-size pool class (GPUmallocExact): the arena costs its payload, N * limbsize * 8 bytes,
+	// not the next power of two (the pow2 class costs 8 MB per 5.5 MB arena, GBs of peak memory with
+	// many resident plaintexts). Every limb record here is 64-bit (meta is the Q chain).
+	bufferLIMB_bytes  = (size_t)cc.N * (size_t)limbsize * sizeof(uint64_t);
+	bufferLIMB_pooled = true; // the destructor frees it through GPUfreeExact
+	bufferLIMB		  = (uint64_t*)GPUmallocExact(id, bufferLIMB_bytes, s.ptr());
+	CudaCheckErrorModNoSync;
+	generate(meta, limb, limbptr, limbsize - 1, nullptr /*no aux*/, bufferLIMB, 0, nullptr, 0);
 }
 
 void LimbPartition::generateLimbConstant() {
@@ -1030,8 +1211,17 @@ void LimbPartition::generateLimbConstant() {
 		// bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
 		// cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
 	} else {
-		GPUfree(bufferLIMB, id, 0, s.ptr());
-		bufferLIMB = nullptr;
+		// NOT `cc.N * limbsize * 2 * sizeof(uint64_t)`: `limbsize` here is getLimbSize(*level),
+		// while generateLimbSingleMalloc sized this buffer from meta.size(). Only the recorded
+		// size is the one GPUmalloc was given.
+		assert(bufferLIMB_bytes > 0);
+		if (bufferLIMB_pooled)
+			GPUfreeExact(bufferLIMB, id, bufferLIMB_bytes, s.ptr());
+		else
+			GPUfree(bufferLIMB, id, (int)bufferLIMB_bytes, s.ptr());
+		bufferLIMB		 = nullptr;
+		bufferLIMB_bytes = 0;
+		bufferLIMB_pooled = false;
 		// cudaFreeAsync(&bufferLIMB, s.ptr());
 		// bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
 		// cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
@@ -1040,6 +1230,47 @@ void LimbPartition::generateLimbConstant() {
 	// limb.clear();
 	// generate(meta, limb, limbptr, (int)limbsize - 1, &auxptr, bufferLIMB, 0, nullptr, 0);
 	generate(meta, limb, limbptr, (int)limbsize - 1, nullptr /*&auxptr*/, nullptr, 0, nullptr, 0);
+}
+
+void LimbPartition::aliasLimbsOf(const LimbPartition& src) {
+	cudaSetDevice(device);
+	if (src.device != device || src.id != id)
+		throw std::logic_error("FIDESlib: a limb view must sit on the partition it aliases");
+	if (!limb.empty() || !SPECIALlimb.empty() || bufferLIMB != nullptr || bufferSPECIAL != nullptr)
+		throw std::logic_error("FIDESlib: a limb view must be built on a freshly constructed partition");
+	const size_t qlimbs = getLimbSize(*level);
+	if (qlimbs > src.limb.size())
+		throw std::logic_error("FIDESlib: a limb view cannot hold more limbs than its source");
+
+	// The source's limbs were written on its stream; the pointer table below is uploaded on ours.
+	s.wait(src.getS());
+
+	auto alias = [&](const LimbImpl& from, std::vector<LimbImpl>& into, std::vector<void*>& ptrs) {
+		if (from.index() == U32) {
+			const Limb<uint32_t>& l = std::get<U32>(from);
+			into.emplace_back(Limb<uint32_t>(cc, l.v.data, 0, id, s, l.primeid, nullptr, 0));
+			ptrs.push_back(std::get<U32>(into.back()).v.data);
+		} else {
+			const Limb<uint64_t>& l = std::get<U64>(from);
+			into.emplace_back(Limb<uint64_t>(cc, l.v.data, 0, id, s, l.primeid, nullptr, 0));
+			ptrs.push_back(std::get<U64>(into.back()).v.data);
+		}
+	};
+
+	std::vector<void*> cpu_ptr;
+	cpu_ptr.reserve(qlimbs);
+	for (size_t i = 0; i < qlimbs; ++i)
+		alias(src.limb[i], limb, cpu_ptr);
+	if (!cpu_ptr.empty())
+		UploadH2D(limbptr.data, cpu_ptr.data(), cpu_ptr.size() * sizeof(void*), device, s.ptr());
+
+	std::vector<void*> cpu_special;
+	cpu_special.reserve(src.SPECIALlimb.size());
+	for (const auto& l : src.SPECIALlimb)
+		alias(l, SPECIALlimb, cpu_special);
+	if (!cpu_special.empty())
+		UploadH2D(SPECIALlimbptr.data, cpu_special.data(), cpu_special.size() * sizeof(void*), device, s.ptr());
+	CudaCheckErrorModNoSync;
 }
 
 void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data, const std::vector<std::vector<uint64_t>>& moduli) {
@@ -1073,7 +1304,7 @@ void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<ui
 				}
 			}
 		}
-		cudaMemcpyAsync(limbptr.data, cpu_ptr.data(), cpu_ptr.size() * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+		UploadH2D(limbptr.data, cpu_ptr.data(), cpu_ptr.size() * sizeof(void*), device, s.ptr());
 	} else {
 		for (size_t i = 0; i < DECOMPmeta.size(); ++i) {
 			for (int32_t j = 0; j < limb_size; ++j) {
@@ -1515,6 +1746,9 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
 
 size_t LimbPartition::getLimbSize(int level) {
 	size_t size = 0;
+	if (level == cc.L + 1) {
+		level = level - 1 - (cc.rescaleTechnique == FIDESlib::CKKS::FLEXIBLEAUTOEXT);
+	}
 	while (size < meta.size() && meta[size].id <= level) {
 		// assert(limb.size() > size);
 		++size;
@@ -2143,29 +2377,31 @@ void LimbPartition::multScalar(std::vector<uint64_t>& vector) {
 	 */
 	const int limbsize = getLimbSize(*level);
 
-	uint64_t* elems;
-	cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
+	uint64_t* elems = static_cast<uint64_t*>(FIDESlib::OpMallocAsync(vector.size() * sizeof(uint64_t), s.ptr()));
 	// cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
-	cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
+	UploadH2D(elems, vector.data(), vector.size() * sizeof(uint64_t), device, s.ptr());
 
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		STREAM(limb[i]).wait(s);
 		uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
 		Scalar_mult_<ALGO_BARRETT><<<dim3{ (uint32_t)cc.N / 128, num_limbs }, 128, 0, STREAM(limb[i]).ptr()>>>(limbptr.data + i, elems, PARTITION(id, i), nullptr);
 	}
+	if (*level == cc.L + 1 && SPECIALmeta.size() > 0 && SPECIALmeta.at(0).id == cc.L + 1) {
+		Scalar_mult_<ALGO_BARRETT><<<dim3{ (uint32_t)cc.N / 128, 1 }, 128, 0, STREAM(SPECIALlimb[0]).ptr()>>>(SPECIALlimbptr.data, elems, SPECIAL(id, 0), nullptr);
+		s.wait(STREAM(SPECIALlimb[0]));
+	}
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		s.wait(STREAM(limb[i]));
 	}
-	cudaFreeAsync(elems, s.ptr());
+	FIDESlib::OpFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::addScalar(std::vector<uint64_t>& vector) {
 	const int limbsize = getLimbSize(*level);
 	cudaSetDevice(device);
-	uint64_t* elems;
-	cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
+	uint64_t* elems = static_cast<uint64_t*>(FIDESlib::OpMallocAsync(vector.size() * sizeof(uint64_t), s.ptr()));
 	// cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
-	cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
+	UploadH2D(elems, vector.data(), vector.size() * sizeof(uint64_t), device, s.ptr());
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		STREAM(limb[i]).wait(s);
 		uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
@@ -2175,16 +2411,15 @@ void LimbPartition::addScalar(std::vector<uint64_t>& vector) {
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		s.wait(STREAM(limb[i]));
 	}
-	cudaFreeAsync(elems, s.ptr());
+	FIDESlib::OpFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::subScalar(std::vector<uint64_t>& vector) {
 	const int limbsize = getLimbSize(*level);
 	cudaSetDevice(device);
-	uint64_t* elems;
-	cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
+	uint64_t* elems = static_cast<uint64_t*>(FIDESlib::OpMallocAsync(vector.size() * sizeof(uint64_t), s.ptr()));
 	// cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
-	cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
+	UploadH2D(elems, vector.data(), vector.size() * sizeof(uint64_t), device, s.ptr());
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		STREAM(limb[i]).wait(s);
 		uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
@@ -2193,7 +2428,7 @@ void LimbPartition::subScalar(std::vector<uint64_t>& vector) {
 	for (int i = 0; i < limbsize; i += cc.batch) {
 		s.wait(STREAM(limb[i]));
 	}
-	cudaFreeAsync(elems, s.ptr());
+	FIDESlib::OpFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::add(const LimbPartition& a, const LimbPartition& b, const bool ext_a, const bool ext_b) {
@@ -2294,6 +2529,45 @@ void LimbPartition::dropLimb() {
 	limb.pop_back();
 }
 
+void LimbPartition::freeNTTScratch() {
+	cudaSetDevice(device);
+	if (limb.empty())
+		return;
+
+	// Each limb reports what its scratch slot should now hold: nullptr if it was released, the
+	// unchanged address if its aux is a view onto a shared buffer (which freeAux leaves alone).
+	std::vector<void*> cpu_auxptr(limb.size(), nullptr);
+	bool all_released = true;
+	for (size_t i = 0; i < limb.size(); ++i) {
+		SWITCH_RET(limb[i], freeAux(s), cpu_auxptr[i]);
+		if (cpu_auxptr[i] != nullptr)
+			all_released = false;
+	}
+
+	// Write the table the transform reads its scratch addresses from, so a later transform of this
+	// polynomial faults on a null pointer instead of writing into freed memory.
+	//
+	// "Never transformed again" is not an assumption this path introduces — it is a load-bearing
+	// invariant the library already runs on, and more strictly than here. A constant-grown limb has
+	// no scratch at all (aux size 0), and generateLimbConstant passes generate() a null auxptrs, so
+	// for a host-encoded plaintext this table is never written AT ALL: it holds whatever the
+	// partition's pointer arena was allocated with. Transforming such a plaintext would already
+	// scribble through an uninitialised address. Nulling the slots here is therefore strictly safer
+	// than the state a loadConstant plaintext has always been in, not a new hazard.
+	if (all_released) {
+		// The common case, and the only one today's caller produces. A memset needs no host buffer,
+		// so nothing here outlives the async copy.
+		cudaMemsetAsync(auxptr.data, 0, limb.size() * sizeof(void*), s.ptr());
+	} else {
+		UploadH2D(auxptr.data, cpu_auxptr.data(), limb.size() * sizeof(void*), device, s.ptr());
+		// cpu_auxptr is about to go out of scope and the copy is from pageable host memory, so the
+		// upload has to have consumed it before we return. Only the mixed case pays this, and no
+		// caller reaches it today.
+		cudaStreamSynchronize(s.ptr());
+	}
+	CudaCheckErrorModNoSync;
+}
+
 void LimbPartition::addMult(const LimbPartition& a, const LimbPartition& b) {
 	const int limbsize = getLimbSize(*level);
 	assert(a.limb.size() >= limbsize);
@@ -2318,6 +2592,11 @@ void LimbPartition::broadcastLimb0() {
 	cudaSetDevice(device);
 	assert(limbsize - 1 > 0);
 	broadcastLimb0_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)limbsize - 1 }, 128, 0, s.ptr()>>>(limbptr.data);
+
+	if (MODRAISE_WITH_P0) {
+		// if (I HAVE P0)
+		broadcastLimb0_mgpu_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)1 }, 128, 0, s.ptr()>>>(SPECIALlimbptr.data, SPECIAL(id, 0), limbptr.data);
+	}
 }
 
 void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*> ps, std::vector<uint64_t>& weights) {
@@ -2327,24 +2606,54 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 		s.wait(ps[i]->getS());
 	}
 
+	// DIAG (FIDESLIB_PERSIST_TABLES): these two per-call tables are the
+	// reason this op is in the suspect class -- see CudaUtils.cuh PersistOpTables().
+	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
+	if (FIDESlib::WsumSrcSync())
+		for (uint32_t i = 0; i < n; ++i)
+			cudaStreamSynchronize(ps[i]->getS().ptr());   // DIAG: full source drain
 	uint64_t* elems;
-	cudaMallocAsync(&elems, weights.size() * sizeof(uint64_t), s.ptr());
-	// cudaMalloc(&elems, weights.size() * sizeof(uint64_t));
-	cudaMemcpyAsync(elems, weights.data(), weights.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
+	if (persist_tables) {
+		elems = static_cast<uint64_t*>(FIDESlib::OpTableBuffer(device, weights.size() * sizeof(uint64_t), 0));
+		if (FIDESlib::PersistChurn()) {   // DIAG: keep the allocator traffic, not the block
+			void* dummy = FIDESlib::OpMallocAsync(weights.size() * sizeof(uint64_t), s.ptr());
+			FIDESlib::OpFreeAsync(dummy, s.ptr());
+		}
+	} else {
+		elems = static_cast<uint64_t*>(FIDESlib::OpMallocAsync(weights.size() * sizeof(uint64_t), s.ptr()));
+		if (FIDESlib::TableTrace())
+			FIDESlib::TableTraceAlloc(elems, "evalLinearWSum.weights");
+	}
+	UploadH2D(elems, weights.data(), weights.size() * sizeof(uint64_t), device, s.ptr());
 	std::vector<void**> psptr(n, nullptr);
 	for (uint32_t i = 0; i < n; ++i) {
 		psptr[i] = ps[i]->limbptr.data;
 		assert(ps[i]->limb.size() >= limbsize);
 	}
 	void*** d_psptr;
-	cudaMallocAsync(&d_psptr, psptr.size() * sizeof(void**), s.ptr());
-	// cudaMalloc(&d_psptr, psptr.size() * sizeof(void**));
-	cudaMemcpyAsync(d_psptr, psptr.data(), psptr.size() * sizeof(void**), cudaMemcpyDefault, s.ptr());
+	if (persist_tables) {
+		d_psptr = static_cast<void***>(FIDESlib::OpTableBuffer(device, psptr.size() * sizeof(void**), 1));
+		if (FIDESlib::PersistChurn()) {
+			void* dummy = FIDESlib::OpMallocAsync(psptr.size() * sizeof(void**), s.ptr());
+			FIDESlib::OpFreeAsync(dummy, s.ptr());
+		}
+	} else {
+		d_psptr = static_cast<void***>(FIDESlib::OpMallocAsync(psptr.size() * sizeof(void**), s.ptr()));
+		if (FIDESlib::TableTrace())
+			FIDESlib::TableTraceAlloc(d_psptr, "evalLinearWSum.psptr");
+	}
+	UploadH2D(d_psptr, psptr.data(), psptr.size() * sizeof(void**), device, s.ptr());
 
 	if (!limb.empty() && limbsize > 0)
 		eval_linear_w_sum_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)limbsize }, 128, 0, s.ptr()>>>(n, limbptr.data, d_psptr, elems, PARTITION(id, 0));
-	cudaFreeAsync(elems, s.ptr());
-	cudaFreeAsync(d_psptr, s.ptr());
+	if (!persist_tables) {
+		FIDESlib::OpFreeAsync(elems, s.ptr());
+		FIDESlib::OpFreeAsync(d_psptr, s.ptr());
+		if (FIDESlib::TableTrace()) {
+			FIDESlib::TableTraceFree(elems, s.ptr());
+			FIDESlib::TableTraceFree(d_psptr, s.ptr());
+		}
+	}
 	for (uint32_t i = 0; i < n; ++i) {
 		ps[i]->getS().wait(s);
 	}
@@ -2634,7 +2943,7 @@ void LimbPartition::generateGatherLimb(bool iskey) {
 				}
 
 				if (GATHERptr.size * sizeof(void*) > 0) {
-					cudaMemcpyAsync(GATHERptr.data, h_gatherptr.data(), GATHERptr.size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+					UploadH2D(GATHERptr.data, h_gatherptr.data(), GATHERptr.size * sizeof(void*), device, s.ptr());
 				}
 			}
 		} else {
@@ -2654,7 +2963,7 @@ void LimbPartition::generateGatherLimb(bool iskey) {
 				h_gatherptr[i] = (void*)(bufferGATHER + cc.N * i);
 
 			if (GATHERptr.size * sizeof(void*) > 0) {
-				cudaMemcpyAsync(GATHERptr.data, h_gatherptr.data(), GATHERptr.size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+				UploadH2D(GATHERptr.data, h_gatherptr.data(), GATHERptr.size * sizeof(void*), device, s.ptr());
 			}
 		}
 	}
