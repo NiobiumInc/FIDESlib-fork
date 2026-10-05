@@ -32,7 +32,7 @@ bool IsBackendAvailable(Backend backend) {
 	return false;
 }
 
-std::unique_ptr<Engine> MakeEngine(Backend backend) {
+std::unique_ptr<Engine> MakeEngine(Backend backend, bool reducedNoise, bool montgomery) {
 	switch (backend) {
 	case Backend::CPU: return std::make_unique<OpenFheEngine>();
 	case Backend::CUDA:
@@ -43,8 +43,10 @@ std::unique_ptr<Engine> MakeEngine(Backend backend) {
 #endif
 	case Backend::HAZE:
 #ifdef FIDESLIB_ENABLE_HAZE
-		return std::make_unique<HazeEngine>();
+		return std::make_unique<HazeEngine>(reducedNoise, montgomery);
 #else
+		(void)reducedNoise;
+		(void)montgomery;
 		throw std::runtime_error("haze (FHETCH) backend not compiled in; rebuild with FIDESLIB_ENABLE_HAZE=ON.");
 #endif
 	}

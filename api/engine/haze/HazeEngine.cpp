@@ -208,6 +208,24 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	try {
 		hazeCheck(hazeSetProgramInfo("fideslib", "1.0", "FIDESlib HazeEngine"), "hazeSetProgramInfo");
 
+		// FBC mode (constructor-selected), latched at bring-up before the first compute:
+		// reduced-noise selects the centered FBC matching a WITH_REDUCED_NOISE OpenFHE reference
+		// (bit-exact parity); Montgomery selects the 4-op SwitchModulus center shape. Montgomery
+		// is rejected by the local simulator at first compute, so it is only valid against a
+		// hardware/transport target.
+		hazeCheck(hazeSetReducedNoise(reducedNoise_ ? 1 : 0), "hazeSetReducedNoise");
+		hazeCheck(hazeSetMontgomery(montgomery_ ? 1 : 0), "hazeSetMontgomery");
+		// The full hardware data format pairs Montgomery with bit-reversal (the
+		// compiler's --niobium_hw), so couple them: a Montgomery run targets the
+		// hardware datapath, an ordinary run leaves both off.
+		hazeCheck(hazeSetBitReversal(montgomery_ ? 1 : 0), "hazeSetBitReversal");
+		// Replay target (default: in-process local simulator). Montgomery is only
+		// valid against a transport target such as FUNC_SIM / FUNC_SIM_HW (the
+		// Niobium hardware simulator); set it before the bridge brings up the
+		// compiler so replay dispatch routes there.
+		if (const char* tgt = std::getenv("FIDESLIB_HAZE_TARGET"); tgt != nullptr && tgt[0] != '\0')
+			hazeCheck(hazeSetTarget(tgt), "hazeSetTarget");
+
 		// Program directory: <FIDESLIB_HAZE_RUNS_DIR | /tmp/fideslib-haze-runs>/<pid>/ctx<N>.
 		// Each flush writes a multi-hundred-MB project dir, so (a) keep it off slow shared
 		// filesystems and (b) clean it up at teardown unless FIDESLIB_HAZE_KEEP_RUNS is set.

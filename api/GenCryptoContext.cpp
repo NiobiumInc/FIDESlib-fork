@@ -26,7 +26,7 @@ CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params)
 
 	CryptoContextImpl<DCRTPoly> context;
 	context.host				  = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
-	context.engine_				  = MakeEngine(params.backend);
+	context.engine_				  = MakeEngine(params.backend, params.reducedNoise, params.montgomery);
 	context.auto_load_plaintexts  = params.plaintextAutoload;
 	context.auto_load_ciphertexts = params.ciphertextAutoload;
 	context.multiplicative_depth  = impl_params.GetMultiplicativeDepth();

@@ -128,4 +128,12 @@ void CCParams<CryptoContextCKKSRNS>::SetCiphertextAutoload(bool autoload) {
 	this->ciphertextAutoload = autoload;
 }
 
+void CCParams<CryptoContextCKKSRNS>::SetReducedNoise(bool enable) {
+	this->reducedNoise = enable;
+}
+
+void CCParams<CryptoContextCKKSRNS>::SetMontgomery(bool enable) {
+	this->montgomery = enable;
+}
+
 } // namespace fideslib
