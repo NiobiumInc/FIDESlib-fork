@@ -14,9 +14,15 @@
 
 namespace fideslib {
 
+// Construction never checks reducedNoise against LinkedOpenFheReducedNoise(): the linked OpenFHE's
+// FBC variant only matters to operations that key-switch (ModUp/ModDown via ApproxSwitchCRTBasis),
+// so a mismatched engine must still support keygen, encode, encrypt, decrypt and decode.
 OpenFheEngine::OpenFheEngine(bool reducedNoise) : Engine(reducedNoise) {
-	if (reducedNoise != LinkedOpenFheReducedNoise()) {
-		throw std::runtime_error("cpu backend cannot honour reducedNoise=" + std::string(reducedNoise ? "true" : "false") +
+}
+
+void OpenFheEngine::requireLinkedVariant(std::string_view op) const {
+	if (reducedNoise() != LinkedOpenFheReducedNoise()) {
+		throw std::runtime_error("cpu " + std::string(op) + " cannot honour reducedNoise=" + (reducedNoise() ? "true" : "false") +
 		  ": the linked openfhe was built with WITH_REDUCED_NOISE=" + (LinkedOpenFheReducedNoise() ? "ON" : "OFF"));
 	}
 }
@@ -220,6 +226,7 @@ void OpenFheEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scal
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) {
+	requireLinkedVariant("evalMult");
 	auto& context = hostContext(ctx);
 	auto& ct1Impl = hostCt(ct1);
 	auto& ct2Impl = hostCt(ct2);
@@ -257,6 +264,7 @@ void OpenFheEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext
 }
 
 void OpenFheEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Ciphertext<DCRTPoly>& ct2) {
+	requireLinkedVariant("evalMultInPlace");
 	auto& context = hostContext(ctx);
 	ct1->EnsureLazyHostCopy();
 	ct2->EnsureLazyHostCopy();
@@ -274,12 +282,14 @@ Ciphertext<DCRTPoly> OpenFheEngine::evalMultNoRelin(CryptoContextImpl<DCRTPoly>&
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::relinearize(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	requireLinkedVariant("relinearize");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->Relinearize(ctImpl));
 }
 
 void OpenFheEngine::relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	requireLinkedVariant("relinearizeInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -288,12 +298,14 @@ void OpenFheEngine::relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphert
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	requireLinkedVariant("evalSquare");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->EvalSquare(ctImpl));
 }
 
 void OpenFheEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	requireLinkedVariant("evalSquareInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -302,12 +314,14 @@ void OpenFheEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	requireLinkedVariant("evalRotate");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	return wrapHostCt(ctx, context->EvalRotate(ctImpl, index));
 }
 
 void OpenFheEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	requireLinkedVariant("evalRotateInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	setHostCt(ciphertext, context->EvalRotate(ctImpl, index));
@@ -316,6 +330,7 @@ void OpenFheEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t m, const std::shared_ptr<void>& precomp) {
+	requireLinkedVariant("evalFastRotation");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(precomp);
@@ -324,6 +339,7 @@ OpenFheEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Cipherte
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) {
+	requireLinkedVariant("evalFastRotationExt");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(digits);
@@ -335,6 +351,7 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotation(CryptoContextI
   const std::vector<int32_t>& indices,
   const uint32_t m,
   const std::shared_ptr<void>& precomp) {
+	requireLinkedVariant("evalFastRotation");
 	std::vector<Ciphertext<DCRTPoly>> results;
 
 	auto& context = hostContext(ctx);
@@ -352,6 +369,7 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotationExt(CryptoConte
   const std::vector<int32_t>& indices,
   const std::shared_ptr<void>& digits,
   bool addFirst) {
+	requireLinkedVariant("evalFastRotationExt");
 	std::vector<Ciphertext<DCRTPoly>> results;
 
 	auto& context = hostContext(ctx);
@@ -365,12 +383,14 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotationExt(CryptoConte
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) {
+	requireLinkedVariant("evalChebyshevSeries");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->EvalChebyshevSeries(ctImpl, coeffs, a, b));
 }
 
 void OpenFheEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) {
+	requireLinkedVariant("evalChebyshevSeriesInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -426,6 +446,7 @@ void OpenFheEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	requireLinkedVariant("accumulateSum");
 	auto& ctImpl = hostCt(ct);
 
 	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> result_ct = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(ctImpl);
@@ -436,6 +457,7 @@ Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& c
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	requireLinkedVariant("accumulateSumInPlace");
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
 
@@ -443,6 +465,7 @@ void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphe
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
+	requireLinkedVariant("accumulateSumInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -492,12 +515,14 @@ void OpenFheEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const 
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
+	requireLinkedVariant("evalBootstrap");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	return wrapHostCt(ctx, context->EvalBootstrap(ctImpl, numIterations, precision));
 }
 
 void OpenFheEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
+	requireLinkedVariant("evalBootstrapInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	ciphertext	  = wrapHostCt(ctx, context->EvalBootstrap(ctImpl, numIterations, precision));
@@ -720,6 +745,7 @@ void OpenFheEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx
   const std::vector<int>& indexes,
   int stride,
   int rowSize) {
+	requireLinkedVariant("convolutionTransformInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	std::vector<lbcrypto::Plaintext> ptImpls;
@@ -739,6 +765,7 @@ void OpenFheEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPol
   int stride,
   int maskRotationStride,
   int rowSize) {
+	requireLinkedVariant("specialConvolutionTransformInPlace");
 	auto& context  = hostContext(ctx);
 	auto& ctImpl   = hostCt(ct);
 	auto& maskImpl = hostPt(mask);
@@ -760,7 +787,7 @@ void OpenFheEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRT
 }
 
 std::shared_ptr<void> OpenFheEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
-
+	requireLinkedVariant("evalFastRotationPrecompute");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return context->EvalFastRotationPrecompute(ctImpl);
