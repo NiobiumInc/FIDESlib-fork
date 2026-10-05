@@ -10,7 +10,26 @@
 
 namespace FIDESlib {
 constexpr int MAXP = 64;
-constexpr int MAXD = 8;
+// MAXD is the maximum hybrid key-switching digit count (dnum): it bounds the
+// first index of the [MAXD][MAXP] digit arrays in `Constants` below, which are
+// written from digitGPUid values running 0..dnum-1. `Constants host_constants`
+// is a STACK LOCAL in SetupConstants, so exceeding MAXD used to smash the
+// stack rather than fail -- see the note on ContextData::validateDnum, which
+// now rejects it.
+//
+// RAISED 8 -> 13 (2026-09-01). dnum is a SECURITY parameter as well as a
+// performance one: |P| = ceil(|Q|/dnum), and hybrid key switching publishes
+// evaluation keys mod Q*P, so growing dnum shrinks the modulus an attacker
+// sees. At N=2^16, L=26 the useful values are dnum 9 (log2(QP) 1612) and
+// dnum 13 (1552); both exceeded the old ceiling of 8.
+//
+// THE CEILING IS CONSTANT MEMORY, not taste. CUDA gives a module 64 KB of
+// __constant__ space and `constants` is essentially all of it: at MAXD 8 the
+// struct is already ~52 KB, and each +1 costs ~1.5 KB across six [MAXD][MAXP]
+// int arrays plus the flattened union. MAXD 16 lands within a few hundred
+// bytes of the limit and 32 blows straight past it. The static_assert after
+// the struct makes that a BUILD failure instead of a load-time surprise.
+constexpr int MAXD = 13;
 
 enum version { BARRET, DHEM, NEIL };
 
@@ -36,6 +55,7 @@ struct Constants {
 	uint8_t table[MAXP * MAXP * 8];
 
 	uint64_t N_shoup[MAXP];
+	uint64_t one_shoup[MAXP];
 	uint64_t N_inv[MAXP];
 	uint64_t N_inv_shoup[MAXP];
 	uint64_t root[MAXP];
@@ -71,6 +91,13 @@ struct Constants {
 		void* none;
 	};
 };
+
+// `constants` is declared __constant__ below, and CUDA gives each module 64 KB
+// of constant memory total. Raising MAXD grows this struct; fail the build here
+// rather than at module load, where the error is far less obvious.
+static_assert(sizeof(Constants) <= 64 * 1024,
+			  "Constants exceeds CUDA's 64 KB __constant__ budget -- lower MAXD "
+			  "(or move a digit-indexed array out of constant memory).");
 
 constexpr int PARTITION(int id, int j) {
 	return (offsetof(Constants, primeid_partition) - offsetof(Constants, primeid_partition)) / sizeof(int) + id * MAXP + j;

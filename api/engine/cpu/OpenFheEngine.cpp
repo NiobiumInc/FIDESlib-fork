@@ -2,6 +2,7 @@
 
 #include "CryptoContext.hpp"
 #include "engine/EngineCommon.hpp"
+#include "engine/SparseEncapsulation.h"
 
 #include <openfhe.h>
 
@@ -13,10 +14,12 @@ namespace fideslib {
 
 // Most methods here are thin shims over OpenFHE, which makes OpenFHE the reference oracle: if CPU and
 // CUDA disagree on, say, evalMult, the CUDA kernel is the suspect. The exceptions are the ops OpenFHE has
-// no equivalent for — convolutionTransform / specialConvolutionTransform, and more simply accumulateSum
-// — which re-trace the CUDA algorithm by hand. Their tests compare against a clear-text replay of that
-// same algorithm, so they catch a rotation/rescale/encoding slip but not a flaw in the algorithm
-// itself. Keep these as thin as possible.
+// no equivalent for — linearTransform / convolutionTransform / specialConvolutionTransform — which
+// re-trace the CUDA algorithm by hand. The convolution tests compare against a clear-text replay of that
+// same algorithm, so they catch a rotation/rescale/encoding slip but not a flaw in the algorithm itself;
+// the linear transform is checked against an independent host matrix-vector product instead, which does
+// pin the algorithm. Keep these as thin as possible. accumulateSum used to be in that list; it now
+// delegates to OpenFHE's EvalPartialSumInPlace, which folds with the same association the CUDA path uses.
 
 namespace {
 // Unwrap the host-side OpenFHE objects from the value types' / context's `host` std::any (parity with
@@ -123,7 +126,8 @@ Ciphertext<DCRTPoly> OpenFheEngine::evalAddMany(CryptoContextImpl<DCRTPoly>& ctx
 	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> ctImpls;
 	ctImpls.reserve(ciphertexts.size());
 	for (const auto& ct : ciphertexts) {
-		ctImpls.push_back(hostCt(ct));
+		// Null entries pass through as null impls; the OpenFHE EvalAddMany skips them.
+		ctImpls.push_back(ct ? hostCt(ct) : lbcrypto::Ciphertext<lbcrypto::DCRTPoly>());
 	}
 	return wrapHostCt(ctx, context->EvalAddMany(ctImpls));
 }
@@ -137,11 +141,15 @@ void OpenFheEngine::evalAddManyInPlace(CryptoContextImpl<DCRTPoly>& ctx, std::ve
 	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> ctImpls;
 	ctImpls.reserve(ciphertexts.size());
 	for (const auto& ct : ciphertexts) {
-		ctImpls.push_back(hostCt(ct));
+		// Null entries pass through as null impls; the OpenFHE EvalAddManyInPlace skips them.
+		ctImpls.push_back(ct ? hostCt(ct) : lbcrypto::Ciphertext<lbcrypto::DCRTPoly>());
 	}
 	context->EvalAddManyInPlace(ctImpls);
+	// The result lands in slot 0 (the in-place contract); wrap it if slot 0 was null.
+	if (ciphertexts[0] == nullptr) {
+		ciphertexts[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(ctx.self_reference.lock());
+	}
 	setHostCt(ciphertexts[0], ctImpls[0]);
-	return;
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) {
@@ -249,6 +257,27 @@ void OpenFheEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext
 	return;
 }
 
+Ciphertext<DCRTPoly> OpenFheEngine::evalMultNoRelin(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) {
+	auto& context = hostContext(ctx);
+	auto& ct1Impl = hostCt(ct1);
+	auto& ct2Impl = hostCt(ct2);
+	return wrapHostCt(ctx, context->EvalMultNoRelin(ct1Impl, ct2Impl));
+}
+
+Ciphertext<DCRTPoly> OpenFheEngine::relinearize(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	auto& context = hostContext(ctx);
+	auto& ctImpl  = hostCt(ct);
+	return wrapHostCt(ctx, context->Relinearize(ctImpl));
+}
+
+void OpenFheEngine::relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	auto& context = hostContext(ctx);
+	ct->EnsureLazyHostCopy();
+	auto& ctImpl = hostCt(ct);
+	context->RelinearizeInPlace(ctImpl);
+	return;
+}
+
 Ciphertext<DCRTPoly> OpenFheEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
@@ -280,7 +309,7 @@ Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t m, const std::shared_ptr<void>& precomp) {
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
-	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(precomp);
+	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(precomp);
 	return wrapHostCt(ctx, context->EvalFastRotation(ctImpl, index, m, casted));
 }
 
@@ -288,7 +317,7 @@ Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) {
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
-	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(digits);
+	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(digits);
 	return wrapHostCt(ctx, context->EvalFastRotationExt(ctImpl, index, casted, addFirst));
 }
 
@@ -301,7 +330,7 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotation(CryptoContextI
 
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
-	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(precomp);
+	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(precomp);
 
 	for (const auto& index : indices) {
 		results.push_back(wrapHostCt(ct, context->EvalFastRotation(ctImpl, index, m, casted)));
@@ -318,7 +347,7 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotationExt(CryptoConte
 
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
-	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(digits);
+	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(digits);
 
 	for (const auto& index : indices) {
 		results.push_back(wrapHostCt(ct, context->EvalFastRotationExt(ctImpl, index, casted, addFirst)));
@@ -340,47 +369,68 @@ void OpenFheEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx,
 	return;
 }
 
+namespace {
+// api Rescale contract: mod-reduce eagerly under EVERY scaling technique — towers−1, NSD−1
+// (guard ≥1), sf ÷= ModReduceFactor — matching the CUDA and haze engines (Ciphertext::rescale,
+// HazeEngine::rescaleCore; BITCOMPAT.md O3/O12, resolved on the device semantics). OpenFHE's
+// public Rescale only mod-reduces under FIXEDMANUAL and CLONES under the AUTO techniques, so
+// the AUTO path goes through the scheme's internal ModReduce — the same call OpenFHE itself
+// makes inside EvalMult's operand adjustment, which is what makes a hoisted api Rescale
+// equivalent to (and cheaper than) the per-multiply hidden rescales it replaces.
+void modReduceOneLevelInPlace(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context,
+                              lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct) {
+	const auto params =
+		std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(context->GetCryptoParameters());
+	const auto tech = params->GetScalingTechnique();
+	// Parity guard (BITCOMPAT.md O13): a degree-2 ciphertext at the FLEXIBLEAUTOEXT extra
+	// level is refused on CUDA and haze; refuse here too rather than diverge on an untested state.
+	if (tech == lbcrypto::FLEXIBLEAUTOEXT && ct->GetElements().size() == 3 && ct->GetLevel() == 0) {
+		throw std::runtime_error(
+			"cpu backend: rescale of a degree-2 ciphertext at the FLEXIBLEAUTOEXT extra level is not supported; relinearize first");
+	}
+	if (tech == lbcrypto::FIXEDMANUAL) {
+		context->ModReduceInPlace(ct); // already a real mod-reduce here; keep OpenFHE's own path
+	} else {
+		context->GetScheme()->ModReduceInternalInPlace(ct, lbcrypto::BASE_NUM_LEVELS_TO_DROP);
+		// HazeEngine::rescaleCore clamps NSD at 1 (CUDA decrements unconditionally); OpenFHE's
+		// internal call can leave 0 when rescaling an NSD-1 ciphertext — clamp for parity.
+		if (ct->GetNoiseScaleDeg() < 1)
+			ct->SetNoiseScaleDeg(1);
+	}
+}
+} // namespace
+
 Ciphertext<DCRTPoly> OpenFheEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
-	return wrapHostCt(ctx, context->Rescale(ctImpl));
+	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> res = ctImpl->Clone();
+	modReduceOneLevelInPlace(context, res);
+	return wrapHostCt(ctx, std::move(res));
 }
 
 void OpenFheEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) {
 	auto& context = hostContext(ctx);
 	ciphertext->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ciphertext);
-	setHostCt(ciphertext, context->Rescale(ctImpl));
+	modReduceOneLevelInPlace(context, ctImpl);
 	return;
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	auto& context = hostContext(ctx);
-	auto& ctImpl  = hostCt(ct);
+	auto& ctImpl = hostCt(ct);
 
 	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> result_ct = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(ctImpl);
 
-	for (int i = 0; i < log2(slots); i++) {
-		int rot_idx = stride * (1 << i);
-		auto tmp	= context->EvalRotate(result_ct, rot_idx);
-		context->EvalAddInPlace(result_ct, tmp);
-	}
+	lbcrypto::FHECKKSRNS::EvalPartialSumInPlace(result_ct, stride, slots, ACCUMULATE_SUM_RADIX);
 
 	return wrapHostCt(ctx, result_ct);
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
 
-	for (int i = 0; i < log2(slots); i++) {
-		int rot_idx = stride * (1 << i);
-		auto tmp	= context->EvalRotate(ctImpl, rot_idx);
-		context->EvalAddInPlace(ctImpl, tmp);
-	}
-
-	return;
+	lbcrypto::FHECKKSRNS::EvalPartialSumInPlace(ctImpl, stride, slots, ACCUMULATE_SUM_RADIX);
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
@@ -414,6 +464,19 @@ void OpenFheEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const 
 	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
 
 	auto& context = hostContext(ctx);
+
+	// In-context encapsulation: CCParams now maps SPARSE_ENCAPSULATED onto the STOCK lbcrypto
+	// SPARSE_ENCAPSULATED enum, so stock's EvalBootstrapKeyGen emits the two switching keys itself
+	// — the 2N-4 two-prime (q0,p) sparse-switch key via KeySwitchGenSparse and the 2N-2 ordinary
+	// hybrid key — at the correct IN-CONTEXT parameters (ckksrns-fhe.cpp EvalBootstrapKeyGen). They
+	// land in the process-global automorphism map at M-4 / M-2 and travel in the existing
+	// SerializeEvalAutomorphismKey stream, exactly like the rotation and conjugation keys.
+	//
+	// This REPLACES the previous FIDESlib::CKKS::AddSparseEncapsulationKeys(skImpl, 32) call, which
+	// built a *second* "switchable" CryptoContext and generated dual-context-shaped switching keys
+	// — the design the in-context rework removes. That path is no longer needed on either backend: the main key is
+	// kept uniform by CryptoContextImpl::KeyGen() (see the security guard there), and the keys stock
+	// now emits are the ones the in-context GPU bootstrap consumes.
 	context->EvalBootstrapKeyGen(skImpl, slots);
 	return;
 }
@@ -429,6 +492,14 @@ void OpenFheEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphe
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	ciphertext	  = wrapHostCt(ctx, context->EvalBootstrap(ctImpl, numIterations, precision));
+}
+
+Ciphertext<DCRTPoly>
+OpenFheEngine::evalBootstrapToLevel(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t outputLevel, uint32_t numIterations, uint32_t precision, bool prescaled) {
+	// The reference path, and on this backend it is the only one available: see the header
+	// for why the host bootstrap cannot be shortened. The ciphertext and its precision are
+	// the same as the device backend produces at the same output level; the WALL is not.
+	return Engine::evalBootstrapToLevel(ctx, ciphertext, outputLevel, numIterations, precision, prescaled);
 }
 
 void OpenFheEngine::recoverHostCiphertext(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRTPoly>&) {
@@ -536,7 +607,101 @@ lbcrypto::Ciphertext<lbcrypto::DCRTPoly> cpuConvolutionTransform(const lbcrypto:
 
 	return context->Rescale(blockResults[0]);
 }
+
+// Baby-step/giant-step matrix-vector product on CPU via OpenFHE, mirroring
+// FIDESlib::CKKS::LinearTransform (src/CKKS/LinearTransform.cu:63) step for step. The CUDA path
+// fuses the whole thing into one hoisted ModUp plus one MAC kernel over every diagonal and limb;
+// here the same arithmetic is spelled out as rotations, plaintext mults and adds. Slower by a long
+// way, and that is the point: it makes the api portable and gives the CUDA kernel an oracle.
+//
+// Semantics (see CryptoContextImpl::LinearTransformInPlace for the caller-facing contract):
+//   result = sum_{k < rowSize} Rot(ct, k*stride + offset) * D_k
+// with pts[k] holding D_k already counter-rotated by
+//   -bStep*(k/bStep)*stride - offset.
+lbcrypto::Ciphertext<lbcrypto::DCRTPoly> cpuLinearTransform(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context,
+  lbcrypto::Ciphertext<lbcrypto::DCRTPoly> ct,
+  const std::vector<lbcrypto::Plaintext>& pts,
+  int rowSize,
+  int bStep,
+  int stride,
+  int offset) {
+	assert(bStep > 0 && rowSize > 0);
+	assert(static_cast<int>(pts.size()) >= rowSize);
+	const int gStep = (rowSize + bStep - 1) / bStep;
+
+	// Match the GPU path: rescale a freshly-multiplied (noise level 2) input, so the diagonals'
+	// level requirement is stated against the post-rescale level.
+	if (ct->GetNoiseScaleDeg() == 2)
+		ct = context->Rescale(ct);
+
+	// Phase 1: the baby steps. One hoisted key-switch precompute (the CUDA path's single ModUp)
+	// feeds all bStep rotations; index 0 is the identity and consumes no key.
+	auto precomp	 = context->EvalFastRotationPrecompute(ct);
+	const uint32_t m = context->GetCyclotomicOrder();
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> fastRotation(static_cast<size_t>(bStep));
+	for (int i = 0; i < bStep; ++i)
+		fastRotation[static_cast<size_t>(i)] =
+		  (i * stride == 0) ? std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(ct) : context->EvalFastRotation(ct, i * stride, m, precomp);
+
+	// A giant-step rotation that is a whole number of full slot cycles is the identity; the CUDA
+	// path skips it on exactly this condition ((bStep*stride) % (N/2) != 0).
+	const int fullCycle			= static_cast<int>(context->GetRingDimension() / 2);
+	const bool giantStepIsNoOp	= (bStep * stride) % fullCycle == 0;
+	const int giantStepRotation = bStep * stride;
+
+	// Phases 2 and 3: one dot product per giant step, folded backwards (Horner). Walking j down and
+	// rotating the running sum by bStep*stride each time is what turns the per-diagonal rotation
+	// k*stride into i*stride only — the giant part is paid once per step, not once per diagonal.
+	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> acc;
+	for (int j = gStep - 1; j >= 0; --j) {
+		lbcrypto::Ciphertext<lbcrypto::DCRTPoly> inner;
+		for (int i = 0; i < bStep; ++i) {
+			const int k = bStep * j + i;
+			if (k >= rowSize)
+				break; // the last giant step is short; CUDA null-pads it, here we stop
+			auto term = context->EvalMult(fastRotation[static_cast<size_t>(i)], pts[static_cast<size_t>(k)]);
+			if (!inner)
+				inner = term;
+			else
+				context->EvalAddInPlace(inner, term);
+		}
+		// gStep = ceil(rowSize/bStep) guarantees bStep*j < rowSize, so `inner` is never null.
+		if (!acc)
+			acc = inner;
+		else
+			context->EvalAddInPlace(acc, inner);
+
+		if (j > 0) {
+			if (!giantStepIsNoOp)
+				acc = context->EvalRotate(acc, giantStepRotation);
+		} else if (offset != 0) {
+			acc = context->EvalRotate(acc, offset);
+		}
+	}
+
+	// No trailing rescale: the CUDA kernel hands back a noise-scale-degree-2 ciphertext at the input
+	// level, and the api contract promises the same on both backends.
+	return acc;
+}
 } // namespace
+
+// `ext` is deliberately unused. It asks for the extended (mod-up, Q||P) basis, which is a property
+// of how a device holds its RNS limbs — the win is that the baby rotations and the MAC accumulation
+// stay in Q||P and pay ONE ModDown per giant step instead of one per rotation. The CPU reference
+// composes OpenFHE ops that each key-switch down to Q on their own, so there is no basis to stay in
+// and nothing to hoist; the math and the result (down to the same scale and level) are identical
+// either way. MakeCKKSPackedPlaintextExtended likewise hands this backend an ordinary Q-basis
+// encoding, so the diagonals here are ordinary plaintexts whatever the caller asked for. The
+// parameter exists so the same call, with the same flag, is valid and correct on both backends.
+void OpenFheEngine::linearTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int rowSize, int bStep, const std::vector<Plaintext>& diagonals, int stride, int offset, bool /*ext*/) {
+	auto& context = hostContext(ctx);
+	auto& ctImpl  = hostCt(ct);
+	std::vector<lbcrypto::Plaintext> ptImpls;
+	ptImpls.reserve(static_cast<size_t>(rowSize));
+	for (int k = 0; k < rowSize; ++k)
+		ptImpls.push_back(hostPt(diagonals[static_cast<size_t>(k)]));
+	setHostCt(ct, cpuLinearTransform(context, ctImpl, ptImpls, rowSize, bStep, stride, offset));
+}
 
 void OpenFheEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
   Ciphertext<DCRTPoly>& ct,
@@ -606,6 +771,18 @@ size_t OpenFheEngine::ciphertextLevel(CryptoContextImpl<DCRTPoly>&, const Cipher
 
 size_t OpenFheEngine::ciphertextNoiseScaleDeg(CryptoContextImpl<DCRTPoly>&, const CiphertextImpl<DCRTPoly>& ct) {
 	return ct.GetNoiseScaleDegHost();
+}
+
+double OpenFheEngine::ciphertextScalingFactor(CryptoContextImpl<DCRTPoly>&, const CiphertextImpl<DCRTPoly>& ct) {
+	return ct.GetScalingFactorHost();
+}
+
+size_t OpenFheEngine::ciphertextSlots(CryptoContextImpl<DCRTPoly>&, const CiphertextImpl<DCRTPoly>& ct) {
+	return ct.GetSlotsHost();
+}
+
+void OpenFheEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>&, CiphertextImpl<DCRTPoly>&) {
+	// CPU backend: the ciphertext is never device-resident, so the host value is already current.
 }
 
 void OpenFheEngine::setCiphertextSlots(CryptoContextImpl<DCRTPoly>&, CiphertextImpl<DCRTPoly>& ct, size_t slots) {

@@ -3,6 +3,7 @@
 //
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <variant>
 #include <vector>
 
@@ -66,10 +67,9 @@ void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const 
 
 	Stream& s = parta[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	void*** data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, parta[0]->device, s.ptr());
 	s.wait(partb[0]->s);
 	if (!sub) {
 		if (!exta && !extb) {
@@ -116,7 +116,7 @@ void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const 
 		}
 	}
 	partb[0]->s.wait(s);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::multPtBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb, int stride, double usage) {
@@ -154,15 +154,14 @@ void LimbPartition::multPtBatchManyToOne(std::vector<LimbPartition*>& parta, con
 
 	Stream& s = parta[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	void*** data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, parta[0]->device, s.ptr());
 	s.wait(partb[0]->s);
 	if (limbsize > 0)
 		mult_reuse_b___<<<grid, block, 0, s.ptr()>>>(data_ptrs_d, data_ptrs_d + its * split * partb.size(), PARTITION(parta[0]->id, 0), n, its);
 	partb[0]->s.wait(s);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::addScalarBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<std::vector<unsigned long int>>& vector, int stride, double usage) {
@@ -201,14 +200,13 @@ void LimbPartition::addScalarBatchManyToOne(std::vector<LimbPartition*>& parta, 
 
 	Stream& s = parta[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	void*** data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, parta[0]->device, s.ptr());
 
 	if (limbsize > 0)
 		add_scalar_reuse_b___<<<grid, block, 0, s.ptr()>>>(data_ptrs_d, data_ptrs_d + its * split * vector.size(), PARTITION(parta[0]->id, 0), n, its);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::multScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
@@ -255,15 +253,14 @@ void LimbPartition::multScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
 
 	Stream& s = parta[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	void*** data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, parta[0]->device, s.ptr());
 
 	if (limbsize > 0)
 		mult_scalar_reuse_b___<<<grid, block, 0, s.ptr()>>>(
 		  data_ptrs_d, data_ptrs_d + its * split * vector.size(), data_ptrs_d + its * split * vector.size() + split * vector.size() * MAXP, PARTITION(parta[0]->id, 0), n, its);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
@@ -273,7 +270,9 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
   int gStep,
   int stride,
   double usage,
-  bool ext) {
+  bool ext,
+  void*** prepared_pt_q,
+  void*** prepared_pt_p) {
 
 	constexpr bool VER2 = true;
 	constexpr bool VER3 = false;
@@ -325,7 +324,17 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 		num_LT		= out.size() / (2 * gStep);
 	}
 
-	int size		   = (out.size() + in.size() + pt.size()) * (1 + ext);
+	// `prepared` means the caller handed us a device diagonal table that was uploaded once
+	// and outlives this call (CKKS/PreparedLT.cuh). The diagonal third of the pointer table is then
+	// neither rebuilt on the host nor re-uploaded, so `size` covers the per-call thirds alone and
+	// the kernels read their `pt` base straight out of the resident buffer. Everything else — the
+	// index arithmetic, the launch shapes, the stream waits, the pointers the kernel ends up
+	// reading — is unchanged, which is why a prepared call and an unprepared one are the same
+	// computation and not two implementations of it.
+	const bool prepared = prepared_pt_q != nullptr;
+	assert(!prepared || !ext || prepared_pt_p != nullptr);
+
+	int size		   = (out.size() + in.size() + (prepared ? 0u : pt.size())) * (1 + ext);
 	int offset_out_c0  = 0;
 	int offset_out_c1  = out.size() / 2;
 	int offset_in_c0   = out.size();
@@ -363,10 +372,14 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 			}
 		}
 
-		for (int j = 0; j < gStep; ++j) {
-			for (int k = 0; k < bStep; ++k) {
-				data_ptrs[offset_pt + i * gStep * bStep + j * bStep + k] =
-				  pt[i * gStep * bStep + j * bStep + k] ? pt[i * gStep * bStep + j * bStep + k]->limbptr.data : nullptr;
+		// Skipped when the caller handed us a resident diagonal table — these are exactly
+		// the entries that table already holds, at exactly these indices.
+		if (!prepared) {
+			for (int j = 0; j < gStep; ++j) {
+				for (int k = 0; k < bStep; ++k) {
+					data_ptrs[offset_pt + i * gStep * bStep + j * bStep + k] =
+					  pt[i * gStep * bStep + j * bStep + k] ? pt[i * gStep * bStep + j * bStep + k]->limbptr.data : nullptr;
+				}
 			}
 		}
 
@@ -395,10 +408,12 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 				}
 			}
 
-			for (int j = 0; j < gStep; ++j) {
-				for (int k = 0; k < bStep; ++k) {
-					data_ptrs[soffset_pt + i * gStep * bStep + j * bStep + k] =
-					  pt[i * gStep * bStep + j * bStep + k] ? pt[i * gStep * bStep + j * bStep + k]->SPECIALlimbptr.data : nullptr;
+			if (!prepared) {
+				for (int j = 0; j < gStep; ++j) {
+					for (int k = 0; k < bStep; ++k) {
+						data_ptrs[soffset_pt + i * gStep * bStep + j * bStep + k] =
+						  pt[i * gStep * bStep + j * bStep + k] ? pt[i * gStep * bStep + j * bStep + k]->SPECIALlimbptr.data : nullptr;
+					}
 				}
 			}
 		}
@@ -406,12 +421,29 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 
 	Stream& s = in[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	// FIDESLIB_PERSIST_TABLES (2026-10-03): the batched linear transform's pointer table
+	// has the same output-pointer structure as fusedHoistRotate's digits and was never on the
+	// persist ring either. Class 4. See LimbPartitionMGPU.cu fusedHoistRotate for the rationale.
+	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
+	void*** data_ptrs_d = nullptr;
+	if (persist_tables) {
+		data_ptrs_d = static_cast<void***>(FIDESlib::OpTableBuffer(in[0]->device, sizeof(void**) * size, 4));
+		if (FIDESlib::PersistChurn()) {
+			void* dummy = FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr());
+			FIDESlib::OpFreeAsync(dummy, s.ptr());
+		}
+	} else {
+		data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
+	}
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, in[0]->device, s.ptr());
 	s.wait(out[0]->s);
 	s.wait(pt[0]->s);
+
+	// The diagonal bases the kernels read: the resident table when there is one, otherwise the
+	// slice of the per-call table we just filled. Nothing downstream can tell the difference.
+	void*** const pt_q_base = prepared ? prepared_pt_q : data_ptrs_d + offset_pt;
+	void*** const pt_p_base = prepared ? prepared_pt_p : (ext ? data_ptrs_d + soffset_pt : nullptr);
 
 	if constexpr (!VER2) {
 		if (limbsize > 0) {
@@ -419,7 +451,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 			  data_ptrs_d + offset_out_c1,
 			  data_ptrs_d + offset_in_c0,
 			  data_ptrs_d + offset_in_c1,
-			  data_ptrs_d + offset_pt,
+			  pt_q_base,
 			  stride,
 			  gStep,
 			  PARTITION(out[0]->id, 0),
@@ -430,7 +462,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 			  data_ptrs_d + soffset_out_c1,
 			  data_ptrs_d + soffset_in_c0,
 			  data_ptrs_d + soffset_in_c1,
-			  data_ptrs_d + soffset_pt,
+			  pt_p_base,
 			  stride,
 			  gStep,
 			  SPECIAL(out[0]->id, special_start),
@@ -443,7 +475,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 				  data_ptrs_d + offset_out_c1,
 				  data_ptrs_d + offset_in_c0,
 				  data_ptrs_d + offset_in_c1,
-				  data_ptrs_d + offset_pt,
+				  pt_q_base,
 				  bStep,
 				  gStep,
 				  PARTITION(out[0]->id, 0),
@@ -454,7 +486,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 				  data_ptrs_d + soffset_out_c1,
 				  data_ptrs_d + soffset_in_c0,
 				  data_ptrs_d + soffset_in_c1,
-				  data_ptrs_d + soffset_pt,
+				  pt_p_base,
 				  bStep,
 				  gStep,
 				  SPECIAL(out[0]->id, special_start),
@@ -466,7 +498,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 				  data_ptrs_d + offset_out_c1,
 				  data_ptrs_d + offset_in_c0,
 				  data_ptrs_d + offset_in_c1,
-				  data_ptrs_d + offset_pt,
+				  pt_q_base,
 				  bStep,
 				  gStep,
 				  PARTITION(out[0]->id, 0),
@@ -477,7 +509,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 				  data_ptrs_d + soffset_out_c1,
 				  data_ptrs_d + soffset_in_c0,
 				  data_ptrs_d + soffset_in_c1,
-				  data_ptrs_d + soffset_pt,
+				  pt_p_base,
 				  bStep,
 				  gStep,
 				  SPECIAL(out[0]->id, special_start),
@@ -487,7 +519,8 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 	}
 	out[0]->s.wait(s);
 	pt[0]->s.wait(s);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	if (!persist_tables)
+		FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
@@ -516,8 +549,12 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 	  std::min((uint32_t)((threads + block.x * block.y * block.z * grid.x * grid.y - 1) / (block.x * block.y * block.z * grid.x * std::max(1u, grid.y))),
 		(uint32_t)out.size()));
 	// grid.z = num_parallel_parts;
+	// ONE-SHOT: this is a tuning note, not an error. EvalRotateMany (the score-path ladder arm)
+	// calls this thousands of times per pass, and a per-call line would bury the run's real output.
 	if (num_parallel_parts > 1) {
-		std::cerr << "fusedHoistRotateBatch detected underutilization, should optimize" << std::endl;
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set())
+			std::cerr << "fusedHoistRotateBatch detected underutilization, should optimize" << std::endl;
 	}
 
 	// dim3 sgrid = grid;
@@ -584,11 +621,21 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 
 	Stream& s = in[0]->s;
 
-	void*** data_ptrs_d;
-	cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
+	void*** data_ptrs_d = static_cast<void***>(FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr()));
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-	cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
-	s.wait(out[0]->s);
+	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, in[0]->device, s.ptr());
+	// EVERY input and EVERY output, not just the first of each. One source per batch entry means
+	// one stream per batch entry, and the kernel reads all of them: waiting only on in[0]/out[0]
+	// was sufficient while the only conceivable caller was one-source/many-indexes (where every
+	// other `in` is the same poly), and races as soon as a caller batches independent sources --
+	// which is exactly what Ciphertext::rotate_many does. Mirrors the wait set of the single-source
+	// LimbPartition::fusedHoistRotate (LimbPartitionMGPU.cu).
+	for (auto* p : in)
+		if (p)
+			s.wait(p->s);
+	for (auto* p : out)
+		if (p)
+			s.wait(p->s);
 	s.wait(ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s);
 
 	if (limbsize + slimbsize > 0)
@@ -609,9 +656,14 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 		  0,
 		  c0_modup);
 
-	out[0]->s.wait(s);
+	for (auto* p : in)
+		if (p)
+			p->s.wait(s);
+	for (auto* p : out)
+		if (p)
+			p->s.wait(s);
 	(ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s).wait(s);
-	cudaFreeAsync(data_ptrs_d, s.ptr());
+	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
 } // namespace FIDESlib::CKKS

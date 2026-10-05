@@ -2,6 +2,7 @@
 // Created by carlosad on 24/03/24.
 //
 #include "ConstantsGPU.cuh"
+#include <cstdlib>
 #include "CudaUtils.cuh"
 #include "Math.cuh"
 #include <algorithm>
@@ -81,28 +82,30 @@ uint64_t shoup_precomp(uint64_t val, int primeid, Constants& host_constants_) {
 		}                                \
 	} while (false)
 
-#define free(name)                         \
-	do {                                   \
-		if (name[i] != nullptr) {          \
-			if (type & (1 << i)) {         \
-				delete (uint64_t*)name[i]; \
-			} else {                       \
-				delete (uint32_t*)name[i]; \
-			}                              \
-			name[i] = nullptr;             \
-		}                                  \
+// The per-prime host tables (psi, inv_psi, ... below) are allocated with malloc() in
+// SetupConstants; they must be released with free(). This macro used to be named `free`
+// -- shadowing the C library function for the rest of this translation unit -- and released
+// them with `delete (uint64_t*)` / `delete (uint32_t*)`: an allocator mismatch (undefined
+// behaviour) that AddressSanitizer reports at every context teardown
+// (alloc-dealloc-mismatch, malloc vs operator delete). Iterates on the enclosing `i`.
+#define freehost(name)              \
+	do {                            \
+		if (name[i] != nullptr) {   \
+			std::free(name[i]);     \
+			name[i] = nullptr;      \
+		}                           \
 	} while (false)
 
 Global::~Global() {
 	for (int i = 0; i < MAXP; ++i) {
-		free(psi);
-		free(inv_psi);
-		free(psi_middle_scale);
-		free(inv_psi_middle_scale);
-		free(psi_no);
-		free(inv_psi_no);
-		free(psi_shoup);
-		free(inv_psi_shoup);
+		freehost(psi);
+		freehost(inv_psi);
+		freehost(psi_middle_scale);
+		freehost(inv_psi_middle_scale);
+		freehost(psi_no);
+		freehost(inv_psi_no);
+		freehost(psi_shoup);
+		freehost(inv_psi_shoup);
 
 		freegpu(psi_ptr);
 		freegpu(inv_psi_ptr);
@@ -120,6 +123,8 @@ Global::~Global() {
 		}
 	}
 }
+#undef freehost
+#undef freegpu
 
 template <typename Scheme>
 std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const std::vector<PrimeRecord>& q,
@@ -167,6 +172,7 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const 
 		for (size_t i = 0; i < q.size(); ++i) {
 			hC_.primes[i]	   = q[i].p;
 			hC_.N_shoup[i]	   = shoup_precomp(hC_.N, i, host_constants);
+			hC_.one_shoup[i]   = shoup_precomp(1, i, host_constants);
 			hC_.N_inv[i]	   = modinv(hC_.N, q[i].p);
 			hC_.N_inv_shoup[i] = shoup_precomp(hC_.N_inv[i], i, host_constants);
 
@@ -175,12 +181,11 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const 
 		}
 
 		for (size_t i = 0; i < p.size(); ++i) {
-			hC_.primes[hC_.L + i] = p[i].p;
-
+			hC_.primes[hC_.L + i]	   = p[i].p;
 			hC_.N_shoup[hC_.L + i]	   = shoup_precomp(hC_.N, hC_.L + i, host_constants);
+			hC_.one_shoup[i]		   = shoup_precomp(1, i, host_constants);
 			hC_.N_inv[hC_.L + i]	   = modinv(N, hC_.primes[hC_.L + i]);
 			hC_.N_inv_shoup[hC_.L + i] = shoup_precomp(hC_.N_inv[hC_.L + i], hC_.L + i, host_constants);
-			;
 
 			hC_.prime_better_barret_mu[hC_.L + i] = mu_new(hC_.primes[hC_.L + i], p[i].bits);
 			hC_.prime_bits[hC_.L + i]			  = p[i].bits;
@@ -448,6 +453,11 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const 
 					}
 				}
 
+				if (MODRAISE_WITH_P0) {
+					for (size_t j = 0; j < q.size(); ++j) {
+						hG_.QlQlInvModqlDivqlModq[q.size()][j] = param.raw->m_QlQlInvModqlDivqlModq[q.size() - 1][j];
+					}
+				}
 				constexpr int bytes = sizeof(Global::QlQlInvModqlDivqlModq);
 
 				for (uint32_t i = 0; i < GPUid.size(); ++i) {

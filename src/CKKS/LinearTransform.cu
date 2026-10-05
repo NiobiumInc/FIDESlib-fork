@@ -6,6 +6,7 @@
 #include "CKKS/Context.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/Plaintext.cuh"
+#include "CKKS/PreparedLT.cuh"
 #include "CudaUtils.cuh"
 
 #if defined(__clang__)
@@ -24,7 +25,8 @@ void DotProductPtInternal(std::vector<std::shared_ptr<Ciphertext>>& result,
   const int red_n,
   const int pt_reuse_stride,
   const int pt_different_stride,
-  const bool ext) {
+  const bool ext,
+  const PreparedLTTable* prepared = nullptr) {
 	std::vector<RNSPoly*> cts, pts, res;
 	cts.reserve(a.size() * 2);
 	for (auto& i : a) {
@@ -44,7 +46,7 @@ void DotProductPtInternal(std::vector<std::shared_ptr<Ciphertext>>& result,
 			pts.push_back(nullptr);
 	}
 
-	RNSPoly::LTdotProductPtBatch(res, cts, pts, red_n, pt_different_stride, pt_reuse_stride, 1.0, ext);
+	RNSPoly::LTdotProductPtBatch(res, cts, pts, red_n, pt_different_stride, pt_reuse_stride, 1.0, ext, prepared);
 
 	for (size_t i = 0; i < result.size(); ++i) {
 		result[i]->multMetadata(
@@ -60,7 +62,8 @@ void DotProductPtInternal(std::vector<std::shared_ptr<Ciphertext>>& result,
 }
 } // namespace FIDESlib::CKKS
 
-void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts, int stride, int offset) {
+void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts, int stride, int offset, const PreparedLTTable* prepared) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kLt);
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	assert(pts.size() >= rowSize);
 	for (auto i : pts) {
@@ -105,8 +108,8 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
 			}
 
 			constexpr bool MODDOWN_HOIST = true;
-			constexpr bool ONLY_C1		 = true;
-			constexpr bool FUSED		 = true;
+			constexpr bool ONLY_C1       = true;
+			constexpr bool FUSED         = true;
 			if constexpr (FUSED) {
 				assert(rowSize <= pts.size());
 				std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
@@ -142,7 +145,7 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
 					}
 				}
 
-				DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep, MODDOWN_HOIST && ext);
+				DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep, MODDOWN_HOIST && ext, prepared);
 				
 				for (auto& i : results) {
 					for (uint32_t j = 0; j < i->c0.GPU.size(); ++j) {
@@ -247,6 +250,189 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
 				}
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LinearTransformMany — N independent transforms of ONE source, one launch.
+// ---------------------------------------------------------------------------
+// A deliberate copy of the FUSED branch of LinearTransform above rather than a
+// generalisation of it: that function also carries the (dead) unfused branch and
+// is the hot path everything else already depends on.
+//
+// What is SHARED across the num_LT transforms — the reason this exists:
+//   * the hoisted key-switch precompute and its bStep baby rotations. ONE ModUp
+//     of the source for all num_LT transforms instead of one per transform.
+//   * the MAC launch. RNSPoly::LTdotProductPtBatch already takes num_LT
+//     independent transforms per launch: it derives num_LT = out.size()/(2*gStep)
+//     and indexes out[t*gStep + j], pt[t*gStep*bStep + j*bStep + i] and
+//     in[t*bStep + i]. Note the INPUT is indexed per transform too, so the shared
+//     baby-step ciphertexts are handed in REPLICATED num_LT times — the same
+//     pointers, so no extra rotation and no extra device memory. (The metadata
+//     fold in DotProductPtInternal reads a[(i/gStep)*bStep], i.e. the first baby
+//     step of transform i/gStep, which is what that replication makes correct.)
+//
+// What must NOT be shared — the per-transform state:
+//   * the gStep partial results (out[t*gStep + j]), and
+//   * the backwards Horner fold over them: add, rotate by bStep*stride between
+//     giant steps, and the final offset rotation / ModDown. Those run once per
+//     transform, character for character as in LinearTransform.
+void FIDESlib::CKKS::LinearTransformMany(Ciphertext& ctxt,
+  const std::vector<Ciphertext*>& out,
+  int rowSize,
+  int bStep,
+  const std::vector<std::vector<Plaintext*>>& pts,
+  int stride,
+  int offset,
+  const PreparedLTTable* prepared) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kLt);
+	CudaNvtxRange r(std::string{ sc::current().function_name() });
+	assert(!out.empty());
+	assert(out.size() == pts.size());
+	for (const auto& set : pts) {
+		assert(set.size() >= static_cast<size_t>(rowSize));
+		for (int k = 0; k < rowSize; ++k) {
+			assert(set[k] != nullptr);
+		}
+	}
+
+	Context& cc_		 = ctxt.cc_;
+	ContextData& cc		 = ctxt.cc;
+	const uint32_t gStep = (rowSize + bStep - 1) / bStep;
+	const size_t num_LT	 = out.size();
+
+	if (ctxt.NoiseLevel == 2)
+		ctxt.rescale();
+	for (const auto& set : pts) {
+		assert(set[0]->c0.getLevel() == ctxt.getLevel());
+	}
+
+	std::vector<Ciphertext> fastRotation;
+	fastRotation.reserve(bStep);
+	for (int i = 0; i < bStep; ++i) {
+		fastRotation.emplace_back(cc_);
+		fastRotation.back().growToLevel(ctxt.getLevel());
+		fastRotation.back().dropToLevel(ctxt.getLevel(), true);
+	}
+
+	std::vector<Ciphertext*> babyPtr;
+	bool ext = true;
+	{
+		std::vector<int> indexes;
+		for (int i = 0; i < bStep; ++i) {
+			babyPtr.push_back(&fastRotation[i]);
+			indexes.push_back(i * stride);
+		}
+		// The extended path is all-or-nothing across the WHOLE batch: one launch, one basis.
+		for (const auto& set : pts) {
+			for (int k = 0; k < rowSize; ++k) {
+				if (!set[k]->c0.isModUp())
+					ext = false;
+			}
+		}
+		// The one hoisted rotation set, shared by every transform in the batch.
+		ctxt.rotate_hoisted(indexes, babyPtr, ext);
+	}
+
+	constexpr bool MODDOWN_HOIST = true;
+	constexpr bool ONLY_C1		 = true;
+
+	// Diagonals in the order the batch kernel indexes them: transform-major, then giant step, then
+	// baby step. The tail of the last giant step is null-padded out to bStep*gStep, here and not by
+	// the caller, exactly as in the single-transform path.
+	std::vector<Plaintext*> Aptr(num_LT * gStep * bStep, nullptr);
+	for (size_t t = 0; t < num_LT; ++t) {
+		for (uint32_t j = 0; j < gStep; ++j) {
+			for (int i = 0; i < bStep; ++i) {
+				if (bStep * j + i < static_cast<uint32_t>(rowSize))
+					Aptr[t * gStep * bStep + bStep * j + i] = pts[t][bStep * j + i];
+			}
+		}
+	}
+
+	// The same baby ciphertexts, once per transform: in[t*bStep + i].
+	std::vector<Ciphertext*> inPtr;
+	inPtr.reserve(num_LT * static_cast<size_t>(bStep));
+	for (size_t t = 0; t < num_LT; ++t) {
+		for (int i = 0; i < bStep; ++i)
+			inPtr.push_back(babyPtr[i]);
+	}
+
+	// One partial per (transform, giant step): out[t*gStep + j].
+	std::vector<std::shared_ptr<Ciphertext>> results;
+	results.reserve(num_LT * gStep);
+	for (size_t i = 0; i < num_LT * gStep; ++i) {
+		results.emplace_back(std::make_shared<Ciphertext>(cc_));
+		results.back()->growToLevel(ctxt.getLevel());
+		results.back()->dropToLevel(ctxt.getLevel(), true);
+		results.back()->extend(false);
+	}
+
+	// results[0]'s stream is the launch stream; everything the launch touches joins it first and
+	// forks back off it afterwards. Same discipline as LinearTransform, over the bigger batch.
+	for (auto& i : results) {
+		for (uint32_t j = 0; j < i->c0.GPU.size(); ++j) {
+			results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+			results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+		}
+	}
+	for (auto& i : babyPtr) {
+		for (uint32_t j = 0; j < i->c0.GPU.size(); ++j) {
+			results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+			results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+		}
+	}
+
+	DotProductPtInternal<Ciphertext*, Plaintext*>(results, inPtr, Aptr, bStep, 1, gStep, MODDOWN_HOIST && ext, prepared);
+
+	for (auto& i : results) {
+		for (uint32_t j = 0; j < i->c0.GPU.size(); ++j) {
+			i->c0.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+			i->c1.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+		}
+	}
+	for (auto& i : babyPtr) {
+		for (uint32_t j = 0; j < i->c0.GPU.size(); ++j) {
+			i->c0.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+			i->c1.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+		}
+	}
+
+	// Per-transform backwards Horner fold over that transform's own gStep partials.
+	for (size_t t = 0; t < num_LT; ++t) {
+		std::shared_ptr<Ciphertext>* R = results.data() + t * gStep;
+		for (uint32_t j = gStep - 1; j < gStep; --j) {
+			if (j != gStep - 1) {
+				R[j]->add(*R[j + 1]);
+				R[j + 1].reset();
+			}
+
+			if (j > 0) {
+				if ((bStep * stride) % (cc.N / 2) != 0) {
+					if (R[j]->c1.isModUp()) {
+						if (ONLY_C1) {
+							R[j]->c1.moddown(true, false);
+						} else {
+							R[j]->modDown(false);
+						}
+					}
+					R[j]->rotate((int)bStep * stride, false);
+				}
+			} else if (offset != 0) {
+				if (R[j]->c1.isModUp()) {
+					if (ONLY_C1) {
+						R[j]->c1.moddown(true, false);
+					} else {
+						R[j]->modDown(false);
+					}
+				}
+				R[j]->rotate(offset);
+			} else {
+				if (R[j]->c1.isModUp())
+					R[j]->modDown(false);
+			}
+		}
+		out[t]->copy(*R[0]);
 	}
 }
 

@@ -8,7 +8,9 @@
 #include "GenCryptoContext.hpp"
 #include "KeyPair.hpp"
 #include "Plaintext.hpp"
+#include "PreparedLinearTransform.hpp"
 #include "PrivateKey.hpp"
 #include "PublicKey.hpp"
+#include "ConcurrentOps.hpp"
 
 #endif // API_FIDESLIB_HPP

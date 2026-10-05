@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,17 +34,17 @@ namespace fideslib {
 /// this engine: haze's API is polynomial-level (per-residue MRP ops). Ciphertext data is
 /// EVALUATION form, natural order, ordinary (non-Montgomery) representation, one hazeMalloc
 /// allocation per RNS limb.
-class HazeEngine final : public Engine {
+/// Not final: a subclass may observe the single flush by overriding recoverHostCiphertext,
+/// which is how out-of-tree tooling (a benchmark harness) reads replay timing without this
+/// class knowing anything about timing. Keep the protected members below available for that.
+class HazeEngine : public Engine {
   public:
 	/// @param reducedNoise  Use the centered (ReducedNoise) FBC variant, matching an OpenFHE
 	///                      reference built with WITH_REDUCED_NOISE — required for bit-exact parity.
-	/// @param montgomery    Record in the Montgomery hardware data format (selects the 4-op
-	///                      SwitchModulus FBC center shape). Only valid against a hardware/transport
-	///                      target; the local simulator rejects Montgomery-form traces.
-	/// Both default off so a bare HazeEngine matches the libhaze defaults; the facade selects them
-	/// from CCParams (SetReducedNoise / SetMontgomery) at GenCryptoContext.
-	explicit HazeEngine(bool reducedNoise = false, bool montgomery = false)
-		: reducedNoise_(reducedNoise), montgomery_(montgomery) {}
+	/// Defaults off so a bare HazeEngine matches the libhaze defaults; the facade selects it from
+	/// CCParams (SetReducedNoise) at GenCryptoContext. The hardware data format is not selectable
+	/// here — recordings are always ordinary-form and the replay target applies its own format.
+	explicit HazeEngine(bool reducedNoise = false) : reducedNoise_(reducedNoise) {}
 
 	const char* name() const override {
 		return "haze (FHETCH)";
@@ -64,6 +65,14 @@ class HazeEngine final : public Engine {
 	std::any cloneCiphertextBackend(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& src) override;
 	size_t ciphertextLevel(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct) override;
 	size_t ciphertextNoiseScaleDeg(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct) override;
+	double ciphertextScalingFactor(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct) override;
+	size_t ciphertextSlots(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct) override;
+	/// @brief Component count of the device payload — NOT the host shadow, which is stale for any
+	/// recorded value and would report 2 for a degree-2 result. The facade's degree-1 guard reads
+	/// this, so without the override the guard would be vacuous on this backend. Never flushes:
+	/// the component count of a Recorded payload is known without any readback.
+	size_t ciphertextNumElements(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct) override;
+	void refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextImpl<DCRTPoly>& ct) override;
 	void setCiphertextSlots(CryptoContextImpl<DCRTPoly>& ctx, CiphertextImpl<DCRTPoly>& ct, size_t slots) override;
 	void setCiphertextLevel(CryptoContextImpl<DCRTPoly>& ctx, CiphertextImpl<DCRTPoly>& ct, size_t level) override;
 
@@ -92,6 +101,13 @@ class HazeEngine final : public Engine {
 	// ---- Multiplication family + rescale ----
 	Ciphertext<DCRTPoly> evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
 	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Ciphertext<DCRTPoly>& ct2) override;
+	/// @brief Tensor product only — a 3-component (degree-2) result, no relin key required
+	/// (OpenFHE EvalMultNoRelin is EvalMult minus the keyswitch+fold tail).
+	Ciphertext<DCRTPoly> evalMultNoRelin(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) override;
+	/// @brief Keyswitch the third component back into (c0, c1). Metadata unchanged; a degree-1
+	/// input is OpenFHE's no-op (Clone + resize(2)).
+	Ciphertext<DCRTPoly> relinearize(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
+	void relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) override;
 	Ciphertext<DCRTPoly> evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
 	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
 	Ciphertext<DCRTPoly> evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
@@ -166,6 +182,13 @@ class HazeEngine final : public Engine {
 	void setDevices(const std::vector<int>& devices) override;
 	std::vector<int> devices() const override;
 
+	/// @brief Opt-in for harnesses that never read an uploaded input's host residues: drop them
+	/// right after upload instead of retaining them for the run's lifetime. Results are unaffected
+	/// -- their shared host shells keep metadata, only elements are cleared.
+	void setDropInputHostAfterUpload(bool drop) {
+		dropInputHostAfterUpload_ = drop;
+	}
+
 	~HazeEngine() override;
 
   private:
@@ -181,6 +204,11 @@ class HazeEngine final : public Engine {
 
 	/// @brief Ensure ct is device-resident (lazy load) and return its payload.
 	std::shared_ptr<hazebk::HazePayload> ensureCt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
+
+	/// @brief Guard for the ops that only make sense on a degree-1 ciphertext (rotation,
+	/// automorphism, square, Chebyshev, bootstrap, the mult tensor). The facade applies the same
+	/// guard, but bootstrap and the internal cores bypass it, so it is enforced here too.
+	void requireRelinearized(const hazebk::HazePayload& p, const char* op) const;
 
 	/// @brief Q-base prefix for the first `towers` limbs (the per-op MRP base argument).
 	std::vector<uint64_t> qPrefix(size_t towers) const;
@@ -209,10 +237,30 @@ class HazeEngine final : public Engine {
 	/// @brief Recorded per-residue pass-through copy of the leading `towers` limbs
 	/// (epoch.cpp copy_device_to_device) — for result components an op leaves unchanged.
 	hazebk::LimbChain passThroughChain(const hazebk::LimbChain& src, size_t towers);
+	/// @brief Result component vector of an op that touches c0 only (scalar / plaintext addition):
+	/// the computed c0 followed by a passThroughChain of every remaining component of `x`.
+	std::vector<hazebk::LimbChain> passThroughTail(hazebk::LimbChain c0, const Operand& x);
+	/// @brief Morph a plaintext into the SINGLE-component payload the adjust paths operate on (a
+	/// recorded pass-through copy of its chain). One component == "no c1", so the component loops
+	/// in the cores naturally skip it.
+	std::shared_ptr<hazebk::HazePayload> morphPlaintext(const hazebk::HazePtPayload& pt);
 
-	/// @brief INTT → ModDown (drop the last Q prime; centered lift + q_l^{-1}, matching
-	/// OpenFHE ModReduce exactly) → NTT on one chain (port of ops.cpp rescale_chain_one_tower).
+	/// @brief One-level rescale of one chain (OpenFHE ModReduce / the CUDA NTT_RESCALE path):
+	/// INTT ONLY the dropped trailing Q prime, then evalModDown lifts + NTTs it into the surviving
+	/// limbs' eval domain and applies the centered subtract + q_l^{-1} there. Bit-identical to the
+	/// prior INTT-all -> ModDown -> NTT-all chain.
 	hazebk::LimbChain rescaleChainOneTower(const hazebk::LimbChain& src, size_t srcTowers);
+	/// @brief Eval-domain mod-down shared by rescale and the keyswitch P-drop (OpenFHE
+	/// ApproxModDown / CUDA NTT_RESCALE+NTT_MODDOWN). The caller INTTs only the dropped
+	/// `rescaleBase` limbs (coeff, in `droppedCoeff`); `targetBase` survivors stay in eval
+	/// (`survivorsEval`). Returns, per surviving prime q, (survivorsEval[q] - NTT(lift)[q])
+	/// * (prod rescaleBase)^{-1} mod q in eval, lift = hazeBasisConvert(droppedCoeff -> targetBase)
+	/// under the configured FBC variant. Pointwise sub/scale commute with the NTT and the lift
+	/// matches hazeModDown's, so the result is byte-identical while only the dropped limbs are INTT'd.
+	hazebk::LimbChain evalModDown(const std::vector<const void*>& survivorsEval,
+	                              const hazebk::LimbChain& droppedCoeff,
+	                              const std::vector<uint64_t>& rescaleBase,
+	                              const std::vector<uint64_t>& targetBase);
 	/// @brief OpenFHE EvalMultCoreInPlace analog into a fresh payload: per-limb CRT scalar
 	/// multiply, NSD+1, sf ×= ScalingFactorReal[level]. No pre-rescale.
 	Operand multScalarCore(const Operand& x, double operand);
@@ -220,8 +268,12 @@ class HazeEngine final : public Engine {
 	/// rescale both chains, towers−1, NSD−1 (guard ≥1), sf ÷= ModReduceFactor[oldTowers−1].
 	Operand rescaleCore(const Operand& x);
 	/// @brief Exact EvalNegate into a fresh payload: per-limb scalar q_i − 1; metadata
-	/// unchanged (do not copy CUDA's multScalar(-1.0), which bumps NSD).
+	/// unchanged (do not copy CUDA's multScalar(-1.0), which bumps NSD). Every component is
+	/// negated (OpenFHE loops over all elements).
 	Operand negateCore(const Operand& x);
+	/// @brief The per-limb q_i − 1 sign flip of ONE chain — negateCore's loop body, shared with
+	/// the EvalSub tail rule (unmatched subtrahend components are negated, not copied).
+	hazebk::LimbChain negateChain(const hazebk::LimbChain& src, size_t towers);
 	/// @brief OpenFHE AdjustLevelsAndDepthInPlace port (all AUTO modes share one
 	/// implementation; compositeDegree == 1): equalize (level, NSD) of the two views via
 	/// recorded compute + view truncation. FIXEDMANUAL: level-align by truncation only.
@@ -252,10 +304,11 @@ class HazeEngine final : public Engine {
 	/// @brief Materialize a view as a payload: if the view truncates its payload, record
 	/// nothing — build the result payload that owns fresh chains is the OPS' job; this
 	/// simply packages computed chains + view metadata into a fresh Recorded payload.
-	std::shared_ptr<hazebk::HazePayload> finishPayload(hazebk::LimbChain c0, hazebk::LimbChain c1, const Operand& meta) const;
+	std::shared_ptr<hazebk::HazePayload> finishPayload(std::vector<hazebk::LimbChain> comps, const Operand& meta) const;
 	/// @brief Rebind an existing payload's contents to a computed result (facade "InPlace"
-	/// semantics: fresh chains per op result; the old chains are freed).
-	void rebindPayload(hazebk::HazePayload& dst, hazebk::LimbChain c0, hazebk::LimbChain c1, const Operand& meta) const;
+	/// semantics: fresh chains per op result; the old chains are freed). The component
+	/// count comes from `comps`, so an in-place Relinearize legitimately shrinks 3 -> 2.
+	void rebindPayload(hazebk::HazePayload& dst, std::vector<hazebk::LimbChain> comps, const Operand& meta) const;
 	/// @brief Ensure the plaintext is device-resident and return its payload.
 	std::shared_ptr<hazebk::HazePtPayload> ensurePt(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt);
 
@@ -311,6 +364,18 @@ class HazeEngine final : public Engine {
 	/// @brief OpenFHE AdjustLevelsAndDepthToOneInPlace: adjustForAddOrSub, then rescale both
 	/// to NSD 1 when needed, so both enter the tensor product at depth 1.
 	void adjustForMult(Operand& a, Operand& b);
+	/// @brief OpenFHE EvalMultNoRelin: adjustForMult then the tensor product
+	/// (d0 = a0·b0, d1 = a0·b1 + a1·b0, d2 = a1·b1) into a 3-component payload, NSD = a+b,
+	/// sf = a·b, slots = max. No relin key is needed here — that is relinearizeCore's business.
+	Operand multNoRelinCore(Operand a, Operand b, const char* op);
+	/// @brief OpenFHE RelinearizeInPlace: keyswitch the third component against the relin key and
+	/// fold it into (c0, c1); ALL metadata is unchanged. A degree-1 input is returned as-is (the
+	/// OpenFHE no-op); more than 3 components throws, since only one relin key exists.
+	Operand relinearizeCore(const Operand& x);
+	/// @brief OpenFHE EvalAdd/EvalSubCoreInPlace: elementwise over the common components, with the
+	/// larger operand's tail copied (add) or negated when it comes from the subtrahend (sub).
+	/// Result component count = max(a, b).
+	Operand addSubCore(Operand a, Operand b, bool subtract);
 	/// @brief Rotation (ops.cpp rotate): hybridKeyswitch(c1) against the step's
 	/// automorphism key, c0' = c0 + ks.b / c1' = ks.a, then AutomorphMrp BOTH (keyswitch
 	/// first, automorphism last — OpenFHE EvalAtIndex order). Metadata unchanged. Steps
@@ -406,6 +471,14 @@ class HazeEngine final : public Engine {
 	/// @brief Integer scalar multiply (OpenFHE MultByIntegerInPlace): scalar mod q_i per
 	/// limb, metadata unchanged.
 	Operand multIntCore(const Operand& x, uint64_t scalar);
+	/// @brief Multiply both components by the bare monomial X^power (OpenFHE
+	/// MultByMonomialInPlace / CUDA Ciphertext::multMonomial) in R_q = Z_q[X]/(X^N+1).
+	/// Implemented with the coefficient-domain primitive hazeRotAutomorphCoeffMrp (mult by
+	/// X^{-offset}) plus an optional per-limb negate, mapping X^power onto X^{-offset} with the
+	/// X^N=-1 wraparound sign handled explicitly (see the .cpp for the offset/sign derivation).
+	/// Records a single op on the existing ciphertext — no synthetic monomial input. Metadata
+	/// unchanged (a literal monomial, not a CKKS-encoded plaintext — NSD/sf/level preserved).
+	Operand multByMonomialCore(const Operand& x, uint32_t power);
 	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
 	/// of OpenFHE EvalLinearTransform).
 	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);
@@ -422,6 +495,37 @@ class HazeEngine final : public Engine {
 	/// @brief Multi-stage FFT CoeffsToSlots / SlotsToCoeffs driver (levelBudget != {1,1}),
 	/// iterating the per-stage LTstep vectors (CoeffsToSlots.cu:75-151). decode=false → CtS.
 	Ciphertext<DCRTPoly> evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, uint32_t slots, bool decode);
+
+	// ---- Extended-basis (Q∥P) BSGS for the bootstrap linear transforms ----
+	/// @brief P mod q_i for the first `towers` Q primes (OpenFHE cryptoParams->GetPModq();
+	/// the KeySwitchExt / addFirst raise factor).
+	std::vector<uint64_t> pModqPrefix(size_t towers) const;
+	/// @brief OpenFHE KeySwitchDown of ONE extended component (keyswitch-hybrid.cpp:246):
+	/// `ext` holds `towers` Q rows followed by |P| special rows, EVAL form; INTT only the |P|
+	/// tail rows and evalModDown them into the Q survivors — the identical mod-down math (and
+	/// centered-FBC shape) as hybridKeyswitchFromDigits' ext=false tail, factored for reuse.
+	hazebk::LimbChain extModDownChain(const hazebk::LimbChain& ext, size_t towers);
+	/// @brief ONE extended-basis BSGS linear-transform stage, the OpenFHE
+	/// EvalCoeffsToSlots / EvalSlotsToCoeffs / EvalLinearTransform hoisted Horner inner loop
+	/// (ckksrns-fhe.cpp:1918-2186): baby-step rotations via EvalFastRotationExt (per-key dot
+	/// product only, NO per-baby ModDown), plaintext multiply + accumulation in Q∥P, and a
+	/// SINGLE constant giant stride applied to the accumulator between blocks
+	/// (EvalHornerGiantRotate: KeySwitchDown, ModUp of the a part, ext keyswitch, addFirst
+	/// c0·PModq fold, automorph both), plus one final KeySwitchDown. rotIn has g entries
+	/// (rotIn[0] = 0 = identity); numBlocks = b giant blocks are consumed from the TOP
+	/// (i = b-1) downward; term k = g*i + j is included iff k < pts.size(), and the top
+	/// block additionally skips k == numRotSkip (OpenFHE's (Gtop+j) != numRotations guard).
+	/// giantStride 0 disables the accumulator rotation. Returns nullopt when the ext
+	/// preconditions do not hold (non-extended pt encoding, depth != 1, or the
+	/// FIDESLIB_HAZE_BOOT_NO_EXT kill switch) — the caller falls back to the plain-rotation
+	/// path unchanged.
+	std::optional<Operand> extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
+	  const Operand& x,
+	  const std::vector<Plaintext>& pts,
+	  const std::vector<int32_t>& rotIn,
+	  int32_t giantStride,
+	  uint32_t numBlocks,
+	  uint32_t numRotSkip);
 
 	// ---- Chebyshev Paterson-Stockmeyer cores (parity #12-#15; CUDA src/CKKS/ApproxModEval.cu
 	// + Ciphertext.cpp evalLinearWSumMutable are the spec). ----
@@ -457,10 +561,17 @@ class HazeEngine final : public Engine {
 	  const Ciphertext<DCRTPoly>& ct,
 	  std::vector<double>& coeffs,
 	  double a, double b);
+	/// @brief FIXEDMANUAL-only level drop on a live Ciphertext (CUDA dropToLevel / OpenFHE
+	/// LevelReduceInPlace analog): pure tower-count truncation, no IR emitted, no new limb
+	/// chains computed. No-op if ct is already at or below targetTowers.
+	void dropCiphertextToTowers(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, size_t targetTowers);
+	/// @brief Current tower count of a live Ciphertext, per Haze's device-side payload.
+	size_t towersOf(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct);
 
 	// ---- FBC mode (constructor-selected, forwarded to libhaze at bring-up) ----
 	bool reducedNoise_ = false;
-	bool montgomery_   = false;
+	/// @brief See setDropInputHostAfterUpload.
+	bool dropInputHostAfterUpload_ = false;
 
 	// ---- context state ----
 	bool loaded_	  = false;
@@ -475,11 +586,16 @@ class HazeEngine final : public Engine {
 	std::vector<double> sfReal_, sfRealBig_, modReduceFactor_;
 	/// @brief Outputs declared via markOutput (weak: a dropped ciphertext is not an output).
 	std::vector<std::weak_ptr<hazebk::HazePayload>> outputs_;
+  protected:
+	// Visible to subclasses so one can tell whether a readback is the flush and where that
+	// flush wrote. Nothing else about the program state is exposed.
+
 	/// @brief The in-flight program has executed (its single flush happened).
 	bool executed_ = false;
 	/// @brief Program directory of this context (cleaned up at teardown unless kept).
 	std::string programDir_;
 
+  private:
 	/// @brief haze configuration is process-global: one loaded haze context per process.
 	static inline std::atomic<int> liveEngines_{ 0 };
 };

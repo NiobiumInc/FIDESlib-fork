@@ -2,13 +2,16 @@
 // Created by carlosad on 25/04/24.
 //
 #include <errno.h>
+#include "CudaUtils.cuh"
 
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
 
+#include <memory>
 #include <omp.h>
 #include <stdexcept>
+#include <string>
 
 #include "../parallel_for.hpp"
 
@@ -56,7 +59,19 @@ void RNSPoly::grow(int new_level, bool single_malloc, bool constant) {
 	}
 }
 
-RNSPoly::RNSPoly(ContextData& context, int level, bool single_malloc, bool def_stream) : uid(next_uid++), cc(context), level(-1) {
+void RNSPoly::growArena(const int new_level) {
+	if (level != -1)
+		throw std::logic_error("FIDESlib: growArena needs a freshly constructed polynomial (level -1)");
+	level = new_level;
+	for (size_t i = 0; i < cc.GPUid.size(); ++i) {
+		const int n = GPU.at(i).getLimbSize(new_level);
+		if (n > 0)
+			GPU.at(i).generateLimbArena(n);
+	}
+}
+
+RNSPoly::RNSPoly(ContextData& context, int level, bool single_malloc, bool def_stream)
+	: uid(next_uid++), cc(context), level(-1) {
 
 	// #pragma omp parallel for num_threads(context.GPUid.size())
 	for (size_t i = 0u; i < context.GPUid.size(); ++i) {
@@ -67,7 +82,8 @@ RNSPoly::RNSPoly(ContextData& context, int level, bool single_malloc, bool def_s
 	grow(level, single_malloc);
 }
 
-RNSPoly::RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data) : RNSPoly(context, data.size() - 1) {
+RNSPoly::RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data)
+	: RNSPoly(context, data.size() - 1) {
 
 	assert(data.size() <= cc.prime.size());
 	std::vector<uint64_t> moduli(data.size());
@@ -76,7 +92,8 @@ RNSPoly::RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>&
 	load(data, moduli);
 }
 
-RNSPoly::RNSPoly(RNSPoly&& src) noexcept : uid(src.uid), cc(src.cc), level(src.level), modUp(src.modUp), GPU(std::move(src.GPU)) {
+RNSPoly::RNSPoly(RNSPoly&& src) noexcept
+	: uid(src.uid), cc(src.cc), level(src.level), modUp(src.modUp), GPU(std::move(src.GPU)), aux_slot(src.aux_slot) {
 	for (auto& g : GPU) {
 		g.level = &(this->level);
 	}
@@ -120,8 +137,9 @@ void RNSPoly::generateSpecialLimbs(const bool zero_out, const bool for_communica
 			for (uint32_t g = 0; g < cc.splitSpecialMeta[j].size(); ++g) {
 				for (uint32_t i = 0; i < cc.specialMeta[j].size(); ++i) {
 					if (cc.specialMeta[0][i].id == cc.splitSpecialMeta[j][g].id) {
-						cpu_ptr[i] = GPU[j].SPECIALlimb[i].index() == U32 ? (void*)std::get<U32>(GPU[j].SPECIALlimb[i]).v.data :
-																			(void*)std::get<U64>(GPU[j].SPECIALlimb[i]).v.data;
+						cpu_ptr[i] = GPU[j].SPECIALlimb[i].index() == U32 ?
+							(void*)std::get<U32>(GPU[j].SPECIALlimb[i]).v.data :
+							(void*)std::get<U64>(GPU[j].SPECIALlimb[i]).v.data;
 					}
 				}
 			}
@@ -133,7 +151,7 @@ void RNSPoly::generateSpecialLimbs(const bool zero_out, const bool for_communica
 				// std::cout << GPU[g].DECOMPlimbptr[i].data << " " << cpu_ptr.data() << " " << GPU[g].DECOMPmeta.at(i).size() * sizeof(void*) << " "
 				//		  << cudaMemcpyHostToDevice << " " << GPU[g].s.ptr() << std::endl;
 				cudaSetDevice(cc.GPUid[g]);
-				cudaMemcpyAsync(GPU[g].SPECIALlimbptr.data, cpu_ptr.data(), GPU[g].SPECIALmeta.size() * sizeof(void*), cudaMemcpyHostToDevice, GPU[g].s.ptr());
+				UploadH2D(GPU[g].SPECIALlimbptr.data, cpu_ptr.data(), GPU[g].SPECIALmeta.size() * sizeof(void*), GPU[g].device, GPU[g].s.ptr());
 				CudaCheckErrorMod;
 			}
 		}
@@ -159,8 +177,9 @@ void RNSPoly::generateDecompAndDigit(bool iskey) {
 				for (size_t g = 0; g < cc.meta.size(); ++g) {
 					for (auto& m : cc.meta[g]) {
 						if (m.id == cc.decompMeta[0][i][j].id) {
-							cpu_ptr[j] = GPU[g].DECOMPlimb[i][j].index() == U32 ? (void*)std::get<U32>(GPU[g].DECOMPlimb[i][j]).v.data :
-																				  (void*)std::get<U64>(GPU[g].DECOMPlimb[i][j]).v.data;
+							cpu_ptr[j] = GPU[g].DECOMPlimb[i][j].index() == U32 ?
+								(void*)std::get<U32>(GPU[g].DECOMPlimb[i][j]).v.data :
+								(void*)std::get<U64>(GPU[g].DECOMPlimb[i][j]).v.data;
 						}
 					}
 				}
@@ -173,7 +192,11 @@ void RNSPoly::generateDecompAndDigit(bool iskey) {
 					//		  << cudaMemcpyHostToDevice << " " << GPU[g].s.ptr() << std::endl;
 					cudaSetDevice(cc.GPUid[g]);
 					cudaMemcpyAsync(
-					  GPU[g].DECOMPlimbptr[i].data, cpu_ptr.data(), GPU[g].DECOMPmeta.at(i).size() * sizeof(void*), cudaMemcpyHostToDevice, GPU[g].s.ptr());
+						GPU[g].DECOMPlimbptr[i].data,
+						cpu_ptr.data(),
+						GPU[g].DECOMPmeta.at(i).size() * sizeof(void*),
+						cudaMemcpyHostToDevice,
+						GPU[g].s.ptr());
 					CudaCheckErrorMod;
 				}
 			}
@@ -272,16 +295,20 @@ void RNSPoly::sub(const RNSPoly& p) {
 }
 
 void RNSPoly::modup() {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kModup);
 	//  assert(GPU.size() == 1 || 0 == "ModUp Multi-GPU not implemented.");
 	RNSPoly& aux = cc.getKeySwitchAux2();
 
-	generateDecompAndDigit(false);
-	aux.generateDecompAndDigit(false);
+	{
+		ConcurrentOpsDiagScope diag_alloc(ConcurrentOpsDiag::kModupAlloc); // DIAG sub-kind: scratch allocation
+		generateDecompAndDigit(false);
+		aux.generateDecompAndDigit(false);
+	}
 
 	std::vector<std::atomic_uint64_t> thread_stop_buffer(cc.GPUid.size() * 8);
 	std::vector<std::atomic_uint64_t*> thread_stop(cc.GPUid.size(), nullptr);
 	for (uint32_t k = 0; k < cc.GPUid.size(); ++k) {
-		thread_stop[k]			  = &thread_stop_buffer[8 * k];
+		thread_stop[k]            = &thread_stop_buffer[8 * k];
 		thread_stop_buffer[8 * k] = 0;
 	}
 
@@ -322,6 +349,7 @@ void RNSPoly::sync() {
 }
 
 void RNSPoly::rescale() {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kRescale);
 	//    assert(GPU.size() == 1 && "Rescale Multi-GPU not implemented.");
 	if (GPU.size() == 1) {
 		for (auto& i : GPU) {
@@ -356,6 +384,10 @@ void RNSPoly::rescale() {
 }
 
 void RNSPoly::rescaleDouble(RNSPoly& poly) {
+	// DIAG (2026-10-03): the SAME scope RNSPoly::rescale() carries. Ciphertext::rescale routes to this
+	// function (RESCALE_DOUBLE = true), so every "DIAG=rescale" sweep of the hunt serialized a path the
+	// bootstrap never takes and left this one, the one it does take, unlocked. Measuring nothing.
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kRescale);
 	//    assert(GPU.size() == 1 && "Rescale Multi-GPU not implemented.");
 	if (0 && GPU.size() == 1) {
 		for (auto& i : GPU) {
@@ -408,8 +440,8 @@ void RNSPoly::rescaleDouble(RNSPoly& poly) {
 					GPU[i].doubleRescaleMGPU(poly.GPU[i]);
 				}
 			}
-			level -= 1;
-			poly.level -= 1;
+			level -= 1 + (level == cc.L + 1 && cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT);
+			poly.level -= 1 + (poly.level == cc.L + 1 && cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT);
 		}
 	}
 }
@@ -573,6 +605,7 @@ void RNSPoly::rotateModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey&
 }
 
 template <ALGO algo> void RNSPoly::moddown(bool ntt, bool free, int aux_num) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kModdown);
 	if (!this->isModUp()) {
 		std::cout << "RNSPoly calling MOdDown on non-modup polynomial." << std::endl;
 	}
@@ -642,6 +675,7 @@ void RNSPoly::automorph(const int idx, const int br, RNSPoly* src) {
 }
 
 RNSPoly& RNSPoly::dotKSKInPlace(const KeySwitchingKey& ksk, RNSPoly* limb_src) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kKsk);
 	constexpr bool PRINT = false;
 	Out(KEYSWITCH, "dotKSK in");
 
@@ -688,6 +722,7 @@ RNSPoly& RNSPoly::dotKSKInPlace(const KeySwitchingKey& ksk, RNSPoly* limb_src) {
 
 /*
 void RNSPoly::dotKSKInPlace(const RNSPoly& ksk_b, int level) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kKsk);
 #pragma omp parallel for num_threads(cc.GPUid.size())
 	for (size_t i = 0; i < cc.GPUid.size(); ++i) {
 		assert(omp_get_num_threads() == (int)cc.GPUid.size());
@@ -697,17 +732,21 @@ void RNSPoly::dotKSKInPlace(const RNSPoly& ksk_b, int level) {
 */
 
 void RNSPoly::setLevel(const int level) {
-	assert(level >= -1 && level <= cc.L);
+	assert(level >= -1 && (MODRAISE_WITH_P0 ? level <= cc.L + 1 : level <= cc.L));
 	this->level = level;
 }
 
 void RNSPoly::modupInto(RNSPoly& poly) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kModup);
 	assert(level == poly.level);
 	auto& aux = cc.getKeySwitchAux2();
 	aux.setLevel(level);
 
 	if (GPU.size() > 1 || true) {
-		poly.copy(*this);
+		{
+			ConcurrentOpsDiagScope diag_copy(ConcurrentOpsDiag::kModupCopy); // DIAG sub-kind: the copy into the scratch
+			poly.copy(*this);
+		}
 		poly.modup();
 	} else {
 #pragma omp parallel for num_threads(cc.GPUid.size())
@@ -719,6 +758,7 @@ void RNSPoly::modupInto(RNSPoly& poly) {
 }
 
 RNSPoly& RNSPoly::dotKSKInPlaceFrom(RNSPoly& poly, const KeySwitchingKey& ksk, const RNSPoly* limbsrc) {
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kKsk);
 	constexpr bool PRINT = false;
 	Out(KEYSWITCH, "dotKSK in");
 
@@ -816,6 +856,16 @@ void RNSPoly::copy(const RNSPoly& poly) {
 	this->SetModUp(poly.isModUp());
 }
 
+void RNSPoly::shapeLike(const RNSPoly& poly) {
+	// Same resize path as copy() above, minus the per-partition copyLimb/copySpecialLimb transfers.
+	// Special (mod-up) limbs are deliberately not handled: no out-of-place caller needs them, and
+	// silently skipping them would be worse than refusing.
+	assert(!poly.isModUp());
+	this->dropToLevel(poly.level);
+	this->grow(poly.level);
+	this->SetModUp(false);
+}
+
 /** Copy contents without extra checks or resizing */
 void RNSPoly::copyShallow(const RNSPoly& poly) {
 	this->level = poly.level;
@@ -824,6 +874,18 @@ void RNSPoly::copyShallow(const RNSPoly& poly) {
 		assert(omp_get_num_threads() == (int)cc.GPUid.size());
 		GPU.at(i).copyLimb(poly.GPU.at(i));
 	}
+}
+
+void RNSPoly::aliasPrefixOf(const RNSPoly& src, const int new_level) {
+	if (level != -1)
+		throw std::logic_error("FIDESlib: aliasPrefixOf needs a freshly constructed polynomial");
+	if (new_level < 0 || new_level > src.level)
+		throw std::logic_error("FIDESlib: aliasPrefixOf level " + std::to_string(new_level) + " is outside its source's 0.." + std::to_string(src.level));
+	// The partitions size their view from *level, which points here.
+	level = new_level;
+	for (size_t i = 0; i < GPU.size(); ++i)
+		GPU.at(i).aliasLimbsOf(src.GPU.at(i));
+	SetModUp(src.isModUp());
 }
 
 void RNSPoly::dropToLevel(int level) {
@@ -883,6 +945,8 @@ void RNSPoly::load(const std::vector<std::vector<uint64_t>>& data, const std::ve
 			SWITCH(j.SPECIALlimb[i - limbsize], load_convert(data[i]));
 		}
 	}
+	if (Slimbsize == 1)
+		this->setLevel(level + 1);
 }
 
 void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const std::vector<uint64_t>& moduli) {
@@ -922,6 +986,118 @@ void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const
 				}
 			}
 		}
+	}
+}
+
+void RNSPoly::loadCoefficients(const std::vector<uint64_t>& biased, const std::vector<uint64_t>& moduli, const uint64_t bigBound) {
+	const int limbsize = (int)moduli.size();
+
+	// Preconditions are hard errors, never silent fallbacks: this path produces limbs that nothing
+	// downstream re-checks, so a wrong basis or a stale bias constant would surface only as a
+	// decryption that is quietly garbage.
+	if (limbsize <= 0 || limbsize > cc.L + 1) {
+		throw std::invalid_argument("RNSPoly::loadCoefficients: expected 1.." + std::to_string(cc.L + 1) + " Q moduli, got " + std::to_string(limbsize));
+	}
+	if (biased.size() != (size_t)cc.N) {
+		throw std::invalid_argument("RNSPoly::loadCoefficients: expected exactly N=" + std::to_string(cc.N) + " coefficients, got " + std::to_string(biased.size()) +
+		  " (the caller must expand a sparse encoding to full length before uploading)");
+	}
+	if (bigBound == 0) {
+		throw std::invalid_argument("RNSPoly::loadCoefficients: bigBound must be the encoder's bias constant, not 0");
+	}
+	for (int i = 0; i < limbsize; ++i) {
+		if (moduli[i] != cc.prime.at(i).p) {
+			throw std::invalid_argument("RNSPoly::loadCoefficients: modulus " + std::to_string(i) + " is not this context's Q prime at that tower (device encode is Q-basis only; " +
+			  "an extended Q||P plaintext must go through loadConstant)");
+		}
+	}
+
+	// A FRESH polynomial only, and grown NON-constant. Both halves of that matter:
+	//
+	// loadConstant grows with constant = true, which routes through
+	// LimbPartition::generateLimbConstant and deliberately passes no auxptr — a plaintext arrives
+	// already in EVALUATION form, so nothing in this library has ever needed to transform one, and
+	// the NTT scratch (Limb::aux, N words per limb) is simply not allocated. This path DOES
+	// transform, so it must have that scratch: ApplyNTT writes stage one into auxptr and reads
+	// stage two back out of it, and on a constant partition auxptr is empty.
+	//
+	// The scratch is TRANSIENT, not part of the finished plaintext: it is released at the end of
+	// this function, once the NTT is fenced, so what the caller ends up holding is v alone —
+	// byte for byte a loadConstant plaintext's footprint. (It used to be held for the plaintext's
+	// whole lifetime, doubling the device memory of every device-encoded diagonal, because
+	// VectorGPU::free was not idempotent: it left `managed` set, so an early release meant Limb's
+	// destructor freed a second time — an assert in a debug build and a double free in a release
+	// one. VectorGPU::free now returns early when the vector is already freed, which makes "release
+	// early, let the destructor mop up" the intended pattern rather than a hazard.)
+	//
+	// Requiring level == -1 is what makes the scratch precondition structural rather than a
+	// comment: it is the state a just-constructed Plaintext is in, and it forecloses being handed
+	// a polynomial that some other path already grew constant.
+	if (level != -1) {
+		throw std::invalid_argument("RNSPoly::loadCoefficients: expected a freshly constructed polynomial (level -1), got level " + std::to_string(level) +
+		  "; device encode allocates its own NTT scratch and cannot adopt a constant-grown polynomial");
+	}
+	grow(limbsize - 1, false, false);
+	assert(level == limbsize - 1);
+
+	const uint64_t bigValueHf = bigBound >> 1;
+
+	// ONE upload per device: every limb on that device reduces the same N coefficients. This is the
+	// entire point of the arm — loadConstant moves L*N words, this moves N.
+	std::vector<std::unique_ptr<VectorGPU<uint64_t>>> staging(GPU.size());
+	for (int i = 0; i < limbsize; ++i) {
+		const int g = cc.limbGPUid[i].x;
+		if (!staging[g]) {
+			cudaSetDevice(GPU[g].device);
+			staging[g] = std::make_unique<VectorGPU<uint64_t>>(GPU[g].s, cc.N, GPU[g].device, biased.data());
+		}
+	}
+
+	for (int i = 0; i < limbsize; ++i) {
+		const int g		 = cc.limbGPUid[i].x;
+		auto& l			 = GPU[g].limb[cc.limbGPUid[i].y];
+		cudaSetDevice(GPU[g].device);
+		// The upload was enqueued on the partition stream; the limb's own stream must not run ahead of it.
+		STREAM(l).wait(GPU[g].s);
+		SWITCH(l, loadCoefficients(staging[g]->data, bigValueHf, bigBound - moduli[i]));
+	}
+
+	// NTT(sync=true) fences only STREAM(limb[i]) for i stepping by `batch`, and then launches the
+	// whole batch on that one stream — so the per-limb kernels above must be visible to it through
+	// the partition stream, not merely enqueued on their own limb streams.
+	for (int i = 0; i < limbsize; ++i) {
+		const int g = cc.limbGPUid[i].x;
+		cudaSetDevice(GPU[g].device);
+		GPU[g].s.wait(STREAM(GPU[g].limb[cc.limbGPUid[i].y]));
+	}
+
+	// COEFFICIENT -> EVALUATION, leaving exactly what OpenFHE's Encode (which ends in
+	// SetFormat(Format::EVALUATION)) would have handed loadConstant.
+	this->NTT<ALGO_SHOUP>(cc.batch, true);
+
+	// Safe here and only here: NTT(sync=true) closed with s.wait(limb streams), so the pool's
+	// stream-ordered free cannot be reordered ahead of the kernels that read the staging buffer.
+	for (size_t g = 0; g < GPU.size(); ++g) {
+		if (staging[g]) {
+			cudaSetDevice(GPU[g].device);
+			staging[g]->free(GPU[g].s);
+		}
+	}
+
+	// And the NTT scratch, on exactly the same fence and for exactly the same reason: the transform
+	// that needed it has completed, and this polynomial is a PLAINTEXT — an operand, never a
+	// destination, and never transformed again by anything in this library. That is not an
+	// assumption this path introduces: a loadConstant plaintext is grown with no scratch at all and
+	// with its scratch pointer table left unwritten, so the invariant is already load-bearing, and
+	// more strictly than here. Releasing makes the two encoders produce identically shaped
+	// plaintexts, which is the point — device residency can then be sized against one figure.
+	freeNTTScratch();
+}
+
+void RNSPoly::freeNTTScratch() {
+	for (size_t g = 0; g < GPU.size(); ++g) {
+		cudaSetDevice(GPU[g].device);
+		GPU[g].freeNTTScratch();
 	}
 }
 
@@ -974,7 +1150,8 @@ void RNSPoly::generatePartialSpecialLimbs() {
 }
 
 void RNSPoly::dotKSKfused(RNSPoly& out2, const RNSPoly& digitSrc, const RNSPoly& ksk_a, const RNSPoly& ksk_b, const RNSPoly* source) {
-	RNSPoly& out1	   = *this;
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kKsk);
+	RNSPoly& out1      = *this;
 	const RNSPoly& src = source ? *source : *this;
 	if (cc.GPUid.size() == 1) {
 		for (size_t i = 0; i < cc.GPUid.size(); ++i) {
@@ -989,7 +1166,11 @@ void RNSPoly::dotKSKfused(RNSPoly& out2, const RNSPoly& digitSrc, const RNSPoly&
 	}
 }
 
-void RNSPoly::dotProductPt(RNSPoly& c1_, const std::vector<const RNSPoly*>& c0s_, const std::vector<const RNSPoly*>& c1s_, const std::vector<const RNSPoly*>& pts_, const bool ext) {
+void RNSPoly::dotProductPt(RNSPoly& c1_,
+                           const std::vector<const RNSPoly*>& c0s_,
+                           const std::vector<const RNSPoly*>& c1s_,
+                           const std::vector<const RNSPoly*>& pts_,
+                           const bool ext) {
 
 	if (ext) {
 		generateSpecialLimbs(false, false);
@@ -1012,14 +1193,14 @@ void RNSPoly::dotProductPt(RNSPoly& c1_, const std::vector<const RNSPoly*>& c0s_
 }
 
 RNSPoly& RNSPoly::dotProduct(RNSPoly& c1,
-  const RNSPoly& kskb,
-  const RNSPoly& kska,
-  const std::vector<const RNSPoly*>& c0in,
-  const std::vector<const RNSPoly*>& c1in,
-  const std::vector<const RNSPoly*>& d0in,
-  const std::vector<const RNSPoly*>& d1in,
-  bool ext_in,
-  bool ext_out) {
+                             const RNSPoly& kskb,
+                             const RNSPoly& kska,
+                             const std::vector<const RNSPoly*>& c0in,
+                             const std::vector<const RNSPoly*>& c1in,
+                             const std::vector<const RNSPoly*>& d0in,
+                             const std::vector<const RNSPoly*>& d1in,
+                             bool ext_in,
+                             bool ext_out) {
 
 	auto& c2 = cc.getKeySwitchAux();
 
@@ -1051,12 +1232,12 @@ RNSPoly& RNSPoly::dotProduct(RNSPoly& c1,
 }
 
 void RNSPoly::hoistedRotationFused(std::vector<int> indexes,
-  std::vector<RNSPoly*>& c0,
-  std::vector<RNSPoly*>& c1,
-  const std::vector<RNSPoly*>& ksk_a,
-  const std::vector<RNSPoly*>& ksk_b,
-  const RNSPoly& src_c0,
-  const RNSPoly& src_c1) {
+                                   std::vector<RNSPoly*>& c0,
+                                   std::vector<RNSPoly*>& c1,
+                                   const std::vector<RNSPoly*>& ksk_a,
+                                   const std::vector<RNSPoly*>& ksk_b,
+                                   const RNSPoly& src_c0,
+                                   const RNSPoly& src_c1) {
 	uint32_t n = indexes.size();
 	for (uint32_t j = 0; j < n; ++j) {
 		c0[j]->generateSpecialLimbs(false, false);
@@ -1070,8 +1251,8 @@ void RNSPoly::hoistedRotationFused(std::vector<int> indexes,
 		assert(omp_get_num_threads() == (int)cc.GPUid.size());
 		std::vector<LimbPartition*> c0s(n, nullptr), c1s(n, nullptr), ksk_as(n, nullptr), ksk_bs(n, nullptr);
 		for (uint32_t i = 0; i < n; ++i) {
-			c0s[i]	  = &(c0[i]->GPU[j]);
-			c1s[i]	  = &(c1[i]->GPU[j]);
+			c0s[i]    = &(c0[i]->GPU[j]);
+			c1s[i]    = &(c1[i]->GPU[j]);
 			ksk_as[i] = &(ksk_a[i]->GPU[j]);
 			ksk_bs[i] = &(ksk_b[i]->GPU[j]);
 		}
@@ -1095,6 +1276,12 @@ void RNSPoly::generateGatherLimbs() {
 */
 
 RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool moddown) {
+	// DIAGNOSTIC SCOPE (FIDESLIB_CONCURRENT_OPS_DIAG=ksk): this fused key switch is what every
+	// rotation, relinearisation and conjugation in a bootstrap actually runs, and until 2026-09-21 no
+	// diag scope covered it -- the sub-step sweeps (lt, modraise, evalmod, keyswitch, ...) serialized
+	// their callers but never this body, so "only the whole-boot lock closes it" could not tell a
+	// defect in here from one between sub-steps. One cached-bool read when the diag is unset.
+	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kKsk);
 	RNSPoly& aux = cc.getKeySwitchAux2();
 	aux.setLevel(level);
 	RNSPoly& aux_limbs1 = cc.getModdownAux(0);
@@ -1139,7 +1326,7 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
 	std::vector<std::atomic_uint64_t> thread_stop_buffer(cc.GPUid.size() * 8);
 	std::vector<std::atomic_uint64_t*> thread_stop(cc.GPUid.size(), nullptr);
 	for (uint32_t k = 0; k < cc.GPUid.size(); ++k) {
-		thread_stop[k]			  = &thread_stop_buffer[8 * k];
+		thread_stop[k]            = &thread_stop_buffer[8 * k];
 		thread_stop_buffer[8 * k] = 0;
 	}
 
@@ -1168,22 +1355,49 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
 				assert(omp_get_num_threads() == (int)GPU.size());
 				assert(static_cast<size_t>(j) < GPU.size());
 				GPU[j].modup_ksk_moddown_mgpu(
-				  aux.GPU[j], key.a.GPU[j], key.b.GPU[j], aux_limbs1.GPU[j], aux_limbs2.GPU[j], moddown, bufferGather, bufferSpecial_c0, bufferSpecial_c1, external_s, signals, thread_stop, external_s0);
+					aux.GPU[j],
+					key.a.GPU[j],
+					key.b.GPU[j],
+					aux_limbs1.GPU[j],
+					aux_limbs2.GPU[j],
+					moddown,
+					bufferGather,
+					bufferSpecial_c0,
+					bufferSpecial_c1,
+					external_s,
+					signals,
+					thread_stop,
+					external_s0);
 			}
 		} else {
 
 			// #pragma omp parallel num_threads(GPU.size())
 			//{
-			parallel_for(0, cc.GPUid.size(), 1, [&](int j) {
-				// for (int j = 0; j < cc.GPUid.size(); ++j) {
-				// int j = omp_get_thread_num();
-				// if (omp_get_num_threads() != (int)GPU.size())
-				//     throw std::invalid_argument("OMP didn't create enough threads");
-				// assert(omp_get_num_threads() == (int)GPU.size());
-				// assert(j < GPU.size());
-				GPU[j].modup_ksk_moddown_mgpu(
-				  aux.GPU[j], key.a.GPU[j], key.b.GPU[j], aux_limbs1.GPU[j], aux_limbs2.GPU[j], moddown, bufferGather, bufferSpecial_c0, bufferSpecial_c1, external_s, signals, thread_stop, external_s0);
-			});
+			parallel_for(0,
+			             cc.GPUid.size(),
+			             1,
+			             [&](int j) {
+				             // for (int j = 0; j < cc.GPUid.size(); ++j) {
+				             // int j = omp_get_thread_num();
+				             // if (omp_get_num_threads() != (int)GPU.size())
+				             //     throw std::invalid_argument("OMP didn't create enough threads");
+				             // assert(omp_get_num_threads() == (int)GPU.size());
+				             // assert(j < GPU.size());
+				             GPU[j].modup_ksk_moddown_mgpu(
+					             aux.GPU[j],
+					             key.a.GPU[j],
+					             key.b.GPU[j],
+					             aux_limbs1.GPU[j],
+					             aux_limbs2.GPU[j],
+					             moddown,
+					             bufferGather,
+					             bufferSpecial_c0,
+					             bufferSpecial_c1,
+					             external_s,
+					             signals,
+					             thread_stop,
+					             external_s0);
+			             });
 		}
 
 		if (MEMCPY_PEER) {

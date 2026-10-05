@@ -34,6 +34,27 @@ void KeySwitchingKey::Initialize(RawKeySwitchKey& rkk) {
 	cudaDeviceSynchronize();
 }
 
+void KeySwitchingKey::InitializeSparse(RawKeySwitchKey& rkk) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc);
+	keyID = rkk.keyid;
+
+	// GetKeySwitchKey packs the A vector into r_key[0] and the B vector into r_key[1]
+	// (see RawCiphertext.cu). For the GHS single-digit key each has ONE digit, a (q0,p)
+	// DCRTPoly: r_key[X][0] = { q0-limb-coeffs, p-limb-coeffs }, r_key_moduli[X][0] =
+	// { q0, p }. RNSPoly::load places q0 as Q limb 0 and p as the single special limb
+	// (mod-up representation), leaving each in EVALUATION exactly as stored.
+	//
+	// FLAG: confirm the (q0,p) key material survives GetKeySwitchKey and
+	// RNSPoly::load bit-exactly — in particular that r_key[X][0][1]'s modulus equals
+	// cc.specialPrime[0].p (the assert in RNSPoly::load enforces this) so it is
+	// recognized as the special p limb rather than dropped.
+	a.load(rkk.r_key[0][0], rkk.r_key_moduli[0][0]);
+	b.load(rkk.r_key[1][0], rkk.r_key_moduli[1][0]);
+
+	cudaDeviceSynchronize();
+}
+
 KeySwitchingKey::KeySwitchingKey(Context& cc)
 : my_range(loc, LIFETIME), keyID(""), cc((assert(cc != nullptr), CudaNvtxStart(std::string{ sc::current().function_name() }.substr()), cc)),
   a(*cc, -1, false, true), b(*cc, -1, false, true) {

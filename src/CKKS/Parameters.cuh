@@ -89,8 +89,27 @@ class Parameters {
 			}
 		}
 
-		if (this->raw.has_value() < b.raw.has_value()) {
-			return true;
+		if (this->raw.has_value() != b.raw.has_value()) {
+			return this->raw.has_value() < b.raw.has_value();
+		}
+
+		// Order on the bootstrap configuration too. Contexts differing only in secret-key
+		// distribution share every field above, so without this they compare equal and
+		// GenCryptoContextGPU hands back whichever was cached first -  a uniform-key context would
+		// silently serve a sparse-key one the degree-88 Chebyshev table and K_UNIFORM.
+		if (this->raw.has_value()) {
+			if (raw->coefficientsCheby.size() != b.raw->coefficientsCheby.size()) {
+				return raw->coefficientsCheby.size() < b.raw->coefficientsCheby.size();
+			}
+			if (raw->bootK != b.raw->bootK) {
+				return raw->bootK < b.raw->bootK;
+			}
+			if (raw->doubleAngleIts != b.raw->doubleAngleIts) {
+				return raw->doubleAngleIts < b.raw->doubleAngleIts;
+			}
+			if (raw->sparse_encaps != b.raw->sparse_encaps) {
+				return raw->sparse_encaps < b.raw->sparse_encaps;
+			}
 		}
 		return false;
 	}

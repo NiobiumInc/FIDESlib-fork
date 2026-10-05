@@ -2,3 +2,8 @@
 	path = deps/openfhe-src
 	url = https://github.com/openfheorg/openfhe-development
 	ignore = dirty
+[submodule "deps/niobium-haze"]
+	path = deps/niobium-haze
+	url = https://github.com/NiobiumInc/niobium-haze.git
+	branch = main
+	ignore = dirty

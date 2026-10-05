@@ -1,0 +1,2 @@
+# Build output of packaging/build-release.sh.
+dist/

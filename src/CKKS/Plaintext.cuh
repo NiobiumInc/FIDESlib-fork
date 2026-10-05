@@ -102,6 +102,47 @@ class Plaintext {
 	 */
 	void load(const RawPlainText& raw);
 	/**
+	 * @brief Device encode: build this plaintext from an uploaded coefficient vector plus metadata.
+	 *
+	 * The device-encode counterpart of load(RawPlainText). Where load() takes the L already-encoded
+	 * EVALUATION-form towers OpenFHE produced on the host and uploads each, this takes the single
+	 * biased coefficient vector that precedes them (OpenFHE's `temp`) and has the GPU do the CRT
+	 * reduction and the NTT. The metadata arguments are the same three fields load() copies out of
+	 * RawPlainText, passed explicitly because there is no RawPlainText to carry them.
+	 *
+	 * @see RNSPoly::loadCoefficients for the coefficient/modulus contract and the parity argument.
+	 */
+	void loadCoefficients(const std::vector<uint64_t>& biased, const std::vector<uint64_t>& moduli, uint64_t bigBound, double noiseFactor, int noiseLevel, int slots);
+	/**
+	 * @brief Device encode a BATCH of plaintexts that share one level, in one pass of kernels.
+	 *
+	 * Each plaintext ends up bit-identical to what loadCoefficients would have built from the same
+	 * coefficient vector, and carries the same metadata; only the number of host->driver calls
+	 * changes. All plaintexts must be freshly constructed, on the same context, and share the
+	 * `moduli` chain (i.e. the same level) -- which is exactly the shape of a BSGS diagonal group.
+	 *
+	 * @see RNSPoly::loadCoefficientsBatch for the contract, the ownership note and the parity
+	 *      argument.
+	 */
+	static void loadCoefficientsBatch(const std::vector<Plaintext*>& pts,
+	  const std::vector<const std::vector<uint64_t>*>& biased,
+	  const std::vector<uint64_t>& moduli,
+	  uint64_t bigBound,
+	  double noiseFactor,
+	  int noiseLevel,
+	  int slots);
+
+	/// @brief loadCoefficientsBatch from SLOT VALUES, the transform on the device (FIDESLIB_DEVICE_IFFT).
+	/// @see RNSPoly::loadSlotsBatch.
+	static void loadSlotsBatch(const std::vector<Plaintext*>& pts,
+	  const std::vector<const std::vector<double>*>& values,
+	  int slots,
+	  double scalingFactor,
+	  const std::vector<uint64_t>& moduli,
+	  uint64_t bigBound,
+	  double noiseFactor,
+	  int noiseLevel);
+	/**
 	 * @brief Store this plaintext into a raw representation.
 	 *
 	 * @param raw Destination for the raw plaintext data.

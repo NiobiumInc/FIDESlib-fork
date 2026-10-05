@@ -23,7 +23,7 @@ using namespace FIDESlib::CKKS;
 
 constexpr bool BATCHED = false;
 
-void FIDESlib::CKKS::EvalLinearTransform(Ciphertext& ctxt, int slots, bool decode) {
+void FIDESlib::CKKS::EvalLinearTransform(Ciphertext& ctxt, int slots, bool decode, int levelsToDrop) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	//constexpr bool PRINT		 = false;
 	//FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
@@ -58,9 +58,9 @@ void FIDESlib::CKKS::EvalLinearTransform(Ciphertext& ctxt, int slots, bool decod
 		*/
 	} else {
 
-		int bStep				  = cc.GetBootPrecomputation(slots).LT.bStep;
+		int bStep				  = cc.GetBootPrecomputation(slots, levelsToDrop).LT.bStep;
 		int gStep				  = slots / bStep;
-		std::vector<Plaintext>& A = decode ? cc.GetBootPrecomputation(slots).LT.invA : cc.GetBootPrecomputation(slots).LT.A;
+		std::vector<Plaintext>& A = decode ? cc.GetBootPrecomputation(slots, levelsToDrop).LT.invA : cc.GetBootPrecomputation(slots, levelsToDrop).LT.A;
 		std::vector<Plaintext*> Aptr(slots, nullptr);
 		for (uint32_t j = 0; j < static_cast<uint32_t>(gStep); ++j) {
 			for (uint32_t i = 0; i < static_cast<uint32_t>(bStep); ++i) {
@@ -72,7 +72,7 @@ void FIDESlib::CKKS::EvalLinearTransform(Ciphertext& ctxt, int slots, bool decod
 	}
 }
 
-void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode) {
+void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode, int levelsToDrop) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	constexpr bool PRINT = false;
 	// FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
@@ -96,7 +96,7 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
 	if (ctxt.NoiseLevel == 2)
 		ctxt.rescale();
 
-	for (BootstrapPrecomputation::LTstep& step : (decode ? cc.GetBootPrecomputation(slots).StC : cc.GetBootPrecomputation(slots).CtS)) {
+	for (BootstrapPrecomputation::LTstep& step : (decode ? cc.GetBootPrecomputation(slots, levelsToDrop).StC : cc.GetBootPrecomputation(slots, levelsToDrop).CtS)) {
 		// computes the NTTs for each CRT limb (for the hoisted automorphisms used later on)
 
 		if constexpr (BATCHED) {
@@ -140,7 +140,7 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
 					}
 				}
 
-				int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+				int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1];
 				int offset = step.rotOut[0];
 				{
 					LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, offset);

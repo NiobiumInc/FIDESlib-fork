@@ -27,8 +27,11 @@ class LimbChain {
 	LimbChain() = default;
 	/// @brief Allocate `count` fresh device polynomials of `polyBytes` each (hazeMalloc).
 	LimbChain(std::size_t count, std::size_t polyBytes);
-	/// @brief Allocate one device polynomial per row and H2D-upload the row into it.
-	explicit LimbChain(const std::vector<std::vector<uint64_t>>& rows);
+	/// @brief Allocate one device polynomial per row and upload the whole chain in ONE
+	/// hazeMemcpyMrp(H2D), declaring base[i] as row i's prime. base.size() must equal rows.size().
+	/// A per-limb hazeMemcpy loop cannot name those primes and is rejected by any later
+	/// multi-residue MRP op, so this is the only legal way to upload a residue chain.
+	LimbChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base);
 
 	~LimbChain();
 	LimbChain(LimbChain&& other) noexcept;
@@ -57,9 +60,20 @@ class LimbChain {
 /// @brief Device payload of a haze-backed ciphertext: one LimbChain per component plus the
 /// host-side CKKS metadata the engine maintains. Stored as a shared_ptr in the
 /// value type's `device` slot.
+///
+/// `components.size()` is the ONLY expression of the value's degree — it mirrors OpenFHE's
+/// element count: 2 for an ordinary ciphertext, 3 for the degree-2 result of EvalMultNoRelin,
+/// and 1 for the morphed-plaintext operand the FIXEDAUTO adjust paths build internally. There
+/// is no separate degree field and no "empty chain means absent" convention.
 struct HazePayload {
-	LimbChain c0;
-	LimbChain c1;
+	std::vector<LimbChain> components;
+	/// @brief Named accessors for the degree-1-only paths (hybrid keyswitch, rotation,
+	/// bootstrap). Bounds-checked on purpose: a payload that does not carry the component
+	/// throws instead of reading past the end.
+	LimbChain& c0() { return components.at(0); }
+	const LimbChain& c0() const { return components.at(0); }
+	LimbChain& c1() { return components.at(1); }
+	const LimbChain& c1() const { return components.at(1); }
 	/// @brief #RNS limbs; OpenFHE level = |Q| − towers.
 	std::size_t towers = 0;
 	/// @brief OpenFHE m_noiseScaleDeg.
@@ -80,6 +94,17 @@ struct HazePtPayload {
 	double scalingFactor	  = 0.0;
 	std::size_t slots		  = 0;
 };
+
+/// @brief Build a component vector from move-only chains, in order. std::vector has no
+/// initializer-list constructor for move-only elements, so every component-vector literal in the
+/// engine goes through here.
+template <typename... Chains>
+inline std::vector<LimbChain> makeComponents(Chains&&... chains) {
+	std::vector<LimbChain> out;
+	out.reserve(sizeof...(chains));
+	(out.push_back(std::move(chains)), ...);
+	return out;
+}
 
 } // namespace fideslib::hazebk
 

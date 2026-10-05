@@ -3,7 +3,7 @@
 #include "engine/haze/HazeScalarEncode.hpp"
 
 #include <openfhe.h>  // lbcrypto::CKKSPackedEncoding, lbcrypto::LargeScalingFactorConstants,
-                      // lbcrypto::DCRTPoly::Integer, lbcrypto::ScalingTechnique, usint
+                      // lbcrypto::DCRTPoly::Integer, lbcrypto::ScalingTechnique, uint32_t
 
 #include <cassert>
 #include <cmath>
@@ -50,7 +50,7 @@ std::vector<uint64_t> elemForEvalMult(
 	// Build the moduli vector for the active limbs.
 	const uint32_t numTowers = static_cast<uint32_t>(towers);
 	std::vector<lbcrypto::DCRTPoly::Integer> moduli(numTowers);
-	for (usint i = 0; i < numTowers; i++) {
+	for (uint32_t i = 0; i < numTowers; i++) {
 		moduli[i] = p.qBase[i];
 	}
 
@@ -111,7 +111,7 @@ std::vector<uint64_t> elemForEvalMult(
 	// CUDA uses `large_abs > bound` (Context.cu:390): at large_abs == 2^63 it takes the int64
 	// else-branch (wrapping to INT64_MIN), unlike OpenFHE's `>=` which keeps the true __int128 value.
 	if (large_abs > bound) {
-		for (usint i = 0; i < numTowers; i++) {
+		for (uint32_t i = 0; i < numTowers; i++) {
 			DoubleInteger reduced = large % static_cast<__int128>(moduli[i].ConvertToInt());
 			factors[i] = (reduced < 0)
 			             ? static_cast<uint64_t>(reduced + static_cast<__int128>(moduli[i].ConvertToInt()))
@@ -119,7 +119,7 @@ std::vector<uint64_t> elemForEvalMult(
 		}
 	} else {
 		int64_t scConstant = static_cast<int64_t>(large);
-		for (usint i = 0; i < numTowers; i++) {
+		for (uint32_t i = 0; i < numTowers; i++) {
 			int64_t reduced = scConstant % static_cast<int64_t>(moduli[i].ConvertToInt());
 			factors[i]      = (reduced < 0)
 			                  ? static_cast<uint64_t>(reduced + static_cast<int64_t>(moduli[i].ConvertToInt()))
@@ -169,7 +169,7 @@ std::vector<uint64_t> elemForEvalAddOrSub(
 
 	const uint32_t sizeQl = static_cast<uint32_t>(towers);
 	std::vector<lbcrypto::DCRTPoly::Integer> moduli(sizeQl);
-	for (usint i = 0; i < sizeQl; i++) {
+	for (uint32_t i = 0; i < sizeQl; i++) {
 		moduli[i] = p.qBase[i];
 	}
 
@@ -260,7 +260,7 @@ std::vector<uint64_t> elemForEvalAddOrSub(
 	lbcrypto::DCRTPoly::Integer intScFactor = static_cast<uint64_t>(scFactor + 0.5);
 	std::vector<lbcrypto::DCRTPoly::Integer> crtScFactor(sizeQl, intScFactor);
 
-	for (usint i = 1; i < static_cast<usint>(noiseScaleDeg); i++) {
+	for (uint32_t i = 1; i < static_cast<uint32_t>(noiseScaleDeg); i++) {
 		crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtScFactor, moduli);
 	}
 
