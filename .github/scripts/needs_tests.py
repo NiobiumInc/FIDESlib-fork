@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decides whether a pull request's changes need a workflow's test jobs.
+"""Decides whether a pull request's or a push's changes need a workflow's test jobs.
 
 Reads the changed paths (one per line) and the patterns of paths that cannot
 affect a build or a test result. Prints run=false only when every changed path
@@ -16,7 +16,8 @@ import fnmatch
 import os
 import sys
 
-# The pull request files API lists at most this many files.
+# The pull request files API lists at most this many files; the compare API,
+# used for a push, lists at most 300 (--file-limit).
 API_FILE_LIMIT = 3000
 
 
@@ -37,11 +38,11 @@ def matches(path, pattern):
     return fnmatch.fnmatchcase(path, pattern)
 
 
-def decide(paths, skippable, always):
+def decide(paths, skippable, always, limit=API_FILE_LIMIT):
     """Returns (run, reason)."""
     if not paths:
-        return True, "the pull request lists no changed files"
-    if len(paths) >= API_FILE_LIMIT:
+        return True, "no changed files are listed"
+    if len(paths) >= limit:
         return True, f"{len(paths)} changed files, at the API's limit, so the list may be incomplete"
     for path in paths:
         if any(matches(path, p) for p in always):
@@ -58,11 +59,13 @@ def main():
     parser.add_argument("skippable", help="file with the patterns that need no tests")
     parser.add_argument("--always", nargs="*", default=[],
                         help="patterns of this workflow's own files, which always need tests")
+    parser.add_argument("--file-limit", type=int, default=API_FILE_LIMIT,
+                        help="the most files the API that listed the changes returns")
     args = parser.parse_args()
 
     with open(args.changed) as f:
         paths = sorted({line.strip() for line in f if line.strip()})
-    run, reason = decide(paths, read_lines(args.skippable), args.always)
+    run, reason = decide(paths, read_lines(args.skippable), args.always, args.file_limit)
 
     decision = "true" if run else "false"
     verdict = "Tests run" if run else "Tests skipped"

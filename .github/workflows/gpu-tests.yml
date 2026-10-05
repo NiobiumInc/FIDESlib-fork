@@ -12,6 +12,11 @@ on:
     branches: [nb_main]
     # ready_for_review: draft pull requests skip this check until then.
     types: [opened, synchronize, reopened, ready_for_review]
+  # A merge into nb_main. Merging does not require the branch to be up to date,
+  # so a pull request's check may have run against an older nb_main; this run
+  # tests the tree the merge left there.
+  push:
+    branches: [nb_main]
   workflow_dispatch:
     inputs:
       known_failures:
@@ -23,7 +28,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Each push to nb_main gets its own run. Cancelling one for the next would
+  # leave a merge that changed code untested when the next merge changes none.
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -32,9 +39,9 @@ env:
   OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
 
 jobs:
-  # Lists the pull request's changed files and decides whether the test jobs
-  # need to run (.github/scripts/needs_tests.py). Only an explicit "false"
-  # skips them: if this job fails, they run anyway.
+  # Lists the files changed by the pull request, or by the push to nb_main, and
+  # decides whether the test jobs need to run (.github/scripts/needs_tests.py).
+  # Only an explicit "false" skips them: if this job fails, they run anyway.
   changes:
     name: Decide what to test
     runs-on: ubuntu-24.04
@@ -56,24 +63,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
-          if [ "$EVENT" != pull_request ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "**Tests run:** $EVENT event, not a pull request." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          gh api --paginate "repos/$REPO/pulls/$PR/files" \
-            --jq '.[] | .filename, (.previous_filename // empty)' > changed.txt
-          python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt \
+          case "$EVENT" in
+            pull_request)
+              gh api --paginate "repos/$REPO/pulls/$PR/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)' > changed.txt
+              limit=3000 ;;
+            push)
+              gh api "repos/$REPO/compare/$BEFORE...$AFTER" \
+                --jq '.files[] | .filename, (.previous_filename // empty)' > changed.txt
+              limit=300 ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "**Tests run:** $EVENT event." >> "$GITHUB_STEP_SUMMARY"
+              exit 0 ;;
+          esac
+          python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt --file-limit "$limit" \
             --always '.github/workflows/gpu-tests.yml' '.github/gpu-tests/**' \
               '.github/scripts/gpu_suite.py' '.github/scripts/needs_tests.py' '.github/no-test-paths.txt'
 
   gpu:
     name: GPU test suite (RTX PRO 6000)
     needs: changes
-    # Each run rents a GPU VM, so it skips draft pull requests and pull requests
-    # whose changes cannot affect a test result. A failed decision runs it.
+    # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
+    # and merges whose changes cannot affect a test result. A failed decision
+    # runs it.
     if: >-
       ${{ !cancelled() && needs.changes.outputs.run != 'false' &&
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
