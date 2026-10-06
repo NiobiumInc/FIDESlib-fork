@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 2/05/24.
 //
+#include <cstdlib>
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CudaUtils.cuh"
 #include "CKKS/Ciphertext.cuh"
@@ -128,6 +129,20 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		cudaDeviceGetDefaultMemPool(&mp, dev);
 		uint64_t threshold = UINT64_MAX; // 5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
 		cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
+		// DIAGNOSTIC (temporary branch): no reuse of a freed block by ANOTHER stream unless that
+		// stream already has an event dependency on the free. Internal dependencies and
+		// opportunistic reuse are off; event-dependency reuse stays on.
+		if (const char* e = std::getenv("FIDESLIB_DEBUG_NO_XSTREAM_REUSE"); e != nullptr && e[0] == '1') {
+			int off = 0;
+			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &off);
+			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &off);
+			int a = -1, b = -1, c = -1;
+			cudaMemPoolGetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &a);
+			cudaMemPoolGetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &b);
+			cudaMemPoolGetAttribute(mp, cudaMemPoolReuseFollowEventDependencies, &c);
+			printf("[noxsreuse] device %d: internal=%d opportunistic=%d follow-events=%d\n", dev, a, b, c);
+			fflush(stdout);
+		}
 		CudaCheckErrorModNoSync;
 	}
 
