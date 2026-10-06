@@ -46,9 +46,13 @@ on:
       - 'deps/**'
       - 'packaging/**'
       - '.github/workflows/release.yml'
-  # Nightly, 09:00 UTC (02:00 in US Pacific daylight time, 01:00 in standard time).
+  # Nightly, at midnight US Pacific time. Cron runs in UTC with no daylight saving time,
+  # so both candidate hours trigger: 07:00 UTC is midnight in daylight time, 08:00 UTC in
+  # standard time. The version job stops the one that comes before midnight in
+  # America/Los_Angeles, and its one-release-a-day check stops the other one after a
+  # release.
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 7,8 * * *'
   workflow_dispatch:
     inputs:
       publish:
@@ -101,7 +105,8 @@ jobs:
             echo "matrix={\"include\":$(jq -c . <<< "$legs")}"
           } >> "$GITHUB_OUTPUT"
 
-      # The nightly publishes only what is new: nothing when a release with today's date
+      # The nightly runs at midnight US Pacific time (see the schedule trigger) and
+      # publishes only what is new: nothing when a release with today's date
       # already exists (a manual one, say), and nothing when no file the packages are built
       # from changed since the last release. Those are the paths that trigger a package
       # build on a push, plus src/ when the CUDA packages are built, since only they
@@ -115,7 +120,12 @@ jobs:
         run: |
           run=true
           reason=""
-          if [ "$EVENT" = schedule ]; then
+          # Before midnight in US Pacific time the Pacific date is still the day before; a
+          # trigger GitHub runs late still counts, and the date check below stops a second one.
+          if [ "$EVENT" = schedule ] && [ "$(TZ=America/Los_Angeles date +%F)" != "$(date -u +%F)" ]; then
+            run=false
+            reason="it is not midnight in US Pacific time yet; the next trigger is"
+          elif [ "$EVENT" = schedule ]; then
             if gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
               grep -q "^v$VERSION-"; then
               run=false
