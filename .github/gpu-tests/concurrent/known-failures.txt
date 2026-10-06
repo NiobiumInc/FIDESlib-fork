@@ -1,3 +1,10 @@
 # Concurrent-operations pass (FIDESLIB_CONCURRENT_OPS=1): tests that fail in every
 # full run, each section with its reason. The check skips them. A pull request that
 # fixes one deletes its line. One gtest filter pattern per line.
+
+# The fifth parameter set (FLEXIBLEAUTOEXT) under concurrent operations:
+# LanesMatchSerial/4 returns a ciphertext on one lane whose every coefficient
+# differs from the serial run, and SharedOperandsMatchSerial/4 stops the whole
+# process with a CUDA illegal memory access during a 32768-slot bootstrap, which
+# hides every test after it.
+ConcurrencyTests/ConcurrentOpsTest.*/4
