@@ -1729,6 +1729,101 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 		<< "the pool cut a new chunk for a burst the boundary release had just handed it the blocks for";
 }
 
+// ---- MULTPT WAITS FOR ITS PLAINTEXT ---------------------------------------------------------
+//
+// THE DEFECT THIS PINS. LimbPartition::multPt, the fused multiply-and-rescale Ciphertext::multPt
+// takes under FIXEDMANUAL, read the plaintext's limbs without waiting for the plaintext's stream,
+// and without making that stream wait for the read. Every other LimbPartition op that takes an
+// operand does both (multElement: `s.wait(p.getS())` ... `p.getS().wait(s)`). In the default mode a
+// plaintext lives on the legacy default stream, which orders itself against every other stream, and
+// that hid it. In the concurrent mode a plaintext has a stream of its own, and a lane that built its
+// plaintext just before the multiply read it half written: BootstrapLanesMatchSerial /3 /5 /7 got
+// a wrong first serial pass and a right one every time after.
+//
+// HOW IT IS MADE DETERMINISTIC. The plaintext's right contents are copied in on the plaintext's own
+// stream BEHIND a kernel that spins for about 100 ms, and the multiply is issued at once. A multiply
+// that waits for the plaintext's stream reads the copy; one that does not reads the values the
+// plaintext held before, long before the spin ends. Runs in both modes.
+// =================================================================================================
+
+namespace {
+
+__global__ void multpt_spin_(const long long cycles) {
+	const long long t0 = clock64();
+	while (clock64() - t0 < cycles) {
+	}
+}
+
+/// Device pointer and byte size of one limb, whichever word type it holds.
+std::pair<void*, size_t> LimbBytes(const FIDESlib::CKKS::LimbImpl& l) {
+	return std::visit([](const auto& L) { return std::pair<void*, size_t>{ (void*)L.v.data, (size_t)L.v.size * sizeof(*L.v.data) }; }, l);
+}
+
+} // namespace
+
+TEST_P(ConcurrentOpsTest, MultPtWaitsForThePlaintext) {
+	CKKS::DeregisterAllContexts();
+	ClearCachedContexts();
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc, UNIFORM);
+	FIDESlib::CKKS::Context GPUcc_		= CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	const int numSlots					= cc->GetRingDimension() / 2;
+
+	std::vector<double> x(8), y(8), z(8);
+	for (int i = 0; i < 8; ++i) {
+		x[i] = 0.1 * (i + 1);
+		y[i] = 0.05 * (i + 2);
+		z[i] = -0.3 * (i + 3); // what the plaintext holds until the copy lands
+	}
+	const FIDESlib::CKKS::RawCipherText raw_ct =
+	  FIDESlib::CKKS::GetRawCipherText(cc, cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(x, 1, 0, nullptr, numSlots)));
+	const FIDESlib::CKKS::RawPlainText raw_y = FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots));
+	const FIDESlib::CKKS::RawPlainText raw_z = FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(z, 1, 0, nullptr, numSlots));
+
+	// The reference: the plaintext loaded and the device idle before the multiply.
+	FIDESlib::CKKS::RawCipherText want;
+	{
+		FIDESlib::CKKS::Ciphertext ct(GPUcc_, raw_ct);
+		FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_y);
+		cudaDeviceSynchronize();
+		ct.multPt(pt, true);
+		ct.store(want);
+	}
+	cudaDeviceSynchronize();
+
+	constexpr long long kSpinCycles = 200'000'000; // about 100 ms
+	FIDESlib::CKKS::RawCipherText got;
+	{
+		FIDESlib::CKKS::Ciphertext ct(GPUcc_, raw_ct);
+		FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_z);
+		FIDESlib::CKKS::Plaintext src(GPUcc_, raw_y);
+		cudaDeviceSynchronize();
+		ASSERT_EQ(pt.c0.GPU.size(), src.c0.GPU.size());
+		for (size_t g = 0; g < pt.c0.GPU.size(); ++g) {
+			FIDESlib::CKKS::LimbPartition& to		  = pt.c0.GPU[g];
+			const FIDESlib::CKKS::LimbPartition& from = src.c0.GPU[g];
+			ASSERT_EQ(to.limb.size(), from.limb.size());
+			cudaSetDevice(to.device);
+			const cudaStream_t s = to.getS().ptr();
+			multpt_spin_<<<1, 1, 0, s>>>(kSpinCycles);
+			for (size_t i = 0; i < to.limb.size(); ++i) {
+				const auto [dst, n]		 = LimbBytes(to.limb[i]);
+				const auto [from_ptr, m] = LimbBytes(from.limb[i]);
+				ASSERT_EQ(n, m);
+				cudaMemcpyAsync(dst, from_ptr, n, cudaMemcpyDeviceToDevice, s);
+			}
+		}
+		ct.multPt(pt, true);
+		ct.store(got);
+		cudaDeviceSynchronize();
+	}
+	ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+	ExpectRawEqual(want, got, "a multiply issued while its plaintext was still being written on the plaintext's own stream");
+	CKKS::DeregisterAllContexts();
+}
+
 // ---- NOTHING REACHES THE DEVICE POOL ON THE NULL STREAM --------------------------------------
 //
 // THE DEFECT THIS PINS. `Plaintext` (Plaintext.cu:53, :59) and `KeySwitchingKey`
