@@ -175,6 +175,7 @@ jobs:
           key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
 
       - name: Build
+        id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
       # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
@@ -189,6 +190,26 @@ jobs:
           args=()
           if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results "${args[@]}"
+
+      # The concurrent-operations suite, in a process of its own: the library reads
+      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
+      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
+      # It runs even when the default-mode suite failed, so both results are reported.
+      # Every test gets a process of its own: a CUDA error leaves the context unusable for
+      # the rest of the process, so one crash would otherwise hide every test after it.
+      - name: Test concurrent operations
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_CONCURRENT_OPS: '1'
+          KNOWN_FAILURES: ${{ inputs.known_failures }}
+        run: |
+          args=()
+          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
+            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
+            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
 
       - name: Upload test reports
         if: always()
