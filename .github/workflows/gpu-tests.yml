@@ -134,12 +134,18 @@ jobs:
             "https://developer.download.nvidia.com/compute/cuda/repos/$DISTRO/x86_64/cuda-keyring_1.1-1_all.deb"
           echo "$sum  cuda-keyring.deb" | sha256sum -c -
           # A fresh VM can still be running apt on its own (unattended upgrades,
-          # first-boot setup) and holding dpkg's lock. Wait for it, up to 10
-          # minutes, instead of failing; apt itself waits as long for the lock.
-          for _ in $(seq 120); do
-            pgrep -x 'apt|apt-get|dpkg|unattended-upgr' > /dev/null || break
+          # first-boot setup). Wait, up to 10 minutes, while a process holds apt's
+          # or dpkg's lock files open; apt itself also waits as long for dpkg's
+          # lock. This checks the locks, not process names: the unattended-upgrades
+          # shutdown daemon runs all the time under the same name without a lock.
+          command -v fuser > /dev/null || echo "::warning::fuser not found: not waiting for apt's and dpkg's locks"
+          waited=0
+          while [ "$waited" -lt 600 ] &&
+            sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock > /dev/null 2>&1; do
             sleep 5
+            waited=$((waited + 5))
           done
+          echo "Waited ${waited}s for apt's and dpkg's locks."
           apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
           "${apt[@]}" install -y ./cuda-keyring.deb
           "${apt[@]}" update
