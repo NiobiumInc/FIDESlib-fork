@@ -14,8 +14,10 @@
 # are set, which is how the hardware legs are exercised on an FPGA host instead.
 #
 # Pull requests and pushes to nb_main that touch the paths below build and consume the
-# packages. Publishing is manual for now: run this workflow with `publish` on, and it
-# releases the packages tagged v<date>-<sha7> at the commit it ran on.
+# packages; they never publish. A nightly run publishes nb_main at most once a day, and
+# only when something new reached the packages since the last release (see the version
+# job). Running this workflow by hand with `publish` on releases at once. Either way the
+# release is tagged v<date>-<sha7> at the commit it ran on.
 #
 # Every job writes what it did to the run's summary, and the final `report` job adds one
 # table of all of them, so a failure shows where to look without opening each log.
@@ -44,6 +46,9 @@ on:
       - 'deps/**'
       - 'packaging/**'
       - '.github/workflows/release.yml'
+  # Nightly, 09:00 UTC (02:00 in US Pacific daylight time, 01:00 in standard time).
+  schedule:
+    - cron: '0 9 * * *'
   workflow_dispatch:
     inputs:
       publish:
@@ -67,6 +72,8 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       matrix: ${{ steps.v.outputs.matrix }}
+      run: ${{ steps.new.outputs.run }}
+      reason: ${{ steps.new.outputs.reason }}
     steps:
       - id: v
         env:
@@ -94,8 +101,51 @@ jobs:
             echo "matrix={\"include\":$(jq -c . <<< "$legs")}"
           } >> "$GITHUB_OUTPUT"
 
+      # The nightly publishes only what is new: nothing when a release with today's date
+      # already exists (a manual one, say), and nothing when no file the packages are built
+      # from changed since the last release. Those are the paths that trigger a package
+      # build on a push, plus src/ when the CUDA packages are built, since only they
+      # compile it. Every other event builds as before.
+      - id: new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ steps.v.outputs.version }}
+          RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
+        run: |
+          run=true
+          reason=""
+          if [ "$EVENT" = schedule ]; then
+            if gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
+              grep -q "^v$VERSION-"; then
+              run=false
+              reason="a release for $VERSION already exists"
+            else
+              last=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --exclude-drafts --exclude-pre-releases \
+                --json tagName --jq '.[0].tagName // empty')
+              if [ -n "$last" ]; then
+                paths='^(CMakeLists\.txt|cmake/|api/|deps/|packaging/|\.github/workflows/release\.yml)'
+                if [ "${RELEASE_CUDA:-true}" != false ]; then
+                  paths='^(CMakeLists\.txt|cmake/|api/|deps/|packaging/|src/|\.github/workflows/release\.yml)'
+                fi
+                # The compare API lists at most 300 files; a list that long counts as changed.
+                files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$last...$GITHUB_SHA" --jq '.files[].filename')
+                if [ "$(printf '%s\n' "$files" | grep -c .)" -lt 300 ] && ! printf '%s\n' "$files" | grep -qE "$paths"; then
+                  run=false
+                  reason="nothing the packages are built from changed since $last"
+                fi
+              fi
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          if [ "$run" = false ]; then
+            echo "**Nightly: nothing to publish.** ${reason^}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build:
     needs: version
+    if: needs.version.outputs.run == 'true'
     name: build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) and ships gcc-toolset-14 -- the
@@ -330,8 +380,11 @@ jobs:
 
   release:
     needs: [build, consume, version]
-    # Manual for now: pushes to nb_main and pull requests never publish.
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    # The nightly, when the version job found something new, or a manual run with publish
+    # on. Pushes to nb_main and pull requests never publish.
+    if: >-
+      needs.version.outputs.run == 'true' &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -432,6 +485,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
           RELEASE_RESULT: ${{ needs.release.result }}
+          NOTHING_NEW: ${{ needs.version.outputs.reason }}
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -451,7 +505,14 @@ jobs:
             fi
             case "$RELEASE_RESULT" in
               success) echo "- Published: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" ;;
-              skipped) echo "- Not published: publishing is manual (run this workflow with publish on)." ;;
+              skipped)
+                if [ -n "$NOTHING_NEW" ]; then
+                  echo "- Not published: $NOTHING_NEW."
+                elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+                  echo "- Not published: run with publish off."
+                else
+                  echo "- Not published: pushes and pull requests never publish; the nightly does."
+                fi ;;
               *) echo "- Publishing: $(mark "$RELEASE_RESULT") $RELEASE_RESULT" ;;
             esac
             echo
