@@ -16,6 +16,11 @@ namespace fideslib {
 /// All CUDA operation code lives in CudaEngine.cpp.
 class CudaEngine final : public Engine {
   public:
+	/// @param reducedNoise  Use the centered (ReducedNoise) FBC variant on this context's fast
+	///                      base conversion, matching an OpenFHE reference built with
+	///                      WITH_REDUCED_NOISE. Forwarded into the Parameters loadContext builds.
+	explicit CudaEngine(bool reducedNoise) : Engine(reducedNoise) {}
+
 	const char* name() const override {
 		return "FIDESlib (CUDA)";
 	}

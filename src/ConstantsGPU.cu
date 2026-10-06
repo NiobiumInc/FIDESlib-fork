@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <stdexcept>
 
 #include "CKKS/Parameters.cuh"
+#include "CKKS/ReducedNoise.cuh" // fillDecompAndModUpNegQ
 #include "parallel_for.hpp"
 
 namespace FIDESlib {
@@ -442,7 +444,11 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const 
 	}
 
 	if constexpr (std::is_same_v<Scheme, CKKS::Parameters>) {
-		auto param = static_cast<CKKS::Parameters>(parameters);
+		auto param		  = static_cast<CKKS::Parameters>(parameters);
+		hC_.reduced_noise = param.reducedNoise;
+		if (param.reducedNoise && !param.raw) {
+			throw std::runtime_error("reducedNoise=true requires raw params: the FBC correction tables are only filled from them");
+		}
 		if (param.raw) {
 			{
 				for (size_t i = 0; i < q.size(); ++i) {
@@ -624,6 +630,8 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(const 
 										 */
 				}
 			}
+
+			fillDecompAndModUpNegQ(hC_, hG_, DECOMPmeta, digitGPUid, GPUid);
 		}
 	}
 

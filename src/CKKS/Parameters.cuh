@@ -28,6 +28,7 @@ class Parameters {
 	lbcrypto::ScalingTechnique scalingTechnique;
 	std::optional<RawParams> raw;
 	int batch = 100;
+	bool reducedNoise;
 
 	bool operator<(const Parameters& b) const {
 
@@ -87,6 +88,12 @@ class Parameters {
 			} else if (b.Sprimes[i].p < Sprimes[i].p) {
 				return false;
 			}
+		}
+
+		if (reducedNoise < b.reducedNoise) {
+			return true;
+		} else if (reducedNoise > b.reducedNoise) {
+			return false;
 		}
 
 		if (this->raw.has_value() != b.raw.has_value()) {

@@ -80,6 +80,7 @@ class BootstrapToLevelTest : public ::testing::Test {
 		params.SetNumLargeDigits(3);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 		if (GetTestBackend() == TestBackend::CUDA)
 			params.SetBackend(Backend::CUDA);
 		else if (GetTestBackend() == TestBackend::HAZE)

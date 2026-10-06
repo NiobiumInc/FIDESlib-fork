@@ -23,9 +23,13 @@
 #include <string>
 #include <vector>
 
+#include "TestEngineConfig.hpp" // FIDESlib::Testing::{ConfigureTestEngine, GetTestBackend, TestBackend}
 #include "fideslib.hpp"
 
 using namespace fideslib;
+using FIDESlib::Testing::ConfigureTestEngine;
+using FIDESlib::Testing::GetTestBackend;
+using FIDESlib::Testing::TestBackend;
 
 // Exact ciphertext equality: scaling metadata + every RNS limb of both polynomials. Mirrors the
 // ASSERT_EQ_CIPHERTEXT in test/ParametrizedTest.cuh, minus the per-limb debug printing.
@@ -69,25 +73,8 @@ using namespace fideslib;
 		}                                                                                                                                                \
 	} while (0)
 
-// The api test fixtures run against any backend: set FIDESLIB_TEST_BACKEND=cuda (on a
-// CUDA build) or =haze (on a haze build) to exercise that engine end-to-end. Builds
-// without the requested backend fall back to CPU, since IsBackendAvailable is false
-// when it is not compiled in.
-enum class TestBackend { CPU, CUDA, HAZE };
-static TestBackend GetTestBackend() {
-	const char* b = std::getenv("FIDESLIB_TEST_BACKEND");
-	if (b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA))
-		return TestBackend::CUDA;
-	if (b != nullptr && std::string(b) == "haze" && IsBackendAvailable(Backend::HAZE))
-		return TestBackend::HAZE;
-	return TestBackend::CPU;
-}
 static bool TestUseCuda() {
 	return GetTestBackend() == TestBackend::CUDA;
-}
-// Any device backend (CUDA or haze): gates SetBackend + LoadContext in the fixtures.
-static bool TestUseDevice() {
-	return GetTestBackend() != TestBackend::CPU;
 }
 
 // The OpenFHE context the api wraps (its CPU shadow). It holds the same keys the api generated, so
@@ -175,12 +162,7 @@ class ApiParityTest : public ::testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDAUTO);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -212,31 +194,6 @@ class ApiParityTest : public ::testing::Test {
 		ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-6);
 	}
 
-	// Compare a RELINEARIZED (degree-1) result against the OpenFHE oracle.
-	//
-	// Bit-exact on every backend except CUDA. On CUDA it drops to structure + metadata + decrypted
-	// values, because that backend's hybrid key-switch is a different (equally valid) rounding of the
-	// same value than OpenFHE's — a PRE-EXISTING, degree-independent divergence, not one this test
-	// group introduces:
-	//   * plain ApiParityTest.EvalMult and EvalSquare already fail bit-exactness under
-	//     FIDESLIB_TEST_BACKEND=cuda (they are in the recorded CUDA baseline), and the raw
-	//     OpenFheInterfaceTests Mult/Square/MultRescale/MultAllLevels fail there for the same reason;
-	//   * the divergence is confined to the key-switch: the pure tensor product, which performs none,
-	//     IS bit-exact on CUDA — ApiParityTest.EvalMultNoRelin and every Degree2* operand test below
-	//     pass with full ASSERT_EQ_CIPHERTEXT_N there.
-	// So a composition that adds the key-switch fold inherits exactly that gap. haze is untouched by
-	// this branch and stays bit-exact.
-	void ExpectRelinearizedEq(const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& got, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle) {
-		if (TestUseCuda()) {
-			ExpectStructure(got, oracle, 2);
-			EXPECT_EQ(got->GetNoiseScaleDeg(), oracle->GetNoiseScaleDeg());
-			EXPECT_EQ(got->GetScalingFactor(), oracle->GetScalingFactor());
-			EXPECT_EQ(got->GetLevel(), oracle->GetLevel());
-			ExpectApproxEq(got, oracle);
-			return;
-		}
-		ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
-	}
 };
 
 TEST_F(ApiParityTest, EvalAdd) {
@@ -296,10 +253,7 @@ TEST_F(ApiParityTest, EvalRotate) {
 	auto res	= cc->EvalRotate(a1, 1);
 	auto got	= HostCt(cc, res);
 	auto oracle = LbCc(cc)->EvalRotate(lb1, 1);
-	// Approximate, not bit-identical: GPU rotation (hoisted automorphism + key-switch) is numerically
-	// correct but uses a different key-switch representation than OpenFHE. The raw OpenFheInterfaceTests
-	// Rotate test uses ASSERT_ERROR_OK for exactly this reason (its ASSERT_EQ_CIPHERTEXT is commented out).
-	ExpectApproxEq(got, oracle);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
 TEST_F(ApiParityTest, EvalRotateSlotsAware) {
@@ -633,7 +587,7 @@ TEST_F(ApiParityTest, RelinearizeAfterNoRelin) {
 	auto res	= cc->Relinearize(d2); // out-of-place: d2 stays degree 2
 	auto got	= HostCt(cc, res);
 	auto oracle = LbCc(cc)->Relinearize(LbCc(cc)->EvalMultNoRelin(lb1, lb2));
-	ExpectRelinearizedEq(got, oracle);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
 TEST_F(ApiParityTest, RelinearizeInPlaceAfterNoRelin) {
@@ -648,7 +602,7 @@ TEST_F(ApiParityTest, RelinearizeInPlaceAfterNoRelin) {
 	auto oracle = LbCc(cc)->EvalMultNoRelin(lb1, lb2);
 	LbCc(cc)->RelinearizeInPlace(oracle);
 	auto got = HostCt(cc, q);
-	ExpectRelinearizedEq(got, oracle);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
 TEST_F(ApiParityTest, RelinearizeDegree1NoOp) {
@@ -694,11 +648,11 @@ TEST_F(ApiParityTest, EvalMultEqualsRelinearizeNoRelin) {
 	auto gotQ	= HostCt(cc, q);
 	// The primary gate first, and BIT-EXACT on EVERY backend including CUDA: the split composition
 	// must reproduce the fused op exactly, which is what proves mult() and multNoRelin()+relinearize()
-	// share one tensor product and one key-switch fold rather than two drifting copies. Only the
-	// comparison against OpenFHE is relaxed on CUDA (see ExpectRelinearizedEq).
+	// share one tensor product and one key-switch fold rather than two drifting copies. The
+	// comparison against the OpenFHE oracle below is likewise bit-exact on every backend.
 	ASSERT_EQ_CIPHERTEXT(gotP, gotQ);
-	ExpectRelinearizedEq(gotP, oracle);
-	ExpectRelinearizedEq(gotQ, oracle);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, gotP, 2);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, gotQ, 2);
 }
 
 TEST_F(ApiParityTest, Degree2EvalAdd) {
@@ -1124,7 +1078,7 @@ TEST_F(ApiParityTest, Degree2DotProductLazyRelin) {
 
 	auto gotLazy  = HostCt(cc, lazy);
 	auto gotEager = HostCt(cc, eager);
-	ExpectRelinearizedEq(gotLazy, oracle);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, gotLazy, 2);
 	// Lazy and eager agree numerically but NOT bit-for-bit: KeySwitchCore is not additive, so one
 	// key-switch of the summed third component is a different (equally valid) rounding of the same
 	// value as four key-switches summed. Comparing decrypted slots is the only meaningful check.
@@ -1191,12 +1145,7 @@ class ApiParityBootstrapTest : public ::testing::TestWithParam<std::vector<uint3
 		params.SetNumLargeDigits(3);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -1324,10 +1273,7 @@ class ApiParityFullPackBootstrapTest : public ::testing::TestWithParam<FullPackP
 		params.SetNumLargeDigits(3);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -1468,12 +1414,7 @@ class ApiParitySparseSecretBootstrapTest : public ::testing::Test {
 		params.SetNumLargeDigits(3);
 		params.SetSecretKeyDist(SPARSE_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true);
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

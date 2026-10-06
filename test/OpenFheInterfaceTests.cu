@@ -1318,7 +1318,7 @@ TEST_P(OpenFHEInterfaceTest, Rotate) {
 
 	GetOpenFHECipherText(cResGPU, raw_res1);
 	lbcrypto::Plaintext resultGPU;
-	//  ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
+	ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
 
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	ASSERT_ERROR_OK(result, resultGPU)
@@ -1383,7 +1383,7 @@ TEST_P(OpenFHEInterfaceTest, Conjugate) {
 
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		lbcrypto::Plaintext resultGPU;
-		// ASSERT_EQ_CIPHERTEXT(conj, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(conj, cResGPU);
 
 		cc->Decrypt(keys.secretKey, conj, &result);
 		std::cout << "Rotate:\n";
@@ -1495,7 +1495,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 
 	GPUr1.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
-	// ASSERT_EQ_CIPHERTEXT(cpu_r1, cResGPU);
+	ASSERT_EQ_CIPHERTEXT(cpu_r1, cResGPU);
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r1, &result);
@@ -1503,7 +1503,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 
 	GPUr2.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
-	// ASSERT_EQ_CIPHERTEXT(cpu_r2, cResGPU);
+	ASSERT_EQ_CIPHERTEXT(cpu_r2, cResGPU);
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r2, &result);
@@ -1511,7 +1511,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 
 	GPUr3.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
-	// ASSERT_EQ_CIPHERTEXT(cpu_r3, cResGPU);
+	ASSERT_EQ_CIPHERTEXT(cpu_r3, cResGPU);
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r3, &result);
@@ -1519,7 +1519,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 
 	GPUr4.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
-	// ASSERT_EQ_CIPHERTEXT(cpu_r4, cResGPU);
+	ASSERT_EQ_CIPHERTEXT(cpu_r4, cResGPU);
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r4, &result);
@@ -1760,7 +1760,7 @@ TEST_P(OpenFHEInterfaceTest, RotateAllLevels) {
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		lbcrypto::Plaintext resultGPU;
 		CudaCheckErrorMod;
-		// ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 
 		ASSERT_ERROR_OK(result, resultGPU);
@@ -1923,7 +1923,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotateAllLevels) {
 
 		GPUr1.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
-		// ASSERT_EQ_CIPHERTEXT(cpu_r1, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(cpu_r1, cResGPU);
 
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
@@ -1931,21 +1931,21 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotateAllLevels) {
 
 		GPUr2.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
-		// ASSERT_EQ_CIPHERTEXT(cpu_r2, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(cpu_r2, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 		ASSERT_ERROR_OK(result2, resultGPU);
 
 		GPUr3.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
-		// ASSERT_EQ_CIPHERTEXT(cpu_r3, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(cpu_r3, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 		ASSERT_ERROR_OK(result3, resultGPU);
 
 		GPUr4.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
-		// ASSERT_EQ_CIPHERTEXT(cpu_r4, cResGPU);
+		ASSERT_EQ_CIPHERTEXT(cpu_r4, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 		ASSERT_ERROR_OK(result4, resultGPU);

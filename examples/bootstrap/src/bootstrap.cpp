@@ -74,6 +74,7 @@ void SimpleBootstrapExample() {
 	parameters.SetFirstModSize(firstMod);
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
 	std::vector<uint32_t> levelBudget	   = { 3, 3 };
 	uint32_t levelsAvailableAfterBootstrap = 10;
@@ -132,6 +133,7 @@ void BootstrapExample(uint32_t numSlots) {
 	parameters.SetNumLargeDigits(3);
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 #if NATIVEINT == 128 && !defined(__EMSCRIPTEN__)
 	ScalingTechnique rescaleTech = FIXEDAUTO;
@@ -214,6 +216,7 @@ void BootstrapExampleSSE(uint32_t numSlots) {
 	parameters.SetNumLargeDigits(3);
 	parameters.SetKeySwitchTechnique(HYBRID);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 #if NATIVEINT == 128 && !defined(__EMSCRIPTEN__)
 	ScalingTechnique rescaleTech = FIXEDAUTO;

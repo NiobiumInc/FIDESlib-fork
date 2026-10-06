@@ -78,6 +78,7 @@ void AutomaticRescaleDemo(ScalingTechnique scalTech) {
 	parameters.SetScalingTechnique(scalTech);
 	parameters.SetBatchSize(batchSize);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -127,6 +128,7 @@ void ManualRescaleDemo(ScalingTechnique scalTech) {
 	parameters.SetBatchSize(batchSize);
 	parameters.SetScalingTechnique(scalTech);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -191,6 +193,7 @@ void HybridKeySwitchingDemo1() {
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -246,6 +249,7 @@ void HybridKeySwitchingDemo2() {
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -301,6 +305,7 @@ void FastRotationsDemo1() {
 	parameters.SetScalingTechnique(FLEXIBLEAUTO);
 	parameters.SetNumLargeDigits(dnum);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
@@ -401,6 +406,7 @@ void FastRotationsDemo2() {
 	parameters.SetFirstModSize(60);
 	parameters.SetDigitSize(digitSize);
 	parameters.SetBackend(BackendFromEnv());
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 

@@ -27,7 +27,7 @@ int main() {
 	// pick 16384. Harmless on the simulators, just slower.
 	parameters.SetRingDim(65536);
 	parameters.SetBackend(BackendFromEnv()); // [D3] added; OpenFHE has no backend to select
-	parameters.SetReducedNoise(true); // [O2] centered FBC, for bit-exact parity with a WITH_REDUCED_NOISE OpenFHE
+	parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // [O2] matches the oracle's variant
 
 	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 	cc->Enable(PKE);

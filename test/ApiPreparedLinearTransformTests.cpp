@@ -123,10 +123,9 @@ class PreparedLtTest : public ::testing::Test {
 		params.SetScalingTechnique(FIXEDAUTO);
 		if (GetTestBackend() == TestBackend::CUDA)
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
+		else if (GetTestBackend() == TestBackend::HAZE)
 			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true);
-		}
+		params.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);

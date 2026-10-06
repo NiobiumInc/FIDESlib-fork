@@ -253,11 +253,13 @@ Full-suite state after the change, all 145 api-level tests:
 | backend | passed | skipped | failed |
 |---|--:|--:|--:|
 | haze (local) | 142 | 3 | 0 |
-| CUDA | 133 | 10 | 2 |
+| CUDA | 135 | 10 | 0 |
 | CPU | 93 | 37 | 0 |
 
-The 2 CUDA failures are `ApiParityTest.EvalMult`/`EvalSquare`, the relinearization key-switch
-rounding baseline at `test/ApiParityTest.cpp:212-239`. haze's 3 skips are the FLEXIBLEAUTO and
+CUDA is fully green: its former 2 failures (`ApiParityTest.EvalMult`/`EvalSquare`) were not a
+relinearization rounding baseline as once recorded here, but OpenFHE's `WITH_REDUCED_NOISE` FBC
+variant never having been ported to the CUDA `ModDown`/`DecompAndModUpConv` kernels, fixed by
+gating those kernels on `C_.reduced_noise`. haze's 3 skips are the FLEXIBLEAUTO and
 FLEXIBLEAUTOEXT fully-packed parity cases the in-process replay bridge declines; CUDA skips all 5
 fully-packed cases outright, so haze covers two configurations the GPU backend does not.
 
@@ -882,17 +884,23 @@ All 82 also fail in *both* runs of *both* upstream configurations, so the inheri
 Rebuilding upstream against the newer OpenFHE moved only 3 tests, all inside the flaky families,
 so the patch level is not a meaningful variable here.
 
-**Failure kinds.** Roughly half are not bit-compat at all:
+**Failure kinds**, measured 2026-10-03 on this tree after porting OpenFHE's `WITH_REDUCED_NOISE`
+FBC lift to the CUDA `ModDown2`/`ModDown3`/`DecompAndModUpConv`/`DecompAndModUpConv_spec2` kernels
+(the 82/7 counts above predate this fix and are not re-measured here):
 
 | kind | count | families |
 |---|--:|---|
-| `ASSERT_EQ_CIPHERTEXT` - bit-divergence, may still decrypt correctly | 42 | `Mult`, `MultAllLevels`, `MultRescale`, `Square`, `SquareAllLevels` |
+| `ASSERT_EQ_CIPHERTEXT` - bit-divergence, may still decrypt correctly | 3 | `MultAllLevels/1`, `ExtractContextShowPtMult/1`, `ExtractContextShowPtMultAllLevels/1` |
 | `ASSERT_ERROR_OK` - **decrypted values outside tolerance** | 40 | `OpenFHEBootstrap`, `OpenFHEBootstrapLT`, `OpenFHEBootstrapDense`, `LinearTransform`, `CoeffsToSlots` |
 
-The 42 bit-divergence cases are the same relinearization key-switch rounding recorded for
-`ApiParityTest.EvalMult`/`EvalSquare` (`test/ApiParityTest.cpp:212-239`), in a different suite. The
-40 precision failures are genuine numerical breakage in the GPU bootstrap path and are the more
-serious half.
+All 3 bit-divergence cases reproduce identically on a `WITH_REDUCED_NOISE=OFF` rebuild of this same
+tree: `MultAllLevels/1` and `ExtractContextShowPtMult{,AllLevels}/1` are a pre-existing FIXEDAUTO
+rescale-placement harness mismatch, independent of FBC -- the plaintext-multiply sibling
+(`ExtractContextShowPtMult*`) fails too, which a key-switch/reducedNoise bug could not cause since
+a ct x pt multiply never key-switches. The larger family this table once reported (`Mult`,
+`MultAllLevels`, `MultRescale`, `Square`, `SquareAllLevels`) is fixed by gating the CUDA kernels on
+`C_.reduced_noise`. The 40 `ASSERT_ERROR_OK` precision failures are unrelated genuine numerical
+breakage in the GPU bootstrap path and remain the more serious half.
 
 **The 5 fixed-here cases corroborate O6 independently.** Per-parametrization scaling techniques:
 
@@ -905,6 +913,15 @@ serious half.
   partial here. The four FLEXIBLEAUTOEXT dense cases fail in both trees - an inherited gap nothing
   has addressed.
 - `AccumAllLevels/4` is in this tree's flaky set; treat it as noise, not a fix.
+- `AccumAllLevels`'s `ASSERT_EQ_CIPHERTEXT` stays commented out even where 11 siblings elsewhere in
+  this file were made strict (2026-10-03): the GPU `Accumulate` runs a hoisted log-step cascade
+  (`src/CKKS/AccumulateBroadcast.cu`) while the test's CPU reference runs a linear rotate-and-add
+  chain, so the two sides are different algorithms and a bit-exact compare was never valid here.
+- `MatVec` decode failures recur across full-suite runs on this tree at different parametrization
+  indices each time (`{3,4,5,7}` on one run, `{1,2,3,4,7}` on another, both 2026-10) yet 10 isolated
+  reruns of the whole `MatVec/*` family (80 executions) on the same binary produced 0 failures.
+  Unexplained and order/context-dependent -- treat as noise, not a regression, until it reproduces
+  in isolation.
 
 **Methodology warning: a single run of this suite cannot distinguish a regression from noise.**
 7 tests here and 2-4 upstream flip with no source change, confined to

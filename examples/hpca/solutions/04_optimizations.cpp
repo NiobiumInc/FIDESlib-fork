@@ -144,6 +144,7 @@ void sparse_bootstrap() {
 	params.SetNumLargeDigits(dnum);
 	params.SetBatchSize(batchSize);
 	params.SetBackend(BackendFromEnv());
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	params.SetCiphertextAutoload(true);
 
 	// ========
@@ -213,6 +214,7 @@ void uniform_bootstrap() {
 	params.SetNumLargeDigits(dnum);
 	params.SetBatchSize(batchSize);
 	params.SetBackend(BackendFromEnv());
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	params.SetCiphertextAutoload(true);
 
 	// ========
@@ -283,6 +285,7 @@ int main() {
 		parameters.SetNumLargeDigits(dnum);
 		parameters.SetBatchSize(batchSize);
 		parameters.SetBackend(BackendFromEnv());
+		parameters.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
 		parameters.SetPlaintextAutoload(false);
 		parameters.SetCiphertextAutoload(true);
 

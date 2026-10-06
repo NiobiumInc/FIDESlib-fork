@@ -7,11 +7,16 @@
 #include <openfhe.h>
 
 #include <shared_mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace fideslib {
 
 CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params) {
+	if (!params.reducedNoise.has_value()) {
+		throw std::runtime_error("reducedNoise is unset: call CCParams::SetReducedNoise before GenCryptoContext");
+	}
+
 	auto& impl_params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(params.host);
 	auto cc			  = lbcrypto::GenCryptoContext(impl_params);
 
@@ -20,7 +25,7 @@ CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params)
 
 	CryptoContextImpl<DCRTPoly> context;
 	context.host				  = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
-	context.engine_				  = MakeEngine(params.backend, params.reducedNoise);
+	context.engine_				  = MakeEngine(params.backend, *params.reducedNoise);
 	context.auto_load_plaintexts  = params.plaintextAutoload;
 	context.auto_load_ciphertexts = params.ciphertextAutoload;
 	context.multiplicative_depth  = impl_params.GetMultiplicativeDepth();

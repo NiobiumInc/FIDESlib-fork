@@ -34,10 +34,10 @@ bool IsBackendAvailable(Backend backend) {
 
 std::unique_ptr<Engine> MakeEngine(Backend backend, bool reducedNoise) {
 	switch (backend) {
-	case Backend::CPU: return std::make_unique<OpenFheEngine>();
+	case Backend::CPU: return std::make_unique<OpenFheEngine>(reducedNoise);
 	case Backend::CUDA:
 #ifdef FIDESLIB_ENABLE_CUDA
-		return std::make_unique<CudaEngine>();
+		return std::make_unique<CudaEngine>(reducedNoise);
 #else
 		throw std::runtime_error("CUDA backend not compiled in; rebuild with FIDESLIB_ENABLE_CUDA=ON (i.e. with CUDA).");
 #endif

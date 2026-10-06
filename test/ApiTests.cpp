@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "Serialize.hpp"
+#include "TestEngineConfig.hpp" // FIDESlib::Testing::{ConfigureTestEngine, GetTestBackend, TestBackend}
 #include "engine/Engine.hpp"		 // Engine::backend(), for the hard backend guard
 #include "engine/EngineCommon.hpp" // bootstrapModEvalLevels
 #include "engine/cuda/CudaEngine.hpp" // setDropInputHostAfterUpload; empty header when !FIDESLIB_ENABLE_CUDA
@@ -28,20 +29,10 @@
 #include "fideslib.hpp"
 
 using namespace fideslib;
+using FIDESlib::Testing::ConfigureTestEngine;
+using FIDESlib::Testing::GetTestBackend;
+using FIDESlib::Testing::TestBackend;
 
-// The api test fixtures run against any backend: set FIDESLIB_TEST_BACKEND=cuda (on a
-// CUDA build) or =haze (on a haze build) to exercise that engine end-to-end. Builds
-// without the requested backend fall back to CPU, since IsBackendAvailable is false
-// when it is not compiled in.
-enum class TestBackend { CPU, CUDA, HAZE };
-static TestBackend GetTestBackend() {
-	const char* b = std::getenv("FIDESLIB_TEST_BACKEND");
-	if (b != nullptr && std::string(b) == "cuda" && IsBackendAvailable(Backend::CUDA))
-		return TestBackend::CUDA;
-	if (b != nullptr && std::string(b) == "haze" && IsBackendAvailable(Backend::HAZE))
-		return TestBackend::HAZE;
-	return TestBackend::CPU;
-}
 static bool TestUseCuda() {
 	return GetTestBackend() == TestBackend::CUDA;
 }
@@ -94,12 +85,7 @@ class CKKSTest : public ::testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDAUTO);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -577,6 +563,7 @@ TEST(ChebyshevFixedManual, HazeMatchesOpenFheOracle) {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(FIXEDMANUAL);
+		params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	};
 
 	// --- OpenFHE CPU oracle ---
@@ -606,7 +593,6 @@ TEST(ChebyshevFixedManual, HazeMatchesOpenFheOracle) {
 		CCParams<CryptoContextCKKSRNS> params;
 		setCommonParams(params);
 		params.SetBackend(Backend::HAZE);
-		params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
 		auto ccHaze = GenCryptoContext(params);
 		ccHaze->Enable(PKE);
 		ccHaze->Enable(KEYSWITCH);
@@ -671,7 +657,7 @@ TEST_P(ChebyshevFixedManualCoworker, MatchesClosedForm) {
 	params.SetBatchSize(1u << 15);
 	params.SetScalingTechnique(FIXEDMANUAL);
 	params.SetBackend(Backend::HAZE);
-	params.SetReducedNoise(true);
+	params.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise());
 	auto cc = GenCryptoContext(params);
 	cc->Enable(PKE);
 	cc->Enable(KEYSWITCH);
@@ -725,7 +711,7 @@ TEST(DropInputHost, DecryptSurvivesDroppedInput) {
 	params.SetRingDim(kRingDim);
 	params.SetScalingTechnique(FIXEDAUTO);
 	params.SetBackend(Backend::HAZE);
-	params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
+	params.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise());
 	auto cc = GenCryptoContext(params);
 	cc->Enable(PKE);
 	cc->Enable(KEYSWITCH);
@@ -781,6 +767,7 @@ TEST(DropInputHost, DecryptSurvivesDroppedInputCuda) {
 	params.SetRingDim(kRingDim);
 	params.SetScalingTechnique(FIXEDAUTO);
 	params.SetBackend(Backend::CUDA);
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	auto cc = GenCryptoContext(params);
 	cc->Enable(PKE);
 	cc->Enable(KEYSWITCH);
@@ -976,6 +963,7 @@ TEST_F(CKKSTest, SparseEncapsulatedContext) {
 	params.SetRingDim(kRingDim);
 	params.SetScalingTechnique(FIXEDAUTO);
 	params.SetSecretKeyDist(SPARSE_ENCAPSULATED);
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	EXPECT_NO_THROW({
 		auto cc2 = GenCryptoContext(params);
 		cc2->Enable(PKE);
@@ -1006,6 +994,7 @@ TEST_F(CKKSTest, SerializeDeserializeEvalMultKey) {
 	params.SetRingDim(kRingDim);
 	params.SetScalingTechnique(FIXEDAUTO);
 	params.SetSecurityLevel(HEStd_NotSet);
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	auto cc2 = GenCryptoContext(params);
 	cc2->Enable(PKE);
 	cc2->Enable(KEYSWITCH);
@@ -1146,12 +1135,7 @@ class CKKSBootstrapTest : public ::testing::Test {
 		params.SetNumLargeDigits(3);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -1240,12 +1224,7 @@ class CKKSFlexBootstrapTest : public ::testing::Test {
 		params.SetScalingTechnique(FLEXIBLEAUTO);
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
-		if (TestUseCuda())
-			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE) {
-			params.SetBackend(Backend::HAZE);
-			params.SetReducedNoise(true); // parity asserts vs a WITH_REDUCED_NOISE OpenFHE oracle
-		}
+		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
 		cc->Enable(KEYSWITCH);
@@ -1482,6 +1461,7 @@ TEST_F(CKKSTest, SerializeDeserializeEvalAutomorphismKey) {
 	params.SetRingDim(kRingDim);
 	params.SetScalingTechnique(FIXEDAUTO);
 	params.SetSecurityLevel(HEStd_NotSet);
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 	auto cc2 = GenCryptoContext(params);
 	cc2->Enable(PKE);
 	cc2->Enable(KEYSWITCH);
@@ -2252,6 +2232,7 @@ TEST_F(CKKSTest, SerializeDeserializeContextRoundTrip) {
 	ASSERT_TRUE(Serial::DeserializeFromFile(path, cc2, SerType::BINARY));
 	ASSERT_NE(cc2.get(), nullptr);
 	EXPECT_EQ(cc2->GetRingDimension(), cc->GetRingDimension());
+	EXPECT_EQ(cc2->engine_->reducedNoise(), cc->engine_->reducedNoise());
 
 	std::remove(path.c_str());
 	std::remove((path + ".dev").c_str());
@@ -2627,22 +2608,9 @@ static Backend RequestedBackend() {
 	}
 }
 
-// Guard the silent-fallback failure mode. GetTestBackend() resolves to CPU whenever
-// FIDESLIB_TEST_BACKEND names a backend this build lacks, so asking for cuda on a CPU-only build
-// would run these tests entirely on OpenFHE and still report a pass - the level accounting below
-// adapts per backend, so nothing else would notice. These tests exist to prove what the device
-// does, so an unmet request is a failure, not a fallback.
+// GetTestBackend() already refuses a backend this build lacks; this checks the engine actually
+// constructed is the one asked for, since these tests exist to prove what the device does.
 static void RequireRequestedBackend(CryptoContext<DCRTPoly>& cc) {
-	if (const char* want = std::getenv("FIDESLIB_TEST_BACKEND"); want != nullptr) {
-		const std::string requested(want);
-		if (requested == "cuda")
-			EXPECT_TRUE(IsBackendAvailable(Backend::CUDA))
-			  << "FIDESLIB_TEST_BACKEND=cuda but this build has no CUDA backend; refusing to fall back to the CPU";
-		else if (requested == "haze")
-			EXPECT_TRUE(IsBackendAvailable(Backend::HAZE))
-			  << "FIDESLIB_TEST_BACKEND=haze but this build has no haze backend; refusing to fall back to the CPU";
-	}
-	// And the engine actually constructed is the one asked for.
 	EXPECT_EQ(cc->engine_->backend(), RequestedBackend()) << "context was built on a different backend than requested";
 }
 
@@ -2659,8 +2627,7 @@ static CryptoContext<DCRTPoly> MakeContext(SecretKeyDist dist, KeyPair<DCRTPoly>
 	params.SetScalingTechnique(FLEXIBLEAUTO);
 	params.SetSecretKeyDist(dist);
 	params.SetBackend(RequestedBackend());
-	if (RequestedBackend() == Backend::HAZE)
-		params.SetReducedNoise(true);
+	params.SetReducedNoise(LinkedOpenFheReducedNoise());
 
 	auto cc = GenCryptoContext(params);
 	cc->Enable(PKE);

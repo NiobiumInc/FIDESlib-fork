@@ -230,7 +230,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		// format (Montgomery residues, bit-reversed order) is applied by the replay driver, which
 		// decides from the target's device spec (montgomery_enabled) and decodes results back
 		// before they are read.
-		replay.reduced_noise = reducedNoise_ ? 1 : 0;
+		replay.reduced_noise = reducedNoise() ? 1 : 0;
 		// Replay target (default: in-process local simulator, i.e. NULL). This is also the sole
 		// selector of the hardware datapath: point it at a Montgomery device (func_sim_hw, any
 		// fpga*) to get one. Configure it before the bridge brings up the compiler so replay

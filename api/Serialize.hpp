@@ -16,6 +16,10 @@ namespace fideslib {
 
 namespace fideslib::Serial {
 
+    // Label on the .dev sidecar's ReducedNoise line, shared by the writer and reader so the two
+    // cannot drift apart.
+    inline constexpr const char* kReducedNoiseLabel = "ReducedNoise:";
+
     bool SerializeToFile(const std::string& filename, const fideslib::CryptoContext<fideslib::DCRTPoly>& obj, const SerType& sertype);
     bool SerializeToFile(const std::string& filename, const fideslib::PublicKey<fideslib::DCRTPoly>& obj, const SerType& sertype);
     bool SerializeToFile(const std::string& filename, const fideslib::PrivateKey<fideslib::DCRTPoly>& obj, const SerType& sertype);

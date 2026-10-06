@@ -16,6 +16,8 @@
 #include <CKKS/Parameters.cuh>
 #include <string>
 
+#include "OpenFheVariant.hpp" // fideslib::LinkedOpenFheReducedNoise
+
 inline const std::string root_dir = "../";
 
 #define __TBB_NO_IMPLICIT_LINKAGE
@@ -480,6 +482,9 @@ class GeneralParametrizedTest : public testing::TestWithParam<std::tuple<std::tu
 		auto params		  = GetParam();
 		generalTestParams = std::get<0>(std::get<0>(params));
 		fideslibParams	  = std::get<1>(std::get<0>(params));
+		// Checked against the CPU oracle below, so its FBC variant must match the oracle's own
+		// fixed-at-compile-time variant, or the two run different arithmetic.
+		fideslibParams.reducedNoise = fideslib::LinkedOpenFheReducedNoise();
 
 		char* res = getenv("FIDESLIB_USE_NUM_GPUS");
 

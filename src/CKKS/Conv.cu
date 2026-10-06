@@ -3,6 +3,7 @@
 //
 #include "AddSub.cuh"
 #include "CKKS/Conv.cuh"
+#include "CKKS/ReducedNoise.cuh"
 #include "ModMult.cuh"
 
 #include <cooperative_groups.h>
@@ -70,6 +71,10 @@ ModDown2(void** __restrict__ a, const __grid_constant__ int n, void** __restrict
 	}
 	__syncthreads();
 
+	// Same lift count for every target below: it depends only on the source residues/primes this
+	// thread holds, read from buff exactly as the accumulate loop does (read-only, no race).
+	const uint32_t lifted = C_.reduced_noise ? count_lifted(buff, C_.K, C_.L) : 0;
+
 	for (int j = threadIdx.y; j < n; j += blockDim.y) {
 
 		// if (idx == 0) printf("Matrix to %d: ", j);
@@ -78,6 +83,9 @@ ModDown2(void** __restrict__ a, const __grid_constant__ int n, void** __restrict
 			__uint128_t res = 0;
 			for (int i = 0; i < C_.K; ++i) {
 				res = res + (__uint128_t)buff[i * blockDim.x + tid] * G_->ModDown_matrix[MODDOWN_MATRIX(i, primeid)];
+			}
+			if (C_.reduced_noise) {
+				res += (__uint128_t)lifted * (C_.primes[primeid] - C_.P[primeid]);
 			}
 
 			// TODO use better reduction
@@ -225,6 +233,9 @@ ModDown3(void** __restrict__ a, const __grid_constant__ int n, void** __restrict
 	}
 
 	__syncthreads();
+
+	const LiftedPair lifted = C_.reduced_noise ? count_lifted_pair(buff, C_.K, C_.L) : LiftedPair{ 0, 0 };
+
 	for (int j_ = threadIdx.y; j_ < n; j_ += blockDim.y) {
 
 		int primeid = C_.primeid_flattened[primeid_init + j_];
@@ -235,6 +246,11 @@ ModDown3(void** __restrict__ a, const __grid_constant__ int n, void** __restrict
 			// assert(MODUPIDX_MATRIX(n - 1, d, i_, primeid_j) < 64 * 64 * 64 * 8);
 			resx = resx + (__uint128_t)data.x * G_->ModDown_matrix[MODDOWN_MATRIX(i_, primeid)];
 			resy = resy + (__uint128_t)data.y * G_->ModDown_matrix[MODDOWN_MATRIX(i_, primeid)];
+		}
+		if (C_.reduced_noise) {
+			uint64_t negQ = C_.primes[primeid] - C_.P[primeid];
+			resx += (__uint128_t)lifted.x * negQ;
+			resy += (__uint128_t)lifted.y * negQ;
 		}
 
 		assert(a[j_] != nullptr);
@@ -337,6 +353,8 @@ DecompAndModUpConv(void** __restrict__ a, const int __grid_constant__ n, void** 
 
 	__syncthreads();
 
+	const uint32_t lifted = C_.reduced_noise ? count_lifted(buff, n_d_n, C_.primeid_digit_from[d]) : 0;
+
 	// assert(C_.num_primeid_digit_to[d][n - 1] != 0);
 	for (int j_ = threadIdx.y; j_ < C_.num_primeid_digit_to[d][n - 1]; j_ += blockDim.y) {
 		// if (j_ == 0 && idx == 0) printf("Matrix to %d: ", j_);
@@ -357,6 +375,9 @@ DecompAndModUpConv(void** __restrict__ a, const int __grid_constant__ n, void** 
 						uint64_t aux = G_->DecompAndModUp_matrix[MODUPIDX_MATRIX(n - 1, d, primeid /*i_*/, primeid_j)];
 						printf("(%d, %d, %d, %d, %lu)", i_, primeid, primeid_j, MODUPIDX_MATRIX(n - 1, d, primeid /*i_*/, primeid_j), aux);
 					}
+				}
+				if (C_.reduced_noise) {
+					res += (__uint128_t)lifted * G_->DecompAndModUp_negQ[MODUPIDX_SCALE(d, n_d_n - 1, primeid_j)];
 				}
 
 				assert(b[j_] != nullptr);
@@ -766,6 +787,9 @@ DecompAndModUpConv_spec2(void** __restrict__ a, const int __grid_constant__ n, v
 	}
 
 	__syncthreads();
+
+	const LiftedPair lifted = C_.reduced_noise ? count_lifted_pair(buff, n_d_n, C_.primeid_digit_from[d]) : LiftedPair{ 0, 0 };
+
 	for (int j_ = threadIdx.y; j_ < C_.num_primeid_digit_to[d][n - 1]; j_ += blockDim.y) {
 		const int primeid_j = C_.primeid_digit_to[d][j_];
 		if (primeid_j < n || primeid_j >= C_.L) {
@@ -779,6 +803,11 @@ DecompAndModUpConv_spec2(void** __restrict__ a, const int __grid_constant__ n, v
 				assert(MODUPIDX_MATRIX(n - 1, d, i_, primeid_j) < 64 * 64 * 64 * 8);
 				resx = resx + (__uint128_t)data.x * G_->DecompAndModUp_matrix[MODUPIDX_MATRIX(n - 1, d, primeid /*i_*/, primeid_j)];
 				resy = resy + (__uint128_t)data.y * G_->DecompAndModUp_matrix[MODUPIDX_MATRIX(n - 1, d, primeid /*i_*/, primeid_j)];
+			}
+			if (C_.reduced_noise) {
+				uint64_t negQ = G_->DecompAndModUp_negQ[MODUPIDX_SCALE(d, n_d_n - 1, primeid_j)];
+				resx += (__uint128_t)lifted.x * negQ;
+				resy += (__uint128_t)lifted.y * negQ;
 			}
 
 			assert(b[j_] != nullptr);

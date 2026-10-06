@@ -48,6 +48,7 @@ void resnet::generate_context(experiment_settings e) {
 	}
 
 	parameters.SetBackend(fideslib::BackendFromEnv());
+	parameters.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise()); // matches the oracle's variant
 	parameters.SetSecretKeyDist(e.secret_key_dist);
 	parameters.SetPlaintextAutoload(e.autoload);
 

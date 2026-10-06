@@ -747,7 +747,8 @@ if (FIDESLIB_COMPILE_TESTS)
                 ${TEST_SOURCE_DIR}/ApiKeyAccessTests.cpp
                 ${TEST_SOURCE_DIR}/ApiBootstrapToLevelTests.cpp
                 ${TEST_SOURCE_DIR}/ApiPreparedLinearTransformTests.cpp
-                ${TEST_SOURCE_DIR}/ApiParityTest.cpp)
+                ${TEST_SOURCE_DIR}/ApiParityTest.cpp
+                ${TEST_SOURCE_DIR}/ReducedNoiseTests.cpp)
         target_link_libraries(fideslib-cpu-test PRIVATE gtest gtest_main fideslib)
         set_target_properties(fideslib-cpu-test PROPERTIES POSITION_INDEPENDENT_CODE ON)
         gtest_discover_tests(fideslib-cpu-test DISCOVERY_MODE PRE_TEST)
