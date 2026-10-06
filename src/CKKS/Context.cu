@@ -1268,7 +1268,12 @@ std::vector<RNSPoly>& ContextData::auxPolyList() {
 }
 
 std::vector<RNSPoly>& ContextData::auxPolyListFor(const int slot) {
-	if (slot <= 0)
+	// Slot 0 is a KNOWN origin: its list is the context's own, whichever thread holds the slot.
+	// Answering the caller's list here would leave the polynomials of the thread on slot 0 to drift
+	// to whoever destroys them. In the default mode every thread is slot 0, so this is unchanged.
+	if (slot == 0)
+		return precom.auxPoly;
+	if (slot < 0)
 		return auxPolyList();
 	if (static_cast<size_t>(slot) >= op_scratch.size() || op_scratch[slot] == nullptr)
 		return auxPolyList();
