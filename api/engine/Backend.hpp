@@ -20,9 +20,9 @@ class Engine;
 bool IsBackendAvailable(Backend backend);
 
 /// @brief Construct the engine for a backend; throws if it was not compiled in. reducedNoise
-/// selects the FBC variant (see CCParams::SetReducedNoise): honoured by cuda and haze; cpu throws
-/// if it disagrees with the linked OpenFHE's own compile-time WITH_REDUCED_NOISE, since that build
-/// cannot compute any other variant.
+/// selects the FBC variant (see CCParams::SetReducedNoise): honoured by cuda and haze; cpu always
+/// constructs regardless, since the linked OpenFHE fixes its own compile-time WITH_REDUCED_NOISE --
+/// a mismatched cpu engine instead refuses each operation that actually key-switches.
 std::unique_ptr<Engine> MakeEngine(Backend backend, bool reducedNoise);
 
 } // namespace fideslib

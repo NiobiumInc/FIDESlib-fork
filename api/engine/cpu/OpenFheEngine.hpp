@@ -134,7 +134,10 @@ class OpenFheEngine final : public Engine {
   private:
 	/// @brief Throws std::runtime_error naming `op` if reducedNoise() disagrees with
 	/// LinkedOpenFheReducedNoise(). Every method whose OpenFHE call can key-switch (ModUp/ModDown
-	/// via ApproxSwitchCRTBasis) calls this first; see OpenFheEngine.cpp for the per-method evidence.
+	/// via ApproxSwitchCRTBasis) calls this first and refuses unconditionally whenever it COULD
+	/// key-switch, even on an input where the underlying OpenFHE call happens to no-op (e.g. a
+	/// degree-1 Relinearize or a rotation by 0); each call site in OpenFheEngine.cpp names the
+	/// OpenFHE call that key-switches.
 	void requireLinkedVariant(std::string_view op) const;
 };
 

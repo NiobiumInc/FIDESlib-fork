@@ -88,19 +88,31 @@ MinimalCpuContext BuildMinimalCpuContext(bool reducedNoise) {
 	return MinimalCpuContext{ std::move(cc), std::move(keys) };
 }
 
-// Runs fn() and asserts it throws std::runtime_error naming opName.
+// Asserts fn() throws std::runtime_error whose message is requireLinkedVariant's exact text for
+// opName ("cpu <opName> cannot honour ..."), not merely a substring match on opName -- which would
+// let "evalMult" match the "evalMultInPlace" message too.
 void ExpectThrowsNaming(const std::function<void()>& fn, const std::string& opName) {
 	try {
 		fn();
 		FAIL() << "expected " << opName << " to throw";
 	} catch (const std::runtime_error& e) {
-		EXPECT_NE(std::string(e.what()).find(opName), std::string::npos) << e.what();
+		const std::string what	 = e.what();
+		const std::string needle = "cpu " + opName + " cannot honour";
+		EXPECT_NE(what.find(needle), std::string::npos) << "op=" << opName << " what=" << what;
 	}
 }
+
+// One row per OpenFheEngine method guarded by requireLinkedVariant: the op name it was called
+// with, and a callable that drives it (through the public cc facade) far enough to reach the
+// guard. A future guarded method is one more row in CpuMismatchedVariantRefusesEveryGuard below.
+struct GuardCase {
+	std::string opName;
+	std::function<void()> call;
+};
 } // namespace
 
-// MakeEngine(CPU, ...) has only one variant to run -- the one the linked OpenFHE was compiled
-// with -- so the oracle's own value is always accepted and its opposite always refused.
+// MakeEngine(CPU, ...) constructs regardless of variant (see CpuConstructsMismatchedVariant
+// below); this just confirms the oracle's own value is one of the values it accepts.
 TEST(ReducedNoise, CpuAcceptsOracleVariant) {
 	EXPECT_NO_THROW(MakeEngine(Backend::CPU, LinkedOpenFheReducedNoise()));
 }
@@ -135,9 +147,10 @@ TEST(ReducedNoise, CpuMismatchedVariantRunsClientWorkload) {
 		EXPECT_NEAR(out[i], (v1[i] + v2[i]) * v2[i], 1e-6) << "slot " << i;
 }
 
-// (c) The same mismatched context refuses every operation that actually key-switches, naming the
-// operation in the message.
-TEST(ReducedNoise, CpuMismatchedVariantRefusesKeySwitch) {
+// (c) Every OpenFheEngine method guarded by requireLinkedVariant refuses under the mismatched
+// variant, naming itself exactly rather than as a substring of a longer op name. One row per
+// guarded method (see the guarded-method list in OpenFheEngine.cpp); a future guard is one more row.
+TEST(ReducedNoise, CpuMismatchedVariantRefusesEveryGuard) {
 	auto ctx = BuildMinimalCpuContext(!LinkedOpenFheReducedNoise());
 
 	const std::vector<double> v1 = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
@@ -145,13 +158,99 @@ TEST(ReducedNoise, CpuMismatchedVariantRefusesKeySwitch) {
 	auto ct1					 = ctx.cc->Encrypt(pt1, ctx.keys.publicKey);
 	auto ct2					 = ctx.cc->Encrypt(pt1, ctx.keys.publicKey);
 
-	ExpectThrowsNaming([&] { ctx.cc->EvalMult(ct1, ct2); }, "evalMult");
-	ExpectThrowsNaming([&] { ctx.cc->EvalRotate(ct1, 1); }, "evalRotate");
-	ExpectThrowsNaming([&] { ctx.cc->Relinearize(ct1); }, "relinearize");
+	// EvalMultNoRelin does not key-switch (no relinearize), so it is unguarded and is the one way
+	// to mint a real degree-2 ciphertext to drive Relinearize/RelinearizeInPlace below.
+	auto ctDeg2a = ctx.cc->EvalMultNoRelin(ct1, ct2);
+	auto ctDeg2b = ctx.cc->EvalMultNoRelin(ct1, ct2);
+
+	// A precomp/digits object for the fast-rotation family, minted under a separate matched-variant
+	// donor context: every case below throws before touching its contents, so a correctly-typed
+	// object from elsewhere serves as well as one from ctx -- whose own EvalFastRotationPrecompute
+	// is itself one of the guards under test, so it cannot produce one.
+	auto donor		  = BuildMinimalCpuContext(LinkedOpenFheReducedNoise());
+	auto donorPt	  = donor.cc->MakeCKKSPackedPlaintext(v1);
+	auto donorCt	  = donor.cc->Encrypt(donorPt, donor.keys.publicKey);
+	auto dummyPrecomp = donor.cc->EvalFastRotationPrecompute(donorCt);
+	const uint32_t m  = ctx.cc->GetCyclotomicOrder();
+
+	std::vector<double> coeffs = { 0.0, 1.0 };
+	const std::vector<Plaintext> noPts;
+	const std::vector<int> noIndexes;
+	auto maskPt = ctx.cc->MakeCKKSPackedPlaintext(v1);
+
+	const std::vector<GuardCase> cases = {
+		{ "evalMult", [&] { ctx.cc->EvalMult(ct1, ct2); } },
+		{ "evalMultInPlace",
+		  [&] {
+			  auto a				   = ct1, b = ct2;
+			  ctx.cc->EvalMultMutableInPlace(a, b);
+		  } },
+		{ "relinearize", [&] { ctx.cc->Relinearize(ctDeg2a); } },
+		{ "relinearizeInPlace",
+		  [&] {
+			  auto d				   = ctDeg2b;
+			  ctx.cc->RelinearizeInPlace(d);
+		  } },
+		{ "evalSquare", [&] { ctx.cc->EvalSquare(ct1); } },
+		{ "evalSquareInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->EvalSquareInPlace(a);
+		  } },
+		{ "evalRotate", [&] { ctx.cc->EvalRotate(ct1, 1); } },
+		{ "evalRotateInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->EvalRotateInPlace(a, 1);
+		  } },
+		{ "evalFastRotation", [&] { ctx.cc->EvalFastRotation(ct1, 1, m, dummyPrecomp); } },
+		{ "evalFastRotationExt", [&] { ctx.cc->EvalFastRotationExt(ct1, 1, dummyPrecomp, false); } },
+		{ "evalFastRotation", [&] { ctx.cc->EvalFastRotation(ct1, std::vector<int32_t>{ 1 }, m, dummyPrecomp); } },
+		{ "evalFastRotationExt", [&] { ctx.cc->EvalFastRotationExt(ct1, std::vector<int32_t>{ 1 }, dummyPrecomp, false); } },
+		{ "evalFastRotationPrecompute", [&] { ctx.cc->EvalFastRotationPrecompute(ct1); } },
+		{ "evalChebyshevSeries", [&] { ctx.cc->EvalChebyshevSeries(ct1, coeffs, -1.0, 1.0); } },
+		{ "evalChebyshevSeriesInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->EvalChebyshevSeriesInPlace(a, coeffs, -1.0, 1.0);
+		  } },
+		{ "accumulateSum", [&] { ctx.cc->AccumulateSum(ct1, 8, 1); } },
+		{ "accumulateSumInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->AccumulateSumInPlace(a, 8, 1);
+		  } },
+		{ "accumulateSumInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->AccumulateSumInPlace(a, 8, 1, 1);
+		  } },
+		{ "evalBootstrap", [&] { ctx.cc->EvalBootstrap(ct1); } },
+		{ "evalBootstrapInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->EvalBootstrapInPlace(a);
+		  } },
+		{ "convolutionTransformInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  ctx.cc->ConvolutionTransformInPlace(a, 0, 0, noPts, noIndexes);
+		  } },
+		{ "specialConvolutionTransformInPlace",
+		  [&] {
+			  auto a				   = ct1;
+			  auto mask				   = maskPt;
+			  ctx.cc->SpecialConvolutionTransformInPlace(a, 0, 0, noPts, mask, noIndexes, 1, 0, 0);
+		  } },
+	};
+
+	for (const auto& c : cases)
+		ExpectThrowsNaming(c.call, c.opName);
 }
 
-// (d) The matching (linked) variant does none of that throwing.
-TEST(ReducedNoise, CpuMatchedVariantRunsKeySwitch) {
+// (d) The matching (linked) variant does none of that throwing, and the key-switching ops it runs
+// (ct*ct mult, rotate, relinearize-after-no-relin) produce correct results.
+TEST(ReducedNoise, CpuMatchedVariantRunsKeySwitchCorrectly) {
 	auto ctx = BuildMinimalCpuContext(LinkedOpenFheReducedNoise());
 
 	const std::vector<double> v1 = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
@@ -159,9 +258,26 @@ TEST(ReducedNoise, CpuMatchedVariantRunsKeySwitch) {
 	auto ct1					 = ctx.cc->Encrypt(pt1, ctx.keys.publicKey);
 	auto ct2					 = ctx.cc->Encrypt(pt1, ctx.keys.publicKey);
 
-	EXPECT_NO_THROW(ctx.cc->EvalMult(ct1, ct2));
-	EXPECT_NO_THROW(ctx.cc->EvalRotate(ct1, 1));
-	EXPECT_NO_THROW(ctx.cc->Relinearize(ct1));
+	Ciphertext<DCRTPoly> product, rotated, relinearized;
+	EXPECT_NO_THROW(product = ctx.cc->EvalMult(ct1, ct2));
+	EXPECT_NO_THROW(rotated = ctx.cc->EvalRotate(ct1, 1));
+	EXPECT_NO_THROW(relinearized = ctx.cc->Relinearize(ctx.cc->EvalMultNoRelin(ct1, ct2)));
+
+	Plaintext productPt, rotatedPt, relinearizedPt;
+	ctx.cc->Decrypt(product, ctx.keys.secretKey, &productPt);
+	ctx.cc->Decrypt(rotated, ctx.keys.secretKey, &rotatedPt);
+	ctx.cc->Decrypt(relinearized, ctx.keys.secretKey, &relinearizedPt);
+	productPt->SetLength(v1.size());
+	rotatedPt->SetLength(v1.size());
+	relinearizedPt->SetLength(v1.size());
+	auto productOut		 = productPt->GetRealPackedValue();
+	auto rotatedOut		 = rotatedPt->GetRealPackedValue();
+	auto relinearizedOut = relinearizedPt->GetRealPackedValue();
+	for (size_t i = 0; i < v1.size(); ++i) {
+		EXPECT_NEAR(productOut[i], v1[i] * v1[i], 1e-6) << "product slot " << i;
+		EXPECT_NEAR(rotatedOut[i], v1[(i + 1) % v1.size()], 1e-6) << "rotated slot " << i;
+		EXPECT_NEAR(relinearizedOut[i], v1[i] * v1[i], 1e-6) << "relinearized slot " << i;
+	}
 }
 
 // CCParams::reducedNoise has no default; GenCryptoContext must refuse to build from an unset one

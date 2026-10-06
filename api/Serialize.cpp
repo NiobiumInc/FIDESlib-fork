@@ -113,8 +113,9 @@ bool SerializeToFile(const std::string& filename, const fideslib::PrivateKey<fid
 }
 
 // Returns false if the context file or its .dev sidecar is unreadable or incomplete, including a
-// missing or malformed ReducedNoise line. Throws instead if the stored variant mismatches this
-// build's own (OpenFheEngine refuses it at construction) -- the file is fine, this build just cannot honour it.
+// missing or malformed ReducedNoise line. Rebuilding the engine for a stored variant that
+// mismatches this build's own always succeeds for cpu (refusal is deferred to the first
+// key-switching call on the rebuilt engine) and is honoured outright by cuda and haze.
 bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fideslib::DCRTPoly>& obj, const SerType& sertype) {
 
 	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> context;
