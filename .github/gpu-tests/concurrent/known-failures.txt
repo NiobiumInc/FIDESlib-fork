@@ -16,9 +16,3 @@ ConcurrencyTests/ConcurrentOpsTest.*/4
 ConcurrencyTests/ConcurrentOpsTest.BootstrapLanesMatchSerial/3
 ConcurrencyTests/ConcurrentOpsTest.BootstrapLanesMatchSerial/5
 ConcurrencyTests/ConcurrentOpsTest.BootstrapLanesMatchSerial/7
-
-# The test expects every destroyed ciphertext's polynomials on the list of the
-# thread that destroyed them (54 parked, 36 found). Auxiliary polynomials now
-# return to the slot that created them, so the test's expectation predates that
-# change and the drift it measures no longer forms.
-ConcurrencyTests/ConcurrentOpsTest.PassBoundaryReleaseReturnsParkedScratch/*

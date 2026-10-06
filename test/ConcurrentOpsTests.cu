@@ -1426,8 +1426,15 @@ TEST(ConcurrentOpsPoolDrainTest, ProducerConsumerBoundsChunkCount) {
 // -- on no freed list, so no drain can reclaim it. At application scale that ran a 96 GB card out of
 // memory in the third generation pass.
 //
-// So this case reproduces THAT shape -- workers construct, the pass thread destroys -- and asserts
-// what ContextData::releaseParkedScratch owes at a pass boundary:
+// The routing fix removed that drift at its source: a polynomial records the slot that created it
+// (RNSPoly::aux_slot) and its destructor hands it back to THAT slot's list, so the pass thread no
+// longer collects what the workers made and each worker reuses its own polynomials. This case keeps
+// the application's shape and checks the routing first -- exactly, through the context's counters,
+// since how many polynomials a worker reuses depends on timing -- and then the release itself.
+//
+// So this case reproduces THAT shape -- workers construct, the pass thread destroys -- asserts that
+// every polynomial went home to the slot that made it, and then asserts what
+// ContextData::releaseParkedScratch owes at a pass boundary:
 //   1. the parked polynomials are gone (the count drops to zero, not merely down);
 //   2. their blocks reached the SHARED FRESH TIER rather than one lane's private freed list, and
 //      the lanes are empty afterwards;
@@ -1489,6 +1496,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	// Every count that follows is a DELTA against this, which is also why the release is expected
 	// to hand back more than the drift created: it hands back everything parked, not only ours.
 	const size_t parked_baseline = GPUcc.auxPolyParkedCount();
+	const size_t slot0_baseline	 = GPUcc.precom.auxPoly.size();
+	// The routing counters, read with no other thread running. Every count below is a delta.
+	const uint64_t created0 = GPUcc.aux_poly_created_, reused0 = GPUcc.aux_poly_reused_;
+	const uint64_t returned0 = GPUcc.aux_poly_returned_, rehomed0 = GPUcc.aux_poly_rehomed_;
 
 	constexpr int kWorkers	  = 3;
 	constexpr int kPerWorker  = 8;
@@ -1507,12 +1518,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	// THE GATE. Slots are recycled LIFO at thread exit (CudaUtils.cu: SlotHolder::~SlotHolder
 	// pushes the slot onto `freed`, ScratchSlot pops the back of it), and a slot carries its
 	// parked polynomials with it. So a worker that exits before another worker has first asked for
-	// scratch hands that worker its slot WITH two polynomials still on the list, and the new
-	// owner's next Ciphertext constructor draws them straight back out. That is the counting the
-	// /4 and /5 shapes measured: 52 parked instead of 54, 3 hoarding slots instead of 4 -- not
-	// drift the release failed to reach, but two polynomials that were not parked at the moment of
-	// measuring, on a slot that had been handed on. The expectations below are the right ones; the
-	// race was the test's.
+	// scratch hands that worker its slot WITH polynomials still on the list, and the new owner's
+	// next Ciphertext constructor draws them straight back out. The counts below would then miss
+	// polynomials that were in use at the moment of measuring, on a slot that had been handed on:
+	// a race of the test's, not of the code under test.
 	//
 	// So no worker exits until the pass thread has measured AND released: each parks its
 	// polynomials, says so, and blocks here holding its own slot.
@@ -1528,19 +1537,17 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 			cudaSetDevice(dev);
 			try {
 				for (int i = 0; i < kPerWorker; ++i) {
-					// Constructed HERE, on this worker's slot: its list is empty, so both
-					// polynomials are CONSTRUCTED rather than reused, which is the starvation half
-					// of the drift.
+					// Constructed HERE, on this worker's slot. Its list starts empty; once the pass
+					// thread destroys earlier ciphertexts, their polynomials come back to this list
+					// and the later constructors reuse them.
 					auto ct = std::make_unique<FIDESlib::CKKS::Ciphertext>(GPUcc_);
 					std::unique_lock<std::mutex> lk(qm);
 					q_not_full.wait(lk, [&] { return q.size() < kQueueCap; });
 					q.push_back(std::move(ct));
 					q_not_empty.notify_one();
 				}
-				// ...and ONE that this worker destroys itself, so its own slot list is not empty
-				// either. Without it every parked polynomial would sit on slot 0 and the case
-				// would not show that the release walks the OTHER slots -- which is the whole
-				// reason trimAuxilarPoly (the calling thread's list only) was not the fix.
+				// ...and ONE that this worker destroys itself: returned to its own list without
+				// being re-homed, so the counts below separate the two paths.
 				{ FIDESlib::CKKS::Ciphertext local(GPUcc_); }
 			} catch (...) {
 				threw.fetch_add(1);
@@ -1579,8 +1586,8 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 		}
 	} gate_guard{ gate_m, gate_cv, gate_open, workers };
 
-	// The PASS THREAD: destroys everything the workers made. Every destructor parks two
-	// polynomials on slot 0's list, which is the hoarding half of the drift.
+	// The PASS THREAD: destroys everything the workers made. Every destructor hands its two
+	// polynomials back to the slot of the worker that made them, not to this thread's list.
 	int destroyed = 0;
 	for (;;) {
 		std::unique_ptr<FIDESlib::CKKS::Ciphertext> ct;
@@ -1596,8 +1603,8 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 		ct.reset();
 		++destroyed;
 	}
-	// Every worker has parked its two polynomials and is now waiting at the gate, still holding its
-	// slot: 1 + kWorkers hoarding slots, none of them recycled.
+	// Every worker is now waiting at the gate, still holding its slot and the polynomials parked on
+	// it: none of the slots has been recycled.
 	{
 		std::unique_lock<std::mutex> gl(gate_m);
 		all_parked.wait(gl, [&] { return parked_workers == kWorkers; });
@@ -1605,26 +1612,30 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	ASSERT_EQ(destroyed, kWorkers * kPerWorker) << "the pass thread did not receive every ciphertext";
 	cudaDeviceSynchronize();
 
-	// ---- the drift, measured -----------------------------------------------------------------
+	// ---- the routing, measured ---------------------------------------------------------------
 	// kWorkers * kPerWorker ciphertexts died on the pass thread and one more died on each worker,
-	// two polynomials each, and nothing has drawn one back out. So the parked total is exact.
-	const size_t expected_parked = kPolysPerCt * (size_t)(kWorkers * kPerWorker + kWorkers);
-	const size_t parked_before	 = GPUcc.auxPolyParkedCount();
+	// two polynomials each. How many of those polynomials were constructed and how many reused
+	// depends on timing (a worker reuses what the pass thread has already sent home), so the exact
+	// statements are about the counters, not about one total.
+	const uint64_t polys_taken	   = kPolysPerCt * (uint64_t)(kWorkers * kPerWorker + kWorkers);
+	const uint64_t polys_rehomed   = kPolysPerCt * (uint64_t)(kWorkers * kPerWorker);
+	const uint64_t created		   = GPUcc.aux_poly_created_ - created0;
+	const uint64_t reused		   = GPUcc.aux_poly_reused_ - reused0;
+	const size_t parked_before	   = GPUcc.auxPolyParkedCount();
+	const size_t slot0_before	   = GPUcc.precom.auxPoly.size();
+	EXPECT_EQ(created + reused, polys_taken) << "every ciphertext takes two polynomials, constructed or reused";
+	EXPECT_EQ(GPUcc.aux_poly_returned_ - returned0, polys_taken) << "every destroyed ciphertext returns two";
+	EXPECT_EQ(GPUcc.aux_poly_rehomed_ - rehomed0, polys_rehomed)
+		<< "a polynomial the pass thread destroyed did not go back to the worker slot that made it";
 	ASSERT_GE(parked_before, parked_baseline) << "the parked total fell while nothing was drawing polynomials out";
-	EXPECT_EQ(parked_before - parked_baseline, expected_parked)
-		<< "the drift did not form: every ciphertext's polynomials should be parked on the list of the thread that "
-		   "DESTROYED it";
-	// THE ASYMMETRY ITSELF, which is what the measured run shows and what a total cannot: the
-	// thread that FREES holds the mass. Slot 0 IS `precom.auxPoly` (ContextData::auxPolyList), and
-	// this thread is the one that destroyed every ciphertext the workers made, so its list carries
-	// two polynomials per ciphertext while each worker's carries two in total. A GPU run
-	// measured the same shape at application scale: slot lists 0:1664, 1:44, 2:50, 3:50, 4:50 -- ~25
-	// GiB parked on the pass thread against ~50 polynomials on each worker.
-	const size_t slot0_before = GPUcc.precom.auxPoly.size();
-	EXPECT_GE(slot0_before, kPolysPerCt * (size_t)(kWorkers * kPerWorker))
-		<< "the pass thread's own list is not where the polynomials it destroyed went";
-	EXPECT_GT(slot0_before, parked_before - slot0_before)
-		<< "the pass thread should be hoarding MORE than every worker slot put together";
+	// No ciphertext is alive, so every polynomial constructed here is parked on some list.
+	EXPECT_EQ(parked_before - parked_baseline, created)
+		<< "the lists do not hold every polynomial this case constructed";
+	// THE DRIFT, ABSENT: the pass thread destroyed every ciphertext the workers made, and its own
+	// list (slot 0, `precom.auxPoly`) gained none of their polynomials. Before the routing fix this
+	// list held two per ciphertext, and a GPU run measured the same shape at application scale:
+	// slot lists 0:1664, 1:44, 2:50, 3:50, 4:50.
+	EXPECT_EQ(slot0_before, slot0_baseline) << "the pass thread's list kept polynomials the workers made";
 
 	const FIDESlib::MemPoolStats pool_before = FIDESlib::MemPoolStatsSnapshot(dev);
 	const PoolHeld held_before				 = PoolHeldFrom(pool_before);
@@ -1661,10 +1672,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	EXPECT_TRUE(GPUcc.precom.auxPoly.empty())
 		<< "the PASS THREAD'S slot -- the one holding the mass -- still has " << GPUcc.precom.auxPoly.size()
 		<< " polynomials parked";
-	// Slot 0 plus every worker's slot: the drift is ACROSS slots, and a release that emptied only
-	// the caller's list would pass every other assertion here.
-	EXPECT_EQ(rel.slots_drained, (size_t)(1 + kWorkers))
-		<< "the release did not reach every hoarding slot (slot 0 plus one per worker)";
+	// Every worker's slot, plus slot 0 when it held anything: the parked polynomials are ACROSS
+	// slots, and a release that emptied only the caller's list would pass every other assertion.
+	EXPECT_EQ(rel.slots_drained, (size_t)kWorkers + (slot0_baseline > 0 ? 1 : 0))
+		<< "the release did not reach every slot holding parked polynomials";
 
 	// 2. their blocks reached the SHARED fresh tier, and no lane is still holding any.
 	EXPECT_GT(rel.blocks_moved, 0u) << "no pooled block was moved: the polynomials' limbs did not reach the pool";
