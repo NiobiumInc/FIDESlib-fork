@@ -80,7 +80,17 @@ void ChecksumLabel(const std::string& label) {
 	g_ck.label = label;
 }
 
+namespace {
+StageHook g_stage_hook;   // test-only; see Checksum.cuh
+} // namespace
+
+void SetStageHook(StageHook hook) {
+	g_stage_hook = std::move(hook);
+}
+
 void ChecksumProbe(const Ciphertext& ct, const char* tag) {
+	if (g_stage_hook)
+		g_stage_hook(tag, ct);
 	if (!ChecksumEnabled() || g_ck.failed)
 		return;
 	if (g_ck.d == nullptr) {
