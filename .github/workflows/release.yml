@@ -1,0 +1,307 @@
+# Build and publish redistributable FIDESlib packages (CPU + HAZE backends).
+#
+# Each artifact is a tarball carrying libfideslib, libhaze, the OpenFHE and haze
+# headers the public API exposes, and a CMake package -- enough to build and run a
+# consumer on a machine with no package manager, no nix and no OpenFHE install.
+#
+# The `consume` jobs are the point of this workflow: they run on runners that never
+# checked out the source and build the smoke example against the tarball alone, via
+# packaging/test-package.sh. That is the same script used to validate a package
+# locally, so a green run here and a green run on a developer box mean the same thing.
+#
+# The FPGA replay target is not covered here -- GitHub-hosted runners have no accelerator.
+# test-package.sh skips that leg unless FIDESLIB_FPGA_TARGET and NBCC_FHETCH_REPLAY
+# are set, which is how the hardware legs are exercised on an FPGA host instead.
+#
+# A push to nb_main that touches the paths below publishes a release tagged
+# v<date>-<sha7> at that commit; a manual run publishes when `publish` is set. Pull
+# requests build and consume the packages without publishing.
+#
+# The CUDA packages are built unless the repository variable FIDESLIB_RELEASE_CUDA is
+# set to false.
+
+name: release
+
+on:
+  push:
+    branches: [nb_main]
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'api/**'
+      - 'deps/**'
+      - 'packaging/**'
+      - '.github/workflows/release.yml'
+  pull_request:
+    branches: [nb_main]
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'api/**'
+      - 'deps/**'
+      - 'packaging/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Attach the artifacts to a GitHub release'
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Every job reads the repository; only the release job, which creates the tag and the
+# release, needs write, and it declares that escalation itself.
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      matrix: ${{ steps.v.outputs.matrix }}
+    steps:
+      - id: v
+        env:
+          RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
+        run: |
+          v="$(date -u +%Y.%m.%d)"
+          # The build legs. The CUDA artifacts are separate packages, not supersets: they
+          # require the NVIDIA driver at run time, so the plain ones stay usable on
+          # machines with no GPU. libcudart is absorbed statically; only libcuda.so.1
+          # comes from the host, where the kernel driver already provides it. No CUDA leg
+          # on darwin: nvidia has shipped no macOS toolkit since CUDA 10.
+          legs='[
+            {"name": "linux-x86-64", "runner": "ubuntu-24.04", "container": "quay.io/pypa/manylinux_2_28_x86_64", "cuda": "0"},
+            {"name": "linux-aarch64", "runner": "ubuntu-24.04-arm", "container": "quay.io/pypa/manylinux_2_28_aarch64", "cuda": "0"},
+            {"name": "macos-aarch64", "runner": "macos-14", "container": "", "cuda": "0"}]'
+          cuda_legs='[
+            {"name": "linux-x86-64-cuda", "runner": "ubuntu-24.04", "container": "quay.io/pypa/manylinux_2_28_x86_64", "cuda": "1", "cuda_arch": "x86_64"},
+            {"name": "linux-aarch64-cuda", "runner": "ubuntu-24.04-arm", "container": "quay.io/pypa/manylinux_2_28_aarch64", "cuda": "1", "cuda_arch": "sbsa"}]'
+          if [ "${RELEASE_CUDA:-true}" != false ]; then
+            legs=$(jq -c --argjson c "$cuda_legs" '. + $c' <<< "$legs")
+          fi
+          {
+            echo "version=$v"
+            echo "tag=v$v-${GITHUB_SHA::7}"
+            echo "matrix={\"include\":$(jq -c . <<< "$legs")}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) and ships gcc-toolset-14 -- the
+    # pairing this build needs: a C++23 compiler (haze uses std::println) on a glibc
+    # old enough to run everywhere, with libstdc++_nonshared.a absorbing the newer
+    # C++ ABI so the result still loads against an old system libstdc++.
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
+    steps:
+      # niobium-haze and its nested niobium-fhetch are public repos, so the default
+      # GITHUB_TOKEN clones them fine.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install build tools (linux)
+        if: startsWith(matrix.name, 'linux')
+        run: |
+          # gcc-toolset-14 is preinstalled in manylinux_2_28; patchelf normalises rpaths.
+          dnf install -y patchelf || yum install -y patchelf
+          echo "GT_ROOT=/opt/rh/gcc-toolset-14/root" >> "$GITHUB_ENV"
+
+      - name: Install the CUDA toolkit
+        if: matrix.cuda == '1'
+        run: |
+          # Only nvcc, cudart and the driver stub are needed to build: the runner has
+          # no GPU and none is required, since the driver library is resolved on the
+          # target machine. The cuda-toolkit-13-2 metapackage also drags in nsight,
+          # visual-tools, the sanitizer and a JDK (~4GB), which overflows the runner's
+          # disk; FIDESlib links only cudart and the cuda driver stub, no cublas/
+          # curand/cufft, so those stay off.
+          # nvcc 13.x accepts host gcc up to 15, so gcc-toolset-14 is in range.
+          dnf config-manager --add-repo \
+            "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${{ matrix.cuda_arch }}/cuda-rhel8.repo"
+          dnf install -y cuda-nvcc-13-2 cuda-crt-13-2 cuda-cccl-13-2 \
+            cuda-cudart-13-2 cuda-cudart-devel-13-2 cuda-driver-devel-13-2 \
+            cuda-culibos-devel-13-2
+          echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
+
+      - name: Install build tools (macos)
+        if: startsWith(matrix.name, 'macos')
+        run: |
+          # Apple Clang's libc++ predates <print>, which haze needs. Homebrew LLVM 19
+          # supplies it. std::print's runtime support requires macOS 13.3, so the
+          # deployment target cannot go below that.
+          brew install llvm@19 libomp cmake ninja
+          llvm="$(brew --prefix llvm@19)"
+          {
+            echo "CC=$llvm/bin/clang"
+            echo "CXX=$llvm/bin/clang++"
+            echo "MACOSX_DEPLOYMENT_TARGET=13.3"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release package
+        run: |
+          JOBS=$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 4 ) \
+          BUILD_ROOT="${RUNNER_TEMP}/fideslib-build" \
+          OUT_DIR="${GITHUB_WORKSPACE}/dist" \
+          WITH_CUDA="${{ matrix.cuda }}" \
+            bash packaging/build-release.sh "${{ needs.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fideslib-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # The fresh-server proof: these runners receive only the tarball and the test
+  # script. The older distros additionally confirm the glibc floor holds *below* the
+  # image that produced the artifact.
+  #
+  # Only the non-CUDA artifacts are consumed here. A CUDA package needs libcuda.so.1
+  # from the NVIDIA driver even to link a consumer, and a GPU to run one; GitHub-hosted
+  # runners have neither. Their build leg still runs verify-artifact.sh, which checks
+  # the symbol floor and asserts libcudart was absorbed rather than left dynamic.
+  # Run packaging/test-package.sh against them on a GPU host.
+  consume:
+    needs: [build, version]
+    name: consume ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86-64 on almalinux 8 (glibc 2.28)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-24.04
+            container: almalinux:8
+          - name: x86-64 on almalinux 9 (glibc 2.34)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-24.04
+            container: almalinux:9
+          - name: x86-64 on almalinux 10 (glibc 2.39)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-24.04
+            container: almalinux:10
+          - name: x86-64 on ubuntu 22.04 (glibc 2.35)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-24.04
+            container: ubuntu:22.04
+          - name: x86-64 on ubuntu 24.04 (glibc 2.39)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-24.04
+            container: ''
+          # ubuntu-26.04 is GitHub's newest hosted runner (GA); no container, same as
+          # the 24.04 leg above -- whatever the runner natively ships, with no
+          # special setup.
+          - name: x86-64 on ubuntu 26.04 (glibc 2.43)
+            artifact: fideslib-linux-x86-64
+            runner: ubuntu-26.04
+            container: ''
+          - name: aarch64 on ubuntu 22.04
+            artifact: fideslib-linux-aarch64
+            runner: ubuntu-24.04-arm
+            container: ubuntu:22.04
+          - name: macos arm64
+            artifact: fideslib-macos-aarch64
+            runner: macos-14
+            container: ''
+    steps:
+      # Only the test script is taken from the repo -- never the build tree, headers
+      # or libraries. Everything the consumer compiles against comes from the tarball.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: packaging/test-package.sh
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Install a consumer toolchain only
+        shell: bash
+        run: |
+          # Deliberately just a compiler: no cmake, no OpenFHE, no nix, nothing built
+          # from this repository. test-package.sh links the smoke example with plain
+          # -I/-L/-l flags, so a compiler plus tar/gzip to unpack the artifact is the
+          # whole requirement. macOS needs nothing extra: Xcode CLT already provides
+          # clang++ and tar on every GitHub-hosted runner.
+          if [ -f /etc/os-release ] && grep -qiE 'almalinux|rhel|centos' /etc/os-release; then
+            if grep -q 'VERSION_ID="8' /etc/os-release; then
+              # RHEL 8's stock gcc-c++ is GCC 8, which does not accept -std=c++20 at
+              # all (only the provisional -std=c++2a, with incomplete C++20 support
+              # besides) -- fideslib's public headers require real C++20. gcc-toolset
+              # is Red Hat's own AppStream-distributed answer to exactly this: a
+              # current GCC installable alongside the base OS toolchain, the same one
+              # build-release.sh already builds the package with.
+              dnf install -y gcc-toolset-14-gcc-c++ tar gzip
+              echo "CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++" >> "$GITHUB_ENV"
+            else
+              dnf install -y gcc-c++ tar gzip
+            fi
+          elif [ -f /etc/os-release ] && grep -qi ubuntu /etc/os-release; then
+            # Root inside a container job, but not on the bare ubuntu-24.04 runner
+            # (the "no container" leg), which needs sudo for apt-get.
+            SUDO=""
+            [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo"
+            $SUDO apt-get update && $SUDO apt-get install -y g++
+          fi
+
+      - name: Build and run the smoke consumer against the package
+        shell: bash
+        run: |
+          tarball=(dist/*.tar.gz)
+          [ -f "${tarball[0]}" ] || { echo "no tarball found in dist/" >&2; exit 1; }
+          bash packaging/test-package.sh "${tarball[0]}" "${RUNNER_TEMP}/pkgtest"
+
+  release:
+    needs: [build, consume, version]
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # emit-nix-expr.sh lives in the repo, so this job needs the source too.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: packaging/emit-nix-expr.sh
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fideslib-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: cd dist && sha256sum ./*.tar.gz | tee SHA256SUMS
+
+      - name: Emit the nix consumer expression
+        run: |
+          # nix consumes the published tarball rather than producing it: nixpkgs pins
+          # one glibc per revision and none pairs an old glibc with a C++23 compiler.
+          # See packaging/README.md. Same split sunscreen-llvm uses.
+          bash packaging/emit-nix-expr.sh dist "${{ needs.version.outputs.tag }}" \
+            "${{ github.server_url }}/${{ github.repository }}" > dist/fideslib-bin.nix
+
+      # gh is preinstalled on the runner, so no third-party action is needed. --target
+      # puts the tag on the commit that was built rather than the default branch's tip.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "FIDESlib $VERSION" --notes "Built from $GITHUB_SHA." \
+            dist/*.tar.gz dist/SHA256SUMS dist/fideslib-bin.nix
