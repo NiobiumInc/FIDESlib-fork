@@ -30,6 +30,7 @@ run() {
 		"$(grep -m1 -o 'Cuda failure.*' "$out/$file.log")" \
 		"$(grep -m1 -o 'corrupted [a-z -]*\|double free[a-z -]*\|free(): [a-z -]*' "$out/$file.log")" | tee -a "$out/summary.txt"
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
+	grep -E '^\[tabletrace\] (HOT|allocs=.*\(final\))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
 }
 
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee "$out/gpu.txt"
@@ -45,6 +46,14 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 	base) run "$v" 1500 ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
 	lock:*) run "$v" 1500 env FIDESLIB_CONCURRENT_OPS_DIAG="${x#lock:}" ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
 	env:*) run "$v" 1500 env $(printf '%s' "${x#env:}" | tr ',' ' ') ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
+	memcheck-sor)
+		# Stream-ordered race tracking: a use of a cudaMallocAsync allocation after its
+		# cudaFreeAsync (or before its allocation) in stream order, whatever the timing.
+		f=$(printf '%s' "$v" | tr ':,' '-_')
+		run "$v" 2700 "$SAN" --tool memcheck --track-stream-ordered-races all --show-backtrace device \
+			--print-limit 30 --log-file "$out/$f.sanitizer.txt" ./fideslib-test --gtest_filter="$UNIT"
+		{ echo "    ===== $f.sanitizer.txt"; grep -v '^\s*$' "$out/$f.sanitizer.txt" | head -120 | sed 's/^/    /'; } | tee -a "$out/summary.txt"
+		;;
 	asan)
 		rm -f "$out"/asanreport.*
 		run "$v" 2400 env OMP_NUM_THREADS=8 OMP_WAIT_POLICY=passive \
@@ -58,6 +67,9 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 		done
 		;;
 	esac
+done
+for f in "$out"/*.sanitizer.txt; do
+	[ -f "$f" ] && echo "$(basename "$f" .sanitizer.txt): $(grep -h 'ERROR SUMMARY' "$f" | tail -1)" | tee -a "$out/summary.txt"
 done
 { echo '```'; cat "$out/summary.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 exit 0
