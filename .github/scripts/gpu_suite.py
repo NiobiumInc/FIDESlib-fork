@@ -11,6 +11,11 @@ Three passes, each with its own gtest XML report:
 3. Known failures, with --known-failures: the tests in known-failures.txt, as a
    report that never fails the check.
 
+With --only, the gate runs just the tests that match those gtest patterns (still
+minus the lists), so one pass can cover a part of the suite that needs its own
+environment, such as the concurrent-operations mode. --title names the summary
+section, so two passes in one job stay apart.
+
 The suite prints too much for a step log, so each pass writes its full output
 to <out>/<pass>.log and the step log keeps only gtest's progress lines. The
 report is Markdown, appended to $GITHUB_STEP_SUMMARY when that is set and
@@ -136,14 +141,19 @@ def main():
     parser.add_argument("out", help="directory for the gtest XML reports")
     parser.add_argument("--known-failures", action="store_true",
                         help="also run known-failures.txt, as a report")
+    parser.add_argument("--only", default="*",
+                        help="gtest patterns the gate runs, ':'-separated (default: every test)")
+    parser.add_argument("--title", default="GPU test suite",
+                        help="heading of this pass's section in the job summary")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     benchmarks, known, flaky = (read_patterns(os.path.join(args.lists, name)) for name in LISTS)
 
     # 1. Gate, with up to RETRIES more attempts for whatever fails.
-    gate_status, gate = run(args.binary, "-" + ":".join(benchmarks + known + flaky),
-                            os.path.join(args.out, "gate.xml"))
+    excluded = benchmarks + known + flaky
+    gate_filter = args.only + ("-" + ":".join(excluded) if excluded else "")
+    gate_status, gate = run(args.binary, gate_filter, os.path.join(args.out, "gate.xml"))
     exit_status = 0
     failed = []        # gate tests that failed their first attempt
     pending = []       # gate tests that have failed every attempt so far
@@ -192,7 +202,7 @@ def main():
     known_pass = (report_only(args.binary, known, os.path.join(args.out, "known-failures.xml"))
                   if args.known_failures else None)
 
-    lines = ["## GPU test suite", ""]
+    lines = [f"## {args.title}", ""]
     if exit_status == 0:
         lines.append(f"**Check: passed.** No test outside the lists failed all {RETRIES + 1} attempts.")
     elif pending:
@@ -257,11 +267,14 @@ def main():
         for name, (status, message) in sorted(known_pass[1].items()):
             lines.append(f"| `{name}` | {status} | {message} |")
 
-    lines += ["", "### Not run in this job", ""]
-    lines.append("- Timing benchmarks: " + ", ".join(f"`{p}`" for p in benchmarks))
-    if not args.known_failures:
-        lines.append(f"- Known failures: {len(known)} patterns in `known-failures.txt`. "
-                     "Run the workflow by hand with **known_failures** to include them.")
+    not_run = []
+    if benchmarks:
+        not_run.append("- Timing benchmarks: " + ", ".join(f"`{p}`" for p in benchmarks))
+    if not args.known_failures and known:
+        not_run.append(f"- Known failures: {len(known)} patterns in `known-failures.txt`. "
+                       "Run the workflow by hand with **known_failures** to include them.")
+    if not_run:
+        lines += ["", "### Not run in this job", ""] + not_run
 
     text = "\n".join(lines) + "\n"
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
