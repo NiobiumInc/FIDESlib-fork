@@ -294,6 +294,44 @@ jobs:
           bash packaging/emit-nix-expr.sh dist "${{ needs.version.outputs.tag }}" \
             "${{ github.server_url }}/${{ github.repository }}" > dist/fideslib-bin.nix
 
+      # The description: where the release comes from, what each package is and how to
+      # use them. gh appends GitHub's generated list of the pull requests since the
+      # previous release.
+      - name: Write the release notes
+        env:
+          RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
+        run: |
+          describe() {
+            case "$1" in
+              fideslib-cuda-linux-x86-64-*) echo "Linux x86-64, glibc 2.28 or newer: CPU, haze and CUDA backends, built for sm_120. Needs an NVIDIA driver that supports CUDA 13.2." ;;
+              fideslib-cuda-linux-aarch64-*) echo "Linux aarch64, glibc 2.28 or newer: CPU, haze and CUDA backends, built for sm_120. Needs an NVIDIA driver that supports CUDA 13.2." ;;
+              fideslib-linux-x86-64-*) echo "Linux x86-64, glibc 2.28 or newer: CPU and haze backends." ;;
+              fideslib-linux-aarch64-*) echo "Linux aarch64, glibc 2.28 or newer: CPU and haze backends." ;;
+              fideslib-macos-aarch64-*) echo "macOS arm64, 13.3 or newer: CPU and haze backends." ;;
+              *) echo "" ;;
+            esac
+          }
+          {
+            echo "Built from \`$GITHUB_SHA\` on \`$GITHUB_REF_NAME\`."
+            echo
+            echo "## Packages"
+            echo
+            for f in dist/*.tar.gz; do
+              n=$(basename "$f")
+              echo "- \`$n\`: $(describe "$n")"
+            done
+            if [ "${RELEASE_CUDA:-true}" = false ]; then
+              echo
+              echo "This release has no CUDA packages. To use the CUDA backend, build FIDESlib from source."
+            fi
+            echo
+            echo "## Using them"
+            echo
+            echo "- \`SHA256SUMS\` holds the checksum of every tarball: \`sha256sum -c SHA256SUMS\`."
+            echo "- \`fideslib-bin.nix\` consumes the Linux and macOS tarballs by hash: \`pkgs.callPackage ./fideslib-bin.nix { }\`."
+            echo "- Each tarball carries the headers, the libraries and a CMake package; \`packaging/README.md\` describes them."
+          } > "$RUNNER_TEMP/notes.md"
+
       # gh is preinstalled on the runner, so no third-party action is needed. --target
       # puts the tag on the commit that was built rather than the default branch's tip.
       - name: Publish the release
@@ -303,5 +341,5 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "FIDESlib $VERSION" --notes "Built from $GITHUB_SHA." \
+            --title "FIDESlib $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
             dist/*.tar.gz dist/SHA256SUMS dist/fideslib-bin.nix
