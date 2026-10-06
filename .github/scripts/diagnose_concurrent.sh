@@ -4,6 +4,9 @@
 #   base.N                 the unit as is
 #   lock:<kinds>.N         FIDESLIB_CONCURRENT_OPS_DIAG=<kinds> (those op kinds behind one host lock)
 #   asan.N                 the unit once, for a binary built with AddressSanitizer
+#   env:VAR=1,VAR2=1.N     the unit with those environment variables set
+# The gcp-ephemeral VM is stopped about 99 minutes into the job, so no variant starts after
+# DEADLINE minutes of this script, and the artifacts always get uploaded.
 set -u
 out=diag
 mkdir -p "$out"
@@ -30,12 +33,18 @@ run() {
 }
 
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee "$out/gpu.txt"
+DEADLINE=${DEADLINE:-78}
 for v in $(grep -v '^#' ../.github/diag-variants.txt); do
+	if [ $SECONDS -gt $((DEADLINE * 60)) ]; then
+		echo "deadline reached after $((SECONDS / 60)) min: not starting $v" | tee -a "$out/summary.txt"
+		break
+	fi
 	x=${v%.*}
 	free -g | awk 'NR==2 { printf "    host memory: %s GB used of %s\n", $3, $2 }'
 	case "$x" in
 	base) run "$v" 1500 ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
 	lock:*) run "$v" 1500 env FIDESLIB_CONCURRENT_OPS_DIAG="${x#lock:}" ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
+	env:*) run "$v" 1500 env $(printf '%s' "${x#env:}" | tr ',' ' ') ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
 	asan)
 		rm -f "$out"/asanreport.*
 		run "$v" 2400 env OMP_NUM_THREADS=8 OMP_WAIT_POLICY=passive \
