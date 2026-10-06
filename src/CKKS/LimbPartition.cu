@@ -802,6 +802,11 @@ void LimbPartition::multPt(const LimbPartition& p) {
 	assert(limbsize <= p.limb.size());
 	assert(limbsize > 1);
 	cudaSetDevice(device);
+	// The plaintext is an operand, as in multElement: wait for whatever its stream still has in
+	// flight (its upload) before reading it, and below make its stream wait for this read before it
+	// can be rewritten or freed. Without the first wait a plaintext loaded just before the call is
+	// read half-written; without the second its blocks can return to the pool under the read.
+	s.wait(p.getS());
 
 	constexpr bool capture = false;
 	// thread_local, not a bare function-local static: this is on the ct x pt path -- the hottest
@@ -840,6 +845,7 @@ void LimbPartition::multPt(const LimbPartition& p) {
 		//     limb.pop_back();
 		// }
 	}
+	p.getS().wait(s);
 }
 
 void LimbPartition::modup(LimbPartition& aux_partition) {
