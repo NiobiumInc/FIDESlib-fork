@@ -16,6 +16,11 @@ minus the lists), so one pass can cover a part of the suite that needs its own
 environment, such as the concurrent-operations mode. --title names the summary
 section, so two passes in one job stay apart.
 
+With --isolate, every test runs in a process of its own. A test that kills its
+process (a CUDA error leaves the context unusable, and the library exits) then
+fails alone instead of hiding every test after it, and a test that ends without
+writing its report counts as a failure, never as a pass.
+
 The suite prints too much for a step log, so each pass writes its full output
 to <out>/<pass>.log and the step log keeps only gtest's progress lines. The
 report is Markdown, appended to $GITHUB_STEP_SUMMARY when that is set and
@@ -113,6 +118,43 @@ def run(binary, gtest_filter, report):
     return status, parse(report)
 
 
+def list_tests(binary, gtest_filter):
+    """Returns the full names of the tests a filter selects, in gtest's order."""
+    listing = subprocess.run([binary, "--gtest_list_tests", f"--gtest_filter={gtest_filter}"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    names, suite = [], None
+    for line in listing.stdout.splitlines():
+        text = line.split("#", 1)[0].rstrip()
+        if not text:
+            continue
+        if not line.startswith(" "):
+            suite = text if text.endswith(".") else None
+        elif suite:
+            names.append(suite + text.strip())
+    return names
+
+
+def run_isolated(binary, names, out_dir):
+    """Runs each test in a process of its own. Returns (exit status, results).
+
+    A test whose process ends without its report, or without the test in it, is
+    recorded as failed with how the process ended.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    status, results = 0, {}
+    for index, name in enumerate(names):
+        code, found = run(binary, name, os.path.join(out_dir, f"{index:03d}.xml"))
+        if found is None or name not in found:
+            how = f"signal {-code}" if code < 0 else f"exit {code}"
+            results[name] = ("failed", f"crashed: the process ended ({how}) without reporting this test")
+            print(f"::warning::{name} ended its process ({how}) without reporting a result", flush=True)
+            status = status or 1
+        else:
+            results.update(found)
+            status = status or code
+    return status, results
+
+
 def counts(results):
     by = {"passed": 0, "failed": 0, "skipped": 0, "disabled": 0}
     for status, _ in results.values():
@@ -127,10 +169,12 @@ def count_row(label, results, status):
     return f"| {label} | {total} | {passed} | {failed} | {skipped} | {disabled} |"
 
 
-def report_only(binary, patterns, report):
+def report_only(binary, patterns, report, isolate=False):
     """Runs a report-only pass. Returns (exit status, results) or None if empty."""
     if not patterns:
         return None
+    if isolate:
+        return run_isolated(binary, list_tests(binary, ":".join(patterns)), os.path.splitext(report)[0])
     return run(binary, ":".join(patterns), report)
 
 
@@ -145,6 +189,8 @@ def main():
                         help="gtest patterns the gate runs, ':'-separated (default: every test)")
     parser.add_argument("--title", default="GPU test suite",
                         help="heading of this pass's section in the job summary")
+    parser.add_argument("--isolate", action="store_true",
+                        help="run every test in a process of its own")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -153,7 +199,11 @@ def main():
     # 1. Gate, with up to RETRIES more attempts for whatever fails.
     excluded = benchmarks + known + flaky
     gate_filter = args.only + ("-" + ":".join(excluded) if excluded else "")
-    gate_status, gate = run(args.binary, gate_filter, os.path.join(args.out, "gate.xml"))
+    if args.isolate:
+        gate_status, gate = run_isolated(args.binary, list_tests(args.binary, gate_filter),
+                                         os.path.join(args.out, "gate"))
+    else:
+        gate_status, gate = run(args.binary, gate_filter, os.path.join(args.out, "gate.xml"))
     exit_status = 0
     failed = []        # gate tests that failed their first attempt
     pending = []       # gate tests that have failed every attempt so far
@@ -171,8 +221,12 @@ def main():
             if not pending:
                 break
             print(f"Retry {attempt} of {RETRIES}: " + " ".join(pending), flush=True)
-            status, results = run(args.binary, ":".join(pending),
-                                  os.path.join(args.out, f"gate-retry{attempt}.xml"))
+            if args.isolate:
+                status, results = run_isolated(args.binary, pending,
+                                               os.path.join(args.out, f"gate-retry{attempt}"))
+            else:
+                status, results = run(args.binary, ":".join(pending),
+                                      os.path.join(args.out, f"gate-retry{attempt}.xml"))
             retry_rows.append((f"Check, retry {attempt}", results, status))
             still = []
             for name in pending:
@@ -198,8 +252,8 @@ def main():
         exit_status = 1
 
     # 2 and 3. Report-only passes.
-    flaky_pass = report_only(args.binary, flaky, os.path.join(args.out, "flaky.xml"))
-    known_pass = (report_only(args.binary, known, os.path.join(args.out, "known-failures.xml"))
+    flaky_pass = report_only(args.binary, flaky, os.path.join(args.out, "flaky.xml"), args.isolate)
+    known_pass = (report_only(args.binary, known, os.path.join(args.out, "known-failures.xml"), args.isolate)
                   if args.known_failures else None)
 
     lines = [f"## {args.title}", ""]
@@ -209,6 +263,8 @@ def main():
         lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {RETRIES + 1} attempts.")
     else:
         lines.append("**Check: failed.** The suite did not finish; see the job log.")
+    if args.isolate:
+        lines += ["", "Each test ran in a process of its own."]
     lines += ["", "| Pass | Tests | Passed | Failed | Skipped | Disabled |", "|---|---:|---:|---:|---:|---:|"]
     lines.append(count_row("Check", gate, gate_status))
     for label, results, status in retry_rows:

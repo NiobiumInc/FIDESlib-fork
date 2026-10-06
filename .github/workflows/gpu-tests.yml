@@ -195,6 +195,8 @@ jobs:
       # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
       # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
       # It runs even when the default-mode suite failed, so both results are reported.
+      # Every test gets a process of its own: a CUDA error leaves the context unusable for
+      # the rest of the process, so one crash would otherwise hide every test after it.
       - name: Test concurrent operations
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: build
@@ -207,7 +209,7 @@ jobs:
           if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
             --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' "${args[@]}"
+            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
 
       - name: Upload test reports
         if: always()
