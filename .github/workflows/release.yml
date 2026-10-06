@@ -13,9 +13,12 @@
 # test-package.sh skips that leg unless FIDESLIB_FPGA_TARGET and NBCC_FHETCH_REPLAY
 # are set, which is how the hardware legs are exercised on an FPGA host instead.
 #
-# A push to nb_main that touches the paths below publishes a release tagged
-# v<date>-<sha7> at that commit; a manual run publishes when `publish` is set. Pull
-# requests build and consume the packages without publishing.
+# Pull requests and pushes to nb_main that touch the paths below build and consume the
+# packages. Publishing is manual for now: run this workflow with `publish` on, and it
+# releases the packages tagged v<date>-<sha7> at the commit it ran on.
+#
+# Every job writes what it did to the run's summary, and the final `report` job adds one
+# table of all of them, so a failure shows where to look without opening each log.
 #
 # The CUDA packages are built unless the repository variable FIDESLIB_RELEASE_CUDA is
 # set to false.
@@ -149,12 +152,44 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build release package
+        id: build
+        shell: bash
         run: |
           JOBS=$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 4 ) \
           BUILD_ROOT="${RUNNER_TEMP}/fideslib-build" \
           OUT_DIR="${GITHUB_WORKSPACE}/dist" \
           WITH_CUDA="${{ matrix.cuda }}" \
-            bash packaging/build-release.sh "${{ needs.version.outputs.version }}"
+            bash packaging/build-release.sh "${{ needs.version.outputs.version }}" 2>&1 \
+            | tee "$RUNNER_TEMP/build.log"
+
+      - name: Report the build
+        if: always()
+        shell: bash
+        env:
+          LEG: ${{ matrix.name }}
+          OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+          {
+            echo "### build $LEG: $OUTCOME"
+            if ls dist/*.tar.gz >/dev/null 2>&1; then
+              echo
+              echo "| Package | Size | sha256 |"
+              echo "|---|---:|---|"
+              for f in dist/*.tar.gz; do
+                echo "| \`$(basename "$f")\` | $(awk -v b="$(wc -c < "$f")" 'BEGIN { printf "%.1f", b / 1048576 }') MiB | \`$(sha "$f")\` |"
+              done
+            fi
+            if [ "$OUTCOME" != success ] && [ -s "$RUNNER_TEMP/build.log" ]; then
+              echo
+              echo "<details><summary>Last 60 lines of the build log</summary>"
+              echo
+              echo '```'
+              tail -n 60 "$RUNNER_TEMP/build.log"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -229,6 +264,7 @@ jobs:
           path: dist
 
       - name: Install a consumer toolchain only
+        id: toolchain
         shell: bash
         run: |
           # Deliberately just a compiler: no cmake, no OpenFHE, no nix, nothing built
@@ -258,15 +294,44 @@ jobs:
           fi
 
       - name: Build and run the smoke consumer against the package
+        id: consume
         shell: bash
         run: |
           tarball=(dist/*.tar.gz)
           [ -f "${tarball[0]}" ] || { echo "no tarball found in dist/" >&2; exit 1; }
-          bash packaging/test-package.sh "${tarball[0]}" "${RUNNER_TEMP}/pkgtest"
+          bash packaging/test-package.sh "${tarball[0]}" "${RUNNER_TEMP}/pkgtest" 2>&1 \
+            | tee "$RUNNER_TEMP/consume.log"
+
+      - name: Report the consumer
+        if: always()
+        shell: bash
+        env:
+          LEG: ${{ matrix.name }}
+          TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          OUTCOME: ${{ steps.consume.outcome }}
+        run: |
+          if [ -f /etc/os-release ]; then system=$(. /etc/os-release && echo "$PRETTY_NAME"); else system="macOS $(sw_vers -productVersion 2>/dev/null)"; fi
+          compiler=$( (${CXX:-c++} --version 2>/dev/null || true) | head -1)
+          {
+            echo "### consume $LEG: $OUTCOME"
+            echo
+            echo "- System: $system"
+            echo "- Compiler: ${compiler:-none found} (toolchain install: $TOOLCHAIN)"
+            if [ "$OUTCOME" != success ] && [ -s "$RUNNER_TEMP/consume.log" ]; then
+              echo
+              echo "<details><summary>Last 60 lines of the consumer log</summary>"
+              echo
+              echo '```'
+              tail -n 60 "$RUNNER_TEMP/consume.log"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     needs: [build, consume, version]
-    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    # Manual for now: pushes to nb_main and pull requests never publish.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -343,3 +408,64 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "FIDESlib $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
             dist/*.tar.gz dist/SHA256SUMS dist/fideslib-bin.nix
+
+  # One table for the whole run: every job with its result, duration and link, whether
+  # the CUDA packages were built, whether the run published, and the packages it built.
+  # It runs even when a build or a consumer failed, which is when it matters most.
+  report:
+    needs: [version, build, consume, release]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: fideslib-*
+          merge-multiple: true
+          path: dist
+
+      - name: Summarize the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mark() { case "$1" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹️";; skipped) echo "⏭️";; *) echo "❔";; esac; }
+          mins() { [ -n "$1" ] && [ -n "$2" ] && echo "$(( ($(date -d "$2" +%s) - $(date -d "$1" +%s) + 59) / 60 )) min" || echo "—"; }
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name != "report") | [.name, (.conclusion // .status), (.started_at // ""), (.completed_at // ""), .html_url] | @tsv' \
+            > jobs.tsv
+          {
+            echo "## Release run $VERSION"
+            echo
+            echo "- Commit: \`$GITHUB_SHA\` ($GITHUB_EVENT_NAME on \`$GITHUB_REF_NAME\`)"
+            if [ "${RELEASE_CUDA:-true}" = false ]; then
+              echo "- CUDA packages: left out (repository variable FIDESLIB_RELEASE_CUDA is false)"
+            else
+              echo "- CUDA packages: built"
+            fi
+            case "$RELEASE_RESULT" in
+              success) echo "- Published: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" ;;
+              skipped) echo "- Not published: publishing is manual (run this workflow with publish on)." ;;
+              *) echo "- Publishing: $(mark "$RELEASE_RESULT") $RELEASE_RESULT" ;;
+            esac
+            echo
+            echo "| Job | Result | Duration |"
+            echo "|---|---|---:|"
+            while IFS=$'\t' read -r name result started completed url; do
+              echo "| [$name]($url) | $(mark "$result") $result | $(mins "$started" "$completed") |"
+            done < jobs.tsv
+            if ls dist/*.tar.gz >/dev/null 2>&1; then
+              echo
+              echo "| Package | Size | sha256 |"
+              echo "|---|---:|---|"
+              for f in dist/*.tar.gz; do
+                echo "| \`$(basename "$f")\` | $(awk -v b="$(wc -c < "$f")" 'BEGIN { printf "%.1f", b / 1048576 }') MiB | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
