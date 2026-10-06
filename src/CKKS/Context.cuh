@@ -221,9 +221,10 @@ class ContextData {
 	OpScratch& opScratch(const int slot);
 	std::vector<RNSPoly>& auxPolyList();
 	/// The free list of a GIVEN slot, for returning a polynomial to the slot that created it:
-	/// slot 0 (and any slot whose scratch is not materialised, or -1) answers the calling thread's
-	/// list, so an unknown origin degrades to the behaviour this always had. Caller holds
-	/// `aux_poly_lock` in the concurrent mode; this never materialises a slot's scratch.
+	/// slot 0 answers `precom.auxPoly`, its list, and an unknown origin (-1, or a slot whose
+	/// scratch is not materialised) answers the calling thread's list, the behaviour this always
+	/// had. Caller holds `aux_poly_lock` in the concurrent mode; this never materialises a slot's
+	/// scratch.
 	std::vector<RNSPoly>& auxPolyListFor(int slot);
 	void ensureTopLimb(OpScratch& sc);
 	void destroyOpScratch();

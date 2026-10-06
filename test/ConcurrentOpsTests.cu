@@ -1443,10 +1443,13 @@ TEST(ConcurrentOpsPoolDrainTest, ProducerConsumerBoundsChunkCount) {
 // (3) is the assertion that matters: (1) and (2) could both pass on a release that handed back
 // memory the allocator cannot draw from.
 //
+// Which thread gets which slot depends on the order they first ask for one, so a worker may hold
+// slot 0, the context's own list, and the pass thread another. The routing does not depend on it,
+// and neither does any expectation below.
+//
 // CUDA-ONLY. Run it with FIDESLIB_CONCURRENT_OPS=1 (it skips otherwise -- in the default mode
-// there is one list, one thread and nothing to drift) and FIDESLIB_SCRATCH_SLOTS above the worker
-// count, so every worker gets its own slot rather than sharing slot 0, which is what makes the
-// drift visible at all.
+// there is one list, one thread and nothing to route) and FIDESLIB_SCRATCH_SLOTS above the worker
+// count (the default is), since every issuing thread needs a slot of its own.
 // =================================================================================================
 
 namespace {
@@ -1492,11 +1495,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	cudaSetDevice(dev);
 
 	// Prepare() issues ops on THIS thread (the key-switching keys, the bootstrap precomputation),
-	// so slot 0 may already be holding polynomials that have nothing to do with the drift below.
+	// so a list may already be holding polynomials that have nothing to do with the routing below.
 	// Every count that follows is a DELTA against this, which is also why the release is expected
-	// to hand back more than the drift created: it hands back everything parked, not only ours.
+	// to hand back more than this case created: it hands back everything parked, not only ours.
 	const size_t parked_baseline = GPUcc.auxPolyParkedCount();
-	const size_t slot0_baseline	 = GPUcc.precom.auxPoly.size();
 	// The routing counters, read with no other thread running. Every count below is a delta.
 	const uint64_t created0 = GPUcc.aux_poly_created_, reused0 = GPUcc.aux_poly_reused_;
 	const uint64_t returned0 = GPUcc.aux_poly_returned_, rehomed0 = GPUcc.aux_poly_rehomed_;
@@ -1514,6 +1516,7 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	int producers_live		   = kWorkers;
 
 	std::atomic<int> threw{ 0 };
+	std::vector<int> worker_slot(kWorkers, -1); ///< each written by its own worker before the gate
 
 	// THE GATE. Slots are recycled LIFO at thread exit (CudaUtils.cu: SlotHolder::~SlotHolder
 	// pushes the slot onto `freed`, ScratchSlot pops the back of it), and a slot carries its
@@ -1533,9 +1536,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	std::vector<std::thread> workers;
 	workers.reserve(kWorkers);
 	for (int t = 0; t < kWorkers; ++t) {
-		workers.emplace_back([&] {
+		workers.emplace_back([&, t] {
 			cudaSetDevice(dev);
 			try {
+				worker_slot[t] = FIDESlib::ScratchSlot(); // the slot its first constructor would take
 				for (int i = 0; i < kPerWorker; ++i) {
 					// Constructed HERE, on this worker's slot. Its list starts empty; once the pass
 					// thread destroys earlier ciphertexts, their polynomials come back to this list
@@ -1587,7 +1591,8 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	} gate_guard{ gate_m, gate_cv, gate_open, workers };
 
 	// The PASS THREAD: destroys everything the workers made. Every destructor hands its two
-	// polynomials back to the slot of the worker that made them, not to this thread's list.
+	// polynomials back to the slot of the worker that made them, not to this thread's list, slot 0
+	// included.
 	int destroyed = 0;
 	for (;;) {
 		std::unique_ptr<FIDESlib::CKKS::Ciphertext> ct;
@@ -1622,20 +1627,36 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	const uint64_t created		   = GPUcc.aux_poly_created_ - created0;
 	const uint64_t reused		   = GPUcc.aux_poly_reused_ - reused0;
 	const size_t parked_before	   = GPUcc.auxPolyParkedCount();
-	const size_t slot0_before	   = GPUcc.precom.auxPoly.size();
+	const int pass_slot			   = FIDESlib::ScratchSlot();
+	printf("[pass-boundary] slots: pass thread %d, workers", pass_slot);
+	for (const int s : worker_slot)
+		printf(" %d", s);
+	printf("\n");
 	EXPECT_EQ(created + reused, polys_taken) << "every ciphertext takes two polynomials, constructed or reused";
 	EXPECT_EQ(GPUcc.aux_poly_returned_ - returned0, polys_taken) << "every destroyed ciphertext returns two";
+	// THE DRIFT, ABSENT: every polynomial the pass thread handed back went to a list other than its
+	// own, so its list gained none of them. Before the routing fix it kept two per ciphertext, and a
+	// GPU run measured the same shape at application scale: slot lists 0:1664, 1:44, 2:50, 3:50, 4:50.
 	EXPECT_EQ(GPUcc.aux_poly_rehomed_ - rehomed0, polys_rehomed)
 		<< "a polynomial the pass thread destroyed did not go back to the worker slot that made it";
 	ASSERT_GE(parked_before, parked_baseline) << "the parked total fell while nothing was drawing polynomials out";
 	// No ciphertext is alive, so every polynomial constructed here is parked on some list.
 	EXPECT_EQ(parked_before - parked_baseline, created)
 		<< "the lists do not hold every polynomial this case constructed";
-	// THE DRIFT, ABSENT: the pass thread destroyed every ciphertext the workers made, and its own
-	// list (slot 0, `precom.auxPoly`) gained none of their polynomials. Before the routing fix this
-	// list held two per ciphertext, and a GPU run measured the same shape at application scale:
-	// slot lists 0:1664, 1:44, 2:50, 3:50, 4:50.
-	EXPECT_EQ(slot0_before, slot0_baseline) << "the pass thread's list kept polynomials the workers made";
+	// ...and every worker's list holds some: at the least the two of the ciphertext it destroyed
+	// itself. The lists the release must reach are these and any that held polynomials before.
+	const auto list_of = [&](const int slot) -> const std::vector<FIDESlib::CKKS::RNSPoly>& {
+		return slot == 0 ? GPUcc.precom.auxPoly : GPUcc.op_scratch[slot]->auxPoly;
+	};
+	for (int t = 0; t < kWorkers; ++t) {
+		ASSERT_GE(worker_slot[t], 0) << "worker " << t << " never took a slot";
+		ASSERT_NE(worker_slot[t], pass_slot) << "a worker shares the pass thread's slot";
+		EXPECT_FALSE(list_of(worker_slot[t]).empty()) << "worker " << t << "'s list (slot " << worker_slot[t] << ") is empty";
+	}
+	size_t lists_holding = GPUcc.precom.auxPoly.empty() ? 0 : 1;
+	for (size_t slot = 1; slot < GPUcc.op_scratch.size(); ++slot)
+		if (GPUcc.op_scratch[slot] != nullptr && !GPUcc.op_scratch[slot]->auxPoly.empty())
+			++lists_holding;
 
 	const FIDESlib::MemPoolStats pool_before = FIDESlib::MemPoolStatsSnapshot(dev);
 	const PoolHeld held_before				 = PoolHeldFrom(pool_before);
@@ -1670,12 +1691,10 @@ TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
 	EXPECT_EQ(rel.polys_released, parked_before);
 	EXPECT_EQ(GPUcc.auxPolyParkedCount(), 0u) << "a slot list still holds parked polynomials after the boundary";
 	EXPECT_TRUE(GPUcc.precom.auxPoly.empty())
-		<< "the PASS THREAD'S slot -- the one holding the mass -- still has " << GPUcc.precom.auxPoly.size()
-		<< " polynomials parked";
-	// Every worker's slot, plus slot 0 when it held anything: the parked polynomials are ACROSS
+		<< "slot 0, the context's own list, still has " << GPUcc.precom.auxPoly.size() << " polynomials parked";
+	// Every list that held polynomials, the workers' among them: the parked polynomials are ACROSS
 	// slots, and a release that emptied only the caller's list would pass every other assertion.
-	EXPECT_EQ(rel.slots_drained, (size_t)kWorkers + (slot0_baseline > 0 ? 1 : 0))
-		<< "the release did not reach every slot holding parked polynomials";
+	EXPECT_EQ(rel.slots_drained, lists_holding) << "the release did not reach every slot holding parked polynomials";
 
 	// 2. their blocks reached the SHARED fresh tier, and no lane is still holding any.
 	EXPECT_GT(rel.blocks_moved, 0u) << "no pooled block was moved: the polynomials' limbs did not reach the pool";
