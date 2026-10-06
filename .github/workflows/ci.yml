@@ -153,15 +153,25 @@ jobs:
       # cuda/barrier, cuda/pipeline), and NCCL, whose header the GPU test suite
       # includes. NCCL is pinned to its CUDA 13.2 build; the unpinned package
       # follows the newest CUDA. The keyring package is checked against its
-      # known hash before apt trusts NVIDIA's repository.
+      # known hash before apt trusts NVIDIA's repository, and goes through
+      # apt-get, not dpkg -i, because dpkg does not wait for a lock another
+      # process holds.
       - name: Install CUDA 13.2
         run: |
           curl -fsSLo cuda-keyring.deb \
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  cuda-keyring.deb" | sha256sum -c -
-          sudo dpkg -i cuda-keyring.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # A fresh VM can still be running apt on its own (unattended upgrades,
+          # first-boot setup) and holding dpkg's lock. Wait for it, up to 10
+          # minutes, instead of failing; apt itself waits as long for the lock.
+          for _ in $(seq 120); do
+            pgrep -x 'apt|apt-get|dpkg|unattended-upgr' > /dev/null || break
+            sleep 5
+          done
+          apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
+          "${apt[@]}" install -y ./cuda-keyring.deb
+          "${apt[@]}" update
+          "${apt[@]}" install -y --no-install-recommends \
             cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-driver-dev-13-2 cuda-cccl-13-2 \
             libnccl2=2.30.4-1+cuda13.2 libnccl-dev=2.30.4-1+cuda13.2
           "$CUDA_PATH/bin/nvcc" --version | tail -2

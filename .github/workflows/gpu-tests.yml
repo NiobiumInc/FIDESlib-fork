@@ -118,7 +118,8 @@ jobs:
 
       # The GPU test suite includes nccl.h. Install the NCCL build for the
       # runner's CUDA version from NVIDIA's apt repository, after checking the
-      # keyring package's hash.
+      # keyring package's hash. The keyring goes through apt-get, not dpkg -i,
+      # because dpkg does not wait for a lock another process holds.
       - name: Install NCCL
         env:
           CUDA_VERSION: ${{ steps.env.outputs.cuda }}
@@ -132,8 +133,16 @@ jobs:
           curl -fsSLo cuda-keyring.deb \
             "https://developer.download.nvidia.com/compute/cuda/repos/$DISTRO/x86_64/cuda-keyring_1.1-1_all.deb"
           echo "$sum  cuda-keyring.deb" | sha256sum -c -
-          sudo dpkg -i cuda-keyring.deb
-          sudo apt-get update
+          # A fresh VM can still be running apt on its own (unattended upgrades,
+          # first-boot setup) and holding dpkg's lock. Wait for it, up to 10
+          # minutes, instead of failing; apt itself waits as long for the lock.
+          for _ in $(seq 120); do
+            pgrep -x 'apt|apt-get|dpkg|unattended-upgr' > /dev/null || break
+            sleep 5
+          done
+          apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
+          "${apt[@]}" install -y ./cuda-keyring.deb
+          "${apt[@]}" update
           suffix="+cuda$CUDA_VERSION"
           ver=$(apt-cache madison libnccl-dev |
                 awk -v s="$suffix" 'substr($3, length($3) - length(s) + 1) == s { print $3; exit }')
@@ -141,7 +150,7 @@ jobs:
             echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION"
             exit 1
           fi
-          sudo apt-get install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
+          "${apt[@]}" install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
 
       - name: Restore OpenFHE
         id: openfhe
