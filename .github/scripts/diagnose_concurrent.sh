@@ -30,7 +30,7 @@ run() {
 		"$(grep -m1 -o 'Cuda failure.*' "$out/$file.log")" \
 		"$(grep -m1 -o 'corrupted [a-z -]*\|double free[a-z -]*\|free(): [a-z -]*' "$out/$file.log")" | tee -a "$out/summary.txt"
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
-	grep -E '^\[tabletrace\] (HOT|allocs=.*\(final\))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
+	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\])' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
 }
 
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee "$out/gpu.txt"
