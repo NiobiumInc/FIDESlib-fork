@@ -17,7 +17,8 @@
 # packages; they never publish. A nightly run publishes nb_main at most once a day, and
 # only when something new reached the packages since the last release (see the version
 # job). Running this workflow by hand with `publish` on releases at once. Either way the
-# release is tagged v<date>-<sha7> at the commit it ran on.
+# release is tagged v<date>-<sha7> at the commit it ran on. Nothing is built for a release
+# unless the checks nb_main requires of a pull request passed on that commit.
 #
 # Every job writes what it did to the run's summary, and the final `report` job adds one
 # table of all of them, so a failure shows where to look without opening each log.
@@ -72,6 +73,10 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-24.04
+    # checks: read for the check runs of the commit about to be released.
+    permissions:
+      contents: read
+      checks: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -115,6 +120,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
+          PUBLISH: ${{ inputs.publish }}
           VERSION: ${{ steps.v.outputs.version }}
           RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
         run: |
@@ -147,10 +153,38 @@ jobs:
               fi
             fi
           fi
+          # A release is built only from a commit whose required checks passed: the ones
+          # nb_main's ruleset requires of a pull request, read from the ruleset, each at its
+          # latest attempt. A check that failed, was cancelled or has not finished stops it;
+          # one skipped because the commit changed nothing it tests counts as passed.
+          if [ "$run" = true ] && { [ "$EVENT" = schedule ] || [ "$PUBLISH" = true ]; }; then
+            required=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/nb_main" \
+              --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | unique | .[]')
+            checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+              --jq '.check_runs | group_by(.name) | map(max_by(.started_at)) | .[] | [.name, .status, (.conclusion // "")] | @tsv')
+            bad=""
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              result=$(printf '%s\n' "$checks" | awk -F'\t' -v n="$name" '$1 == n { print $2 "/" $3 }')
+              case "$result" in
+                completed/success | completed/skipped | completed/neutral) ;;
+                completed/*) bad="$bad, $name: ${result#completed/}" ;;
+                "") bad="$bad, $name: not run" ;;
+                *) bad="$bad, $name: ${result%%/*}" ;;
+              esac
+            done <<< "$required"
+            if [ -z "$required" ]; then
+              bad=", no required checks found in the nb_main ruleset"
+            fi
+            if [ -n "$bad" ]; then
+              run=false
+              reason="the required checks did not all pass on ${GITHUB_SHA::7} (${bad#, })"
+            fi
+          fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "reason=$reason" >> "$GITHUB_OUTPUT"
           if [ "$run" = false ]; then
-            echo "**Nightly: nothing to publish.** ${reason^}." >> "$GITHUB_STEP_SUMMARY"
+            echo "**Nothing to publish.** ${reason^}." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   build:
