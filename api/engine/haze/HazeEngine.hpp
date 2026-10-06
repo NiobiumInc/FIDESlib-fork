@@ -213,6 +213,10 @@ class HazeEngine : public Engine {
 
 	// ---- FIXEDAUTO adjust + scalar-op cores (OpenFHE ckksrns-leveledshe is the oracle) ----
 
+	/// @brief The basis conversion an eval-domain mod-down lifts with. OpenFHE's rescale always
+	/// centers (SwitchModulus), while its keyswitch ApproxModDown follows WITH_REDUCED_NOISE.
+	enum class ModDownLift { Configured, Centered };
+
 	/// @brief Adjusted read-only view of a ciphertext payload. `towers` may be smaller than
 	/// p->towers (OpenFHE LevelReduce is a view truncation here — no IR, no copy), and the
 	/// metadata fields are the post-adjust values. `p` is either the operand's own payload
@@ -252,13 +256,14 @@ class HazeEngine : public Engine {
 	/// ApproxModDown / CUDA NTT_RESCALE+NTT_MODDOWN). The caller INTTs only the dropped
 	/// `rescaleBase` limbs (coeff, in `droppedCoeff`); `targetBase` survivors stay in eval
 	/// (`survivorsEval`). Returns, per surviving prime q, (survivorsEval[q] - NTT(lift)[q])
-	/// * (prod rescaleBase)^{-1} mod q in eval, lift = hazeBasisConvert(droppedCoeff -> targetBase)
-	/// under the configured FBC variant. Pointwise sub/scale commute with the NTT and the lift
-	/// matches hazeModDown's, so the result is byte-identical while only the dropped limbs are INTT'd.
+	/// * (prod rescaleBase)^{-1} mod q in eval, lift = the basis conversion `lift` selects
+	/// (droppedCoeff -> targetBase). Pointwise sub/scale commute with the NTT, so only the dropped
+	/// limbs are INTT'd.
 	hazebk::LimbChain evalModDown(const std::vector<const void*>& survivorsEval,
 	                              const hazebk::LimbChain& droppedCoeff,
 	                              const std::vector<uint64_t>& rescaleBase,
-	                              const std::vector<uint64_t>& targetBase);
+	                              const std::vector<uint64_t>& targetBase,
+	                              ModDownLift lift);
 	/// @brief OpenFHE EvalMultCoreInPlace analog into a fresh payload: per-limb CRT scalar
 	/// multiply, NSD+1, sf ×= ScalingFactorReal[level]. No pre-rescale.
 	Operand multScalarCore(const Operand& x, double operand);
@@ -463,7 +468,7 @@ class HazeEngine : public Engine {
 	void extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t slots);
 
 	// ---- bootstrap cores (HazeBootstrap.cpp) ----
-	/// @brief ModRaise: from the level-0 limb, INTT@{q0} → hazeBasisConvert({q0}→Q) →
+	/// @brief ModRaise: from the level-0 limb, INTT@{q0} → hazeBasisConvertCentered({q0}→Q) →
 	/// NTT@Q on both components; towers = |Q|, NSD/sf unchanged (OpenFHE raise semantics).
 	Operand modRaiseCore(const Operand& x, size_t targetTowers);
 	/// @brief Integer scalar multiply (OpenFHE MultByIntegerInPlace): scalar mod q_i per

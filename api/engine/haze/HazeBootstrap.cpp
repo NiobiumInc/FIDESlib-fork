@@ -154,8 +154,9 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x, size_t targetTowers) {
 	// OpenFHE raise: only the level-0 limb is used; it is reinterpreted at the raised chain
 	// (DCRTPoly(tmp, elementParamsRaised); FLEXIBLEAUTOEXT pops the extra modulus, hence
-	// the parameterized target). Device-side: INTT@{q0} -> hazeBasisConvert ({q0} -> Q') ->
-	// NTT@Q' on both components. Metadata (NSD/sf) carries through.
+	// the parameterized target). Device-side: INTT@{q0} -> hazeBasisConvertCentered ({q0} -> Q',
+	// centered because that constructor's SwitchModulus always is) -> NTT@Q' on both components.
+	// Metadata (NSD/sf) carries through.
 	const std::vector<uint64_t> base1	  = { qBase_.front() };
 	const std::vector<uint64_t> raisedBase = qPrefix(targetTowers);
 	const hazeBasisConvertParams convParams = {
@@ -170,7 +171,7 @@ HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x, size_t targetTowe
 		LimbChain intt(1, polyBytes_);
 		hazeCheck(hazeINTTMrp(intt.data(), src.asConst().data(), base1.data(), base1.size(), nullptr), "hazeINTTMrp");
 		LimbChain conv(fullTowers, polyBytes_);
-		hazeCheck(hazeBasisConvert(conv.data(), intt.asConst().data(), &convParams, nullptr), "hazeBasisConvert");
+		hazeCheck(hazeBasisConvertCentered(conv.data(), intt.asConst().data(), &convParams, nullptr), "hazeBasisConvertCentered");
 		LimbChain ntt(fullTowers, polyBytes_);
 		hazeCheck(hazeNTTMrp(ntt.data(), conv.asConst().data(), raisedBase.data(), raisedBase.size(), nullptr), "hazeNTTMrp");
 		return ntt;
@@ -320,7 +321,7 @@ hazebk::LimbChain HazeEngine::extModDownChain(const hazebk::LimbChain& ext, size
 	for (size_t i = 0; i < towers; ++i) {
 		surv[i] = ext[i];
 	}
-	return evalModDown(surv, pCoeff, pBase_, qPrefix(towers));
+	return evalModDown(surv, pCoeff, pBase_, qPrefix(towers), ModDownLift::Configured);
 }
 
 std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
