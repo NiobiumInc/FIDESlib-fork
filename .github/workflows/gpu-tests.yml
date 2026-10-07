@@ -95,7 +95,7 @@ jobs:
       ${{ !cancelled() && needs.changes.outputs.run != 'false' &&
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
-    timeout-minutes: 150
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -174,6 +174,8 @@ jobs:
           mkdir -p build && cd build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_FLAGS="-lineinfo -Xcompiler -g" \
+            -DCMAKE_CXX_FLAGS="-g" \
             -DCUDA_PATH="$CUDA_PATH" \
             -DFIDESLIB_ARCH=120-real \
             -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
@@ -193,44 +195,18 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
-      # unless told otherwise; cuda makes them exercise the CUDA engine, which
-      # is what this job is for. The CPU backend has its own job in ci.yml.
-      - name: Test
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results "${args[@]}"
-
-      # The concurrent-operations suite, in a process of its own: the library reads
-      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
-      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
-      # It runs even when the default-mode suite failed, so both results are reported.
-      # Every test gets a process of its own: a CUDA error leaves the context unusable for
-      # the rest of the process, so one crash would otherwise hide every test after it.
-      - name: Test concurrent operations
+      - name: Diagnose concurrent operations
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: build
         env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
+          CUDA_PATH: ${{ steps.env.outputs.cuda_path }}
+        run: ../.github/scripts/diagnose_concurrent.sh
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpu-test-reports
-          path: build/gpu-results/
+          name: concurrent-diagnostics
+          path: build/diag/
           retention-days: 14
           if-no-files-found: ignore

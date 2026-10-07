@@ -24,6 +24,12 @@
 #include <vector>
 #include <unistd.h>
 
+#include <dlfcn.h>
+#include <exception>
+#include <unordered_map>
+
+#include "TableOwner.cuh"
+
 #include "nvtx3/nvtx3.hpp"
 #include <iostream>
 #include <ostream>
@@ -438,6 +444,137 @@ void* OpTableBuffer(int device, size_t bytes, int which) {
 	return r.buf[i];
 }
 
+// ---- DEBUG BRANCH ONLY: stream-ordered allocation log for TableOwner.cuh ----
+namespace {
+struct MemEvent {
+	unsigned long long seq;
+	void* ptr;
+	size_t bytes;
+	cudaStream_t stream;
+	void* site;
+	int tid;
+	char op; ///< 'A' allocation, 'F' free
+};
+constexpr size_t kMemLogSize = size_t{ 1 } << 21;
+MemEvent* mem_log() {
+	static auto* v = new MemEvent[kMemLogSize]();
+	return v;
+}
+std::atomic<unsigned long long> mem_seq{ 0 };
+std::mutex& mem_size_mu() {
+	static std::mutex mu;
+	return mu;
+}
+std::unordered_map<void*, size_t>& mem_sizes() {
+	static auto* m = new std::unordered_map<void*, size_t>();
+	return *m;
+}
+int MemLogTid() {
+	static std::atomic<int> next{ 0 };
+	thread_local const int tid = next.fetch_add(1);
+	return tid;
+}
+void MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s, void* site) {
+	const unsigned long long seq = mem_seq.fetch_add(1) + 1;
+	MemEvent& e					 = mem_log()[seq % kMemLogSize];
+	e.seq						 = 0;
+	e.ptr						 = p;
+	e.bytes						 = bytes;
+	e.stream					 = s;
+	e.site						 = site;
+	e.tid						 = MemLogTid();
+	e.op						 = op;
+	e.seq						 = seq;
+}
+std::mutex& table_report_mu() {
+	static std::mutex mu;
+	return mu;
+}
+void PrintMemEvent(const MemEvent& e, const unsigned long long now, const unsigned long long x, const char* what) {
+	Dl_info info{};
+	const char* obj	   = "?";
+	unsigned long off  = 0;
+	if (e.site != nullptr && dladdr(e.site, &info) != 0 && info.dli_fname != nullptr) {
+		obj = info.dli_fname;
+		off = static_cast<unsigned long>(static_cast<const char*>(e.site) - static_cast<const char*>(info.dli_fbase));
+	}
+	const auto p = reinterpret_cast<unsigned long long>(e.ptr);
+	std::printf("[tableowner] %s %c seq=%llu (%llu events ago) ptr=0x%llx bytes=%zu offset_of_bad=%lld stream=%p tid=%d site=%s+0x%lx\n", what, e.op,
+	  e.seq, now - e.seq, p, e.bytes, static_cast<long long>(x - p), static_cast<void*>(e.stream), e.tid, obj, off);
+}
+} // namespace
+
+void MemLogAlloc(void* p, const size_t bytes, const cudaStream_t s, void* site) {
+	if (p == nullptr)
+		return;
+	{
+		std::lock_guard<std::mutex> lk(mem_size_mu());
+		mem_sizes()[p] = bytes;
+	}
+	MemLogPut('A', p, bytes, s, site);
+}
+
+void MemLogFree(void* p, const cudaStream_t s, void* site) {
+	if (p == nullptr)
+		return;
+	size_t bytes = 0;
+	{
+		std::lock_guard<std::mutex> lk(mem_size_mu());
+		const auto it = mem_sizes().find(p);
+		if (it != mem_sizes().end()) {
+			bytes = it->second;
+			mem_sizes().erase(it);
+		}
+	}
+	MemLogPut('F', p, bytes, s, site);
+}
+
+void TableOwnerReport() {
+	std::lock_guard<std::mutex> lk(table_report_mu());
+	static bool done = false;
+	if (done)
+		return;
+	done				   = true;
+	const TableReport* r   = TableReportHost();
+	if (r == nullptr || r->hit == 0) {
+		std::printf("[tableowner] no bad table entry was recorded\n");
+		std::fflush(stdout);
+		return;
+	}
+	static const char* const names[] = { "?", "eval_linear_w_sum_", "fusedDotKSK_2_", "dotProductLtBatchedPt2___" };
+	const int k						 = (r->kernel >= 1 && r->kernel <= 3) ? r->kernel : 0;
+	std::printf("[tableowner] BAD ENTRY kernel=%s level=%d index=%d table=0x%llx value=0x%llx array=0x%llx block=(%d,%d,%d)\n", names[k], r->level,
+	  r->index, r->table, r->value, r->array, r->bx, r->by, r->bz);
+	for (int i = 0; i < r->nwords; i += 4) {
+		std::printf("[tableowner] words[%2d..]:", i);
+		for (int j = i; j < i + 4 && j < r->nwords; ++j)
+			std::printf(" 0x%016llx", r->words[j]);
+		std::printf("\n");
+	}
+	// The memory that held the bad value: the table itself (level 1) or the array it points to.
+	const unsigned long long x	 = r->level == 1 ? r->table : r->array;
+	const unsigned long long now = mem_seq.load();
+	const unsigned long long lo	 = now > kMemLogSize ? now - kMemLogSize + 1 : 1;
+	int covering = 0, near = 0;
+	for (unsigned long long q = now; q >= lo && q > 0; --q) {
+		const MemEvent& e = mem_log()[q % kMemLogSize];
+		if (e.seq != q)
+			continue;
+		const auto p	 = reinterpret_cast<unsigned long long>(e.ptr);
+		const size_t len = e.bytes > 0 ? e.bytes : 1;
+		if (p <= x && x < p + len) {
+			if (covering < 24)
+				PrintMemEvent(e, now, x, "COVERS");
+			++covering;
+		} else if (near < 12 && ((p + len <= x && x - (p + len) < 65536) || (p > x && p - x < 65536))) {
+			PrintMemEvent(e, now, x, "NEAR");
+			++near;
+		}
+	}
+	std::printf("[tableowner] %d logged events cover 0x%llx (%llu events in the log)\n", covering, x, now - lo + 1);
+	std::fflush(stdout);
+}
+
 // ---- Per-slot device memory pools (DIAGNOSTIC / candidate fix, FIDESLIB_SLOT_MEMPOOL=1) ----
 //
 // See CudaUtils.cuh SlotMemPool() for what this discriminates. The invariant it buys is one line:
@@ -546,6 +683,22 @@ void DestroySlotMemPools() {
 }
 
 void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
+	static std::once_flag table_check_once;
+	std::call_once(table_check_once, [] {
+		TableCheckInit();
+		std::set_terminate([] {
+			TableOwnerReport();
+			if (const std::exception_ptr e = std::current_exception()) {
+				try {
+					std::rethrow_exception(e);
+				} catch (const std::exception& x) {
+					std::fprintf(stderr, "terminate called after throwing: %s\n", x.what());
+				} catch (...) {
+				}
+			}
+			std::abort();
+		});
+	});
 	if (SlotMemPool()) {
 		const int slot = ScratchSlot();
 		if (slot > 0) {
@@ -559,6 +712,7 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 					const cudaError_t e = cudaMallocFromPoolAsync(&p, bytes, pool, s);
 					if (e != cudaSuccess)
 						throw std::runtime_error(std::string("OpMallocAsync: cudaMallocFromPoolAsync failed: ") + cudaGetErrorString(e));
+					MemLogAlloc(p, bytes, s, __builtin_return_address(0));
 					slot_pool_allocs.fetch_add(1, std::memory_order_relaxed);
 					return p;
 				}
@@ -570,11 +724,13 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 	// checking the status (the call sites' CudaCheckError macros do that where they always did).
 	void* p = nullptr;
 	cudaMallocAsync(&p, bytes, s);
+	MemLogAlloc(p, bytes, s, __builtin_return_address(0));
 	return p;
 }
 
 void OpFreeAsync(void* p, const cudaStream_t s) {
 	// Unconditional by design -- see CudaUtils.cuh OpFreeAsync.
+	MemLogFree(p, s, __builtin_return_address(0));
 	cudaFreeAsync(p, s);
 }
 
@@ -1784,6 +1940,7 @@ void* PoolMallocPerStream(int id, int bytes, cudaStream_t stream, uint64_t MBs) 
 	// every other stream reaches them only through the handoff above.
 	void* base = nullptr;
 	cudaMallocAsync(&base, MBs * 1024 * 1024, stream);
+	MemLogAlloc(base, MBs * 1024 * 1024, stream, __builtin_return_address(0));
 	CudaCheckErrorModNoSync;
 	if (base == nullptr)
 		return nullptr;
@@ -2225,6 +2382,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 				// this is the site that died in a GPU run, and it died silently because
 				// the abort path runs long before the teardown report.
 				const cudaError_t chunk = cudaMallocAsync(&base, MBs * 1024 * 1024, mine.ptr());
+				MemLogAlloc(base, MBs * 1024 * 1024, mine.ptr(), __builtin_return_address(0));
 				if (chunk != cudaSuccess)
 					MemPoolFailureReport(id, bytes, "GPUmalloc chunk cut, concurrent lane pool");
 				CudaCheckErrorModNoSync;
@@ -2312,6 +2470,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 			// the same non-effect on what happens next: the error stays sticky and the
 			// CudaCheckErrorModNoSync after this loop still aborts on it.
 			const cudaError_t chunk = cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
+			MemLogAlloc(base, MBs * 1024 * 1024, s[id].ptr(), __builtin_return_address(0));
 			if (chunk != cudaSuccess)
 				MemPoolFailureReport(id, bytes, "GPUmalloc chunk cut, default shared pool");
 			++pool_chunks_cut[id][bytes];
@@ -2344,6 +2503,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 		cudaMalloc(&ptr, bytes);
 	} else if (1) {
 		cudaMallocAsync(&ptr, bytes, 0);
+		MemLogAlloc(ptr, bytes, 0, __builtin_return_address(0));
 	} else {
 		if (size_to_memory[id][bytes].empty()) {
 			cudaSetDevice(id);
@@ -2498,6 +2658,7 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 	if (0) {
 		cudaFree(ptr);
 	} else if (1) {
+		MemLogFree(ptr, 0, __builtin_return_address(0));
 		cudaFreeAsync(ptr, 0);
 	} else {
 		auto* p    = new pointerdata;
@@ -2538,6 +2699,7 @@ void* GPUmallocExact(const int id, const size_t bytes, const cudaStream_t stream
 		const size_t chunk		 = nblocks * bytes;
 		uint64_t* base		 = nullptr;
 		const cudaError_t rc = cudaMallocAsync(&base, chunk, s[id].ptr());
+		MemLogAlloc(base, chunk, s[id].ptr(), __builtin_return_address(0));
 		if (rc != cudaSuccess)
 			MemPoolFailureReport(id, key, "GPUmallocExact chunk cut, default shared pool");
 		++pool_chunks_cut[id][key];
@@ -3035,6 +3197,7 @@ CudaError::CudaError(const cudaError_t error, const char* const file, const int 
 }
 
 void CudaFailure(const cudaError_t error, const char* const file, const int line, const bool with_backtrace) {
+	TableOwnerReport(); // DEBUG BRANCH ONLY: TableOwner.cuh
 	if (with_backtrace) {
 		void* frames[10];
 		const int n = backtrace(frames, 10);

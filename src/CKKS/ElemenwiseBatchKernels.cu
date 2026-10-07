@@ -8,6 +8,80 @@
 
 #include <cooperative_groups.h>
 #include <cuda/barrier>
+
+#include <cstring>
+#include <mutex>
+
+#include "TableOwner.cuh"
+
+// DEBUG BRANCH ONLY: see TableOwner.cuh.
+namespace FIDESlib {
+__device__ TableReport* g_table_report = nullptr;
+
+namespace {
+TableReport* host_table_report = nullptr;
+}
+
+void TableCheckInit() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		void* h = nullptr;
+		if (cudaHostAlloc(&h, sizeof(TableReport), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+			return;
+		std::memset(h, 0, sizeof(TableReport));
+		void* d = nullptr;
+		if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess)
+			return;
+		TableReport* dp = static_cast<TableReport*>(d);
+		if (cudaMemcpyToSymbol(g_table_report, &dp, sizeof(dp)) != cudaSuccess)
+			return;
+		cudaDeviceSynchronize();
+		host_table_report = static_cast<TableReport*>(h);
+		std::printf("[tableowner] table checks on\n");
+		std::fflush(stdout);
+	});
+}
+
+const TableReport* TableReportHost() {
+	return host_table_report;
+}
+
+namespace CKKS {
+/// A device pointer from cudaMalloc*: 8-byte aligned with a high word of 0x1 to 0xFFFF. An RNS
+/// residue below 2^60 has a high word up to 0x0FFFFFFF, so it almost never passes.
+__device__ __forceinline__ bool PointerShaped(const void* p) {
+	const unsigned long long v = reinterpret_cast<unsigned long long>(p);
+	const unsigned int hi	   = static_cast<unsigned int>(v >> 32);
+	return (v & 7ull) == 0 && hi >= 1u && hi <= 0xFFFFu;
+}
+
+__device__ __noinline__ void TableFault(const int kernel, const int level, const int index, const void* table, const void* value, const void* array, int nwords) {
+	TableReport* r = g_table_report;
+	if (r != nullptr && atomicCAS(&r->hit, 0u, 1u) == 0u) {
+		r->kernel = kernel;
+		r->level  = level;
+		r->index  = index;
+		r->table  = reinterpret_cast<unsigned long long>(table);
+		r->value  = reinterpret_cast<unsigned long long>(value);
+		r->array  = reinterpret_cast<unsigned long long>(array);
+		r->bx	  = blockIdx.x;
+		r->by	  = blockIdx.y;
+		r->bz	  = blockIdx.z;
+		r->nwords = 0;
+		__threadfence_system();
+		const volatile unsigned long long* src = static_cast<const volatile unsigned long long*>(level == 1 ? table : array);
+		if (nwords > 32)
+			nwords = 32;
+		for (int k = 0; k < nwords; ++k) {
+			r->words[k] = src[k];
+			r->nwords	= k + 1;
+			__threadfence_system();
+		}
+	}
+	__trap();
+}
+} // namespace CKKS
+} // namespace FIDESlib
 namespace cg = cooperative_groups;
 
 namespace FIDESlib ::CKKS {
@@ -189,6 +263,17 @@ __global__ void eval_linear_w_sum_(const __grid_constant__ int n, void** a, void
 	const int primeid	= C_.primeid_flattened[primeid_init + blockIdx.y];
 	constexpr ALGO algo = ALGO_BARRETT;
 
+	if (threadIdx.x == 0) { // DEBUG BRANCH ONLY: TableOwner.cuh
+		for (int i = 0; i < n; ++i) {
+			void** b = bs[i];
+			if (!PointerShaped(b))
+				TableFault(1, 1, i, bs, b, nullptr, n);
+			void* limb = b[blockIdx.y];
+			if (!PointerShaped(limb))
+				TableFault(1, 2, blockIdx.y, bs, limb, b, blockIdx.y + 1);
+		}
+	}
+
 	{
 		uint64_t res = modmult<algo>(((uint64_t*)(bs[0])[blockIdx.y])[idx], w[primeid], primeid);
 		for (int i = 1; i < n; ++i) {
@@ -201,6 +286,16 @@ __global__ void eval_linear_w_sum_(const __grid_constant__ int n, void** a, void
 
 __global__ void fusedDotKSK_2_(void** out1, void** sout1, void** out2, void** sout2, void*** digits, int num_d, int id, int num_special, int init) {
 	const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+	if (threadIdx.x == 0) { // DEBUG BRANCH ONLY: TableOwner.cuh. Entries g * dnum + j, j < num_d, are all set.
+		for (int g = 0; g < 6; ++g)
+			for (int j = 0; j < num_d; ++j) {
+				const int e = g * C_.dnum + j;
+				void** arr	= digits[e];
+				if (!PointerShaped(arr))
+					TableFault(2, 1, e, digits, arr, nullptr, 6 * C_.dnum);
+			}
+	}
 
 	const int blky = blockIdx.y + init;
 	// num_special = C_.K;
@@ -785,6 +880,18 @@ __global__ void dotProductLtBatchedPt___(void*** c0_out, void*** c1_out, void***
 __global__ void
 dotProductLtBatchedPt2___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts, const int bStep, const int gStep, const int primeidInit, const int n) {
 	int idx = threadIdx.x + threadIdx.z * blockDim.x + blockIdx.x * blockDim.x * blockDim.z;
+
+	if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) { // DEBUG BRANCH ONLY: TableOwner.cuh
+		for (int k = blockIdx.z; k < n; k += gridDim.z)
+			for (int i = 0; i < bStep; ++i) {
+				void** x = c0_in[k * bStep + i];
+				if (!PointerShaped(x))
+					TableFault(3, 1, k * bStep + i, c0_in, x, nullptr, 16);
+				void** y = c1_in[k * bStep + i];
+				if (!PointerShaped(y))
+					TableFault(3, 1, k * bStep + i, c1_in, y, nullptr, 16);
+			}
+	}
 	// int b = blockDim.z;
 	const int primeid = C_.primeid_flattened[primeidInit + blockIdx.y];
 	// constexpr ALGO algo = ALGO_BARRETT;
