@@ -56,26 +56,31 @@ __device__ __forceinline__ bool PointerShaped(const void* p) {
 }
 
 __device__ __noinline__ void TableFault(const int kernel, const int level, const int index, const void* table, const void* value, const void* array, int nwords) {
+	// Every field goes out as an atomic: a plain store to mapped host memory can still be in the
+	// GPU's caches when the trap ends the context, and the first run lost them that way.
 	TableReport* r = g_table_report;
 	if (r != nullptr && atomicCAS(&r->hit, 0u, 1u) == 0u) {
-		r->kernel = kernel;
-		r->level  = level;
-		r->index  = index;
-		r->table  = reinterpret_cast<unsigned long long>(table);
-		r->value  = reinterpret_cast<unsigned long long>(value);
-		r->array  = reinterpret_cast<unsigned long long>(array);
-		r->bx	  = blockIdx.x;
-		r->by	  = blockIdx.y;
-		r->bz	  = blockIdx.z;
-		r->nwords = 0;
+		atomicExch(&r->kernel, kernel);
+		atomicExch(&r->level, level);
+		atomicExch(&r->index, index);
+		atomicExch(&r->table, reinterpret_cast<unsigned long long>(table));
+		atomicExch(&r->value, reinterpret_cast<unsigned long long>(value));
+		atomicExch(&r->array, reinterpret_cast<unsigned long long>(array));
+		atomicExch(&r->bx, static_cast<int>(blockIdx.x));
+		atomicExch(&r->by, static_cast<int>(blockIdx.y));
+		atomicExch(&r->bz, static_cast<int>(blockIdx.z));
 		__threadfence_system();
 		const volatile unsigned long long* src = static_cast<const volatile unsigned long long*>(level == 1 ? table : array);
 		if (nwords > 32)
 			nwords = 32;
 		for (int k = 0; k < nwords; ++k) {
-			r->words[k] = src[k];
-			r->nwords	= k + 1;
-			__threadfence_system();
+			atomicExch(&r->words[k], src[k]);
+			atomicExch(&r->nwords, k + 1);
+		}
+		__threadfence_system();
+		// Let the writes land before the trap tears the context down (about a millisecond).
+		const long long start = clock64();
+		while (clock64() - start < 2'000'000) {
 		}
 	}
 	__trap();
@@ -273,6 +278,7 @@ __global__ void eval_linear_w_sum_(const __grid_constant__ int n, void** a, void
 				TableFault(1, 2, blockIdx.y, bs, limb, b, blockIdx.y + 1);
 		}
 	}
+	__syncthreads(); // the other threads must not read a bad entry before thread 0 reports it
 
 	{
 		uint64_t res = modmult<algo>(((uint64_t*)(bs[0])[blockIdx.y])[idx], w[primeid], primeid);
@@ -296,6 +302,7 @@ __global__ void fusedDotKSK_2_(void** out1, void** sout1, void** out2, void** so
 					TableFault(2, 1, e, digits, arr, nullptr, 6 * C_.dnum);
 			}
 	}
+	__syncthreads(); // the other threads must not read a bad entry before thread 0 reports it
 
 	const int blky = blockIdx.y + init;
 	// num_special = C_.K;
@@ -892,6 +899,7 @@ dotProductLtBatchedPt2___(void*** c0_out, void*** c1_out, void*** c0_in, void***
 					TableFault(3, 1, k * bStep + i, c1_in, y, nullptr, 16);
 			}
 	}
+	__syncthreads(); // the other threads must not read a bad entry before thread 0 reports it
 	// int b = blockDim.z;
 	const int primeid = C_.primeid_flattened[primeidInit + blockIdx.y];
 	// constexpr ALGO algo = ALGO_BARRETT;
