@@ -446,11 +446,11 @@ void LimbPartition::dotKSKfusedMGPU(LimbPartition& out2, const LimbPartition& di
 	};
 
 	vector_gpu digits{ .size = cc.dnum * 6 };
-	// DIAG (FIDESLIB_PERSIST_TABLES): the fused key switch's digit pointer
+	// FIDESLIB_PERSIST_TABLES (on by default in the concurrent mode): the fused key switch's digit pointer
 	// table is the other member of the earlier bisection's suspect class -- CudaUtils.cuh PersistOpTables().
 	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
 	if (persist_tables) {
-		digits.data = static_cast<void***>(FIDESlib::OpTableBuffer(device, digits.size * sizeof(void**), 2));
+		digits.data = static_cast<void***>(FIDESlib::OpTableBuffer(device, digits.size * sizeof(void**), 2, s.ptr()));
 		if (FIDESlib::PersistChurn()) {
 			void* dummy = FIDESlib::OpMallocAsync(digits.size * sizeof(void**), s.ptr());
 			FIDESlib::OpFreeAsync(dummy, s.ptr());
@@ -505,6 +505,8 @@ void LimbPartition::dotKSKfusedMGPU(LimbPartition& out2, const LimbPartition& di
 		FIDESlib::OpFreeAsync(digits.data, s.ptr());
 		if (FIDESlib::TableTrace())
 			FIDESlib::TableTraceFree(digits.data, s.ptr());
+	} else {
+		FIDESlib::OpTableRelease(device, digits.data, 2, s.ptr());
 	}
 	// digits.free(s);
 
@@ -544,7 +546,7 @@ void LimbPartition::fusedHoistRotate(int n,
 	// OFF unless the flag is set; PersistChurn keeps the allocator traffic without the block.
 	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
 	if (persist_tables) {
-		digits.data = static_cast<void***>(FIDESlib::OpTableBuffer(device, digits.size * sizeof(void**), 3));
+		digits.data = static_cast<void***>(FIDESlib::OpTableBuffer(device, digits.size * sizeof(void**), 3, s.ptr()));
 		if (FIDESlib::PersistChurn()) {
 			void* dummy = FIDESlib::OpMallocAsync(digits.size * sizeof(void**), s.ptr());
 			FIDESlib::OpFreeAsync(dummy, s.ptr());
@@ -663,6 +665,8 @@ void LimbPartition::fusedHoistRotate(int n,
 	}
 	if (!persist_tables)
 		FIDESlib::OpFreeAsync(digits.data, s.ptr());
+	else
+		FIDESlib::OpTableRelease(device, digits.data, 3, s.ptr());
 	// digits.free(s);
 }
 

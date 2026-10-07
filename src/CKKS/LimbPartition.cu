@@ -2612,7 +2612,7 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 		s.wait(ps[i]->getS());
 	}
 
-	// DIAG (FIDESLIB_PERSIST_TABLES): these two per-call tables are the
+	// FIDESLIB_PERSIST_TABLES (on by default in the concurrent mode): these two per-call tables are the
 	// reason this op is in the suspect class -- see CudaUtils.cuh PersistOpTables().
 	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
 	if (FIDESlib::WsumSrcSync())
@@ -2620,7 +2620,7 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 			cudaStreamSynchronize(ps[i]->getS().ptr());   // DIAG: full source drain
 	uint64_t* elems;
 	if (persist_tables) {
-		elems = static_cast<uint64_t*>(FIDESlib::OpTableBuffer(device, weights.size() * sizeof(uint64_t), 0));
+		elems = static_cast<uint64_t*>(FIDESlib::OpTableBuffer(device, weights.size() * sizeof(uint64_t), 0, s.ptr()));
 		if (FIDESlib::PersistChurn()) {   // DIAG: keep the allocator traffic, not the block
 			void* dummy = FIDESlib::OpMallocAsync(weights.size() * sizeof(uint64_t), s.ptr());
 			FIDESlib::OpFreeAsync(dummy, s.ptr());
@@ -2638,7 +2638,7 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 	}
 	void*** d_psptr;
 	if (persist_tables) {
-		d_psptr = static_cast<void***>(FIDESlib::OpTableBuffer(device, psptr.size() * sizeof(void**), 1));
+		d_psptr = static_cast<void***>(FIDESlib::OpTableBuffer(device, psptr.size() * sizeof(void**), 1, s.ptr()));
 		if (FIDESlib::PersistChurn()) {
 			void* dummy = FIDESlib::OpMallocAsync(psptr.size() * sizeof(void**), s.ptr());
 			FIDESlib::OpFreeAsync(dummy, s.ptr());
@@ -2659,6 +2659,9 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 			FIDESlib::TableTraceFree(elems, s.ptr());
 			FIDESlib::TableTraceFree(d_psptr, s.ptr());
 		}
+	} else {
+		FIDESlib::OpTableRelease(device, elems, 0, s.ptr());
+		FIDESlib::OpTableRelease(device, d_psptr, 1, s.ptr());
 	}
 	for (uint32_t i = 0; i < n; ++i) {
 		ps[i]->getS().wait(s);

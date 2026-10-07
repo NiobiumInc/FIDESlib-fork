@@ -300,9 +300,13 @@ bool WsumSrcSync() {
 }
 
 bool PersistOpTables() {
+	// DEFAULT ON in the concurrent mode, together with SlotMemPool(): see CudaUtils.cuh for why.
+	// FIDESLIB_PERSIST_TABLES=0 is the kill switch; any other value, or unset, is on.
 	static const bool enabled = [] {
 		const char* env = std::getenv("FIDESLIB_PERSIST_TABLES");
-		return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+		if (env == nullptr || env[0] == '\0')
+			return true;
+		return std::atoi(env) != 0;
 	}();
 	return enabled && ConcurrentOps();
 }
@@ -398,6 +402,8 @@ struct OpTableRing {
 	static constexpr int kDepth = 16;
 	void* buf[kDepth]			= {};
 	size_t cap[kDepth]			= {};
+	/// Recorded by OpTableRelease after the buffer's last reader; the next user waits on it.
+	cudaEvent_t done[kDepth]	= {};
 	int next					= 0;
 };
 
@@ -412,39 +418,68 @@ std::map<std::tuple<int, int, int>, OpTableRing>& op_table_rings() {
 	static auto* m = new std::map<std::tuple<int, int, int>, OpTableRing>();
 	return *m;
 }
+
+/// The calling thread's ring for (device, class). The lock covers the map lookup only: std::map
+/// nodes never move, and a ring is used by the one thread that owns its slot.
+OpTableRing& op_table_ring(const int device, const int which) {
+	std::lock_guard<std::mutex> lk(op_table_mu());
+	return op_table_rings()[{ device, ScratchSlot(), which }];
+}
 } // namespace
 
-void* OpTableBuffer(int device, size_t bytes, int which) {
+void* OpTableBuffer(const int device, const size_t bytes, const int which, const cudaStream_t s) {
 	// One ring per (device, issuing slot, table class), so two threads never touch one ring and a
-	// thread's own consecutive ops walk kDepth distinct buffers before reusing one. The depth is
-	// what makes this sound WITHOUT a fence: the buffer an op writes is not handed back to that
-	// same thread until kDepth ops later, by which time its kernel has long retired. It is still a
-	// DIAGNOSTIC and not a mode to ship -- nothing here proves kDepth is enough for every caller.
-	std::lock_guard<std::mutex> lk(op_table_mu());
-	OpTableRing& r = op_table_rings()[{ device, ScratchSlot(), which }];
+	// thread's own consecutive ops walk kDepth distinct buffers before reusing one. The depth keeps
+	// the waits below from stalling anything; the event is what makes the reuse sound. The thread's
+	// ops run on many streams, so nothing else orders a new upload into a buffer after the kernels
+	// of the op that used it kDepth ops earlier, and the host can run far ahead of the device.
+	OpTableRing& r = op_table_ring(device, which);
 	const int i	   = r.next;
 	r.next		   = (r.next + 1) % OpTableRing::kDepth;
+	if (r.done[i] == nullptr) {
+		const cudaError_t e = cudaEventCreateWithFlags(&r.done[i], cudaEventDisableTiming);
+		if (e != cudaSuccess)
+			throw std::runtime_error(std::string("OpTableBuffer: cudaEventCreate failed: ") + cudaGetErrorString(e));
+	}
 	if (r.cap[i] < bytes) {
-		if (r.buf[i] != nullptr)
+		if (r.buf[i] != nullptr) {
+			// Growing is rare (a table larger than any this entry has held), so a host wait is fine.
+			cudaEventSynchronize(r.done[i]);
 			cudaFree(r.buf[i]);
-		// cudaMalloc, NOT cudaMallocAsync: the whole point of this instrument is to take these
-		// tables OUT of the stream-ordered allocator's pool, which is the class the earlier pool
-		// exclusions never covered (that was the library's own pool, not the driver's).
+		}
+		// cudaMalloc, NOT cudaMallocAsync: these buffers stay out of the stream-ordered allocator's
+		// pool for the life of the process.
 		const cudaError_t e = cudaMalloc(&r.buf[i], bytes);
 		if (e != cudaSuccess)
 			throw std::runtime_error(std::string("OpTableBuffer: cudaMalloc failed: ") + cudaGetErrorString(e));
 		r.cap[i] = bytes;
+	} else {
+		// The new op's upload into this buffer waits for the previous user's kernels. An event
+		// that was never recorded is already complete, so the first pass through the ring waits
+		// on nothing.
+		cudaStreamWaitEvent(s, r.done[i], 0);
 	}
 	return r.buf[i];
 }
 
-// ---- Per-slot device memory pools (DIAGNOSTIC / candidate fix, FIDESLIB_SLOT_MEMPOOL=1) ----
+void OpTableRelease(const int device, void* const p, const int which, const cudaStream_t s) {
+	OpTableRing& r = op_table_ring(device, which);
+	for (int i = 0; i < OpTableRing::kDepth; ++i) {
+		if (r.buf[i] == p) {
+			cudaEventRecord(r.done[i], s);
+			return;
+		}
+	}
+	assert(false && "OpTableRelease: not a buffer from this thread's ring for that device and class");
+}
+
+// ---- Per-slot device memory pools (FIDESLIB_SLOT_MEMPOOL, on by default in the concurrent mode) ----
 //
-// See CudaUtils.cuh SlotMemPool() for what this discriminates. The invariant it buys is one line:
-// a device block allocated by one lane is never handed to another lane, because the two lanes draw
-// from different cudaMemPool_t objects. Slot 0 is left on the device default pool, so with the flag
-// unset (or outside the concurrent mode) nothing below is ever reached and OpMallocAsync is the
-// plain cudaMallocAsync it replaced.
+// See CudaUtils.cuh SlotMemPool(). The invariant it buys is one line: a device block allocated by
+// one lane is never handed to another lane, because the two lanes draw from different
+// cudaMemPool_t objects. Slot 0 is left on the device default pool, so outside the concurrent mode
+// (or with FIDESLIB_SLOT_MEMPOOL=0) nothing below is ever reached and OpMallocAsync is the plain
+// cudaMallocAsync it replaced.
 
 namespace {
 std::atomic<unsigned long long> slot_pool_allocs{ 0 };	  ///< Tables that came from a slot pool.
@@ -482,9 +517,13 @@ void SlotMemPoolReport() {
 
 bool SlotMemPool() {
 	static const bool enabled = [] {
-		const char* env = std::getenv("FIDESLIB_SLOT_MEMPOOL");
-		const bool on  = env != nullptr && env[0] != '\0' && std::atoi(env) != 0 && ConcurrentOps();
-		if (on) {
+		// DEFAULT ON in the concurrent mode, together with PersistOpTables(): see CudaUtils.cuh.
+		// FIDESLIB_SLOT_MEMPOOL=0 is the kill switch. Setting it to a non-zero value explicitly also
+		// prints the banner below and the table counts at exit.
+		const char* env		 = std::getenv("FIDESLIB_SLOT_MEMPOOL");
+		const bool explicitly = env != nullptr && env[0] != '\0';
+		const bool on		 = (!explicitly || std::atoi(env) != 0) && ConcurrentOps();
+		if (on && explicitly) {
 			printf("[slotmempool] ON: per-op device tables come from a cudaMemPool_t private to the issuing slot (slot 0 keeps the device default pool)\n");
 			fflush(stdout);
 			std::atexit(SlotMemPoolReport);

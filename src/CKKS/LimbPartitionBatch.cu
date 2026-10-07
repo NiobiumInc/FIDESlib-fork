@@ -427,7 +427,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 	const bool persist_tables = FIDESlib::PersistOpTables() || FIDESlib::PersistChurn();
 	void*** data_ptrs_d = nullptr;
 	if (persist_tables) {
-		data_ptrs_d = static_cast<void***>(FIDESlib::OpTableBuffer(in[0]->device, sizeof(void**) * size, 4));
+		data_ptrs_d = static_cast<void***>(FIDESlib::OpTableBuffer(in[0]->device, sizeof(void**) * size, 4, s.ptr()));
 		if (FIDESlib::PersistChurn()) {
 			void* dummy = FIDESlib::OpMallocAsync(sizeof(void**) * size, s.ptr());
 			FIDESlib::OpFreeAsync(dummy, s.ptr());
@@ -521,6 +521,8 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 	pt[0]->s.wait(s);
 	if (!persist_tables)
 		FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
+	else
+		FIDESlib::OpTableRelease(in[0]->device, data_ptrs_d, 4, s.ptr());
 }
 
 void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,

@@ -185,10 +185,20 @@ bool PersistChurn();
 /// defect is in the kernel's own launch/stream or in the closing multiply.
 bool WsumSrcSync();
 
-/// @brief DIAGNOSTIC: take the PER-OP DEVICE TABLES out of the driver's
-/// stream-ordered allocator (`FIDESLIB_PERSIST_TABLES=1`, and only when `FIDESLIB_CONCURRENT_OPS=1`).
+/// @brief Whether the PER-OP DEVICE TABLES of the weighted sum, the fused key switches and the
+/// batched linear transform come from persistent per-thread buffers instead of the driver's
+/// stream-ordered allocator. Concurrent mode only (`FIDESLIB_CONCURRENT_OPS=1`). ON BY DEFAULT
+/// there, together with SlotMemPool(); `FIDESLIB_PERSIST_TABLES=0` is the kill switch. Read once.
 ///
-/// WHAT IT IS FOR. An earlier bisection put the first wrong value right after a fused
+/// WHY IT IS ON. With several threads issuing ops on one context, the concurrent lane tests
+/// sometimes give a wrong result or an illegal memory access when they run repeatedly in one
+/// process. With these two switches on they have not. The mechanism is NOT known: a check that
+/// snapshotted every table at its free and poisoned it found every table's contents and lifetime
+/// correct, and the stream-ordered race tracking of compute-sanitizer found nothing. Keeping
+/// freed table memory away from immediate reuse is what makes the difference. Treat this as a
+/// mitigation; the root cause is still open.
+///
+/// HOW IT WAS FOUND. An earlier bisection put the first wrong value right after a fused
 /// weighted sum or the recursion's closing multiply, with copy, add and addScalar clean. What those
 /// two ops have and the clean ones lack is a per-call device table -- a constants array or a digit
 /// pointer table -- built with `cudaMallocAsync` on the op's stream, filled by an asynchronous
@@ -196,10 +206,9 @@ bool WsumSrcSync();
 /// DRIVER's memory pool, which is a different pool from the library's own: the `takesync` /
 /// `noreuse` / `freesync` exclusions covered the library's pool and say nothing about this one.
 ///
-/// With this set, those tables come from a per-(device, slot) ring of plain `cudaMalloc` buffers
-/// that are never freed, so no table block ever changes hands. Clean => the table's lifetime in the
-/// driver pool is the mechanism, and the fix is to give the tables an owner. Still failing =>
-/// the class is excluded and the hunt moves to the kernels' own stream dependencies.
+/// With this set, those tables come from a per-(device, slot, class) ring of plain `cudaMalloc`
+/// buffers that are never freed, so no table block ever changes hands between threads. A buffer is
+/// reused by its own thread only after an event recorded behind its previous user (OpTableRelease).
 bool PersistOpTables();
 
 /// @brief Whether a reduced-level bootstrap set is installed as SHARED VIEWS of the full-height
@@ -259,16 +268,25 @@ bool PlaintextArena();
 /// `FIDESLIB_DEVICE_CHECKS=0` skips them. Debug builds (no NDEBUG) always run them. Read once.
 bool DeviceChecks();
 
-/// @brief One persistent per-op table buffer of at least `bytes`. Only call when PersistOpTables().
+/// @brief One persistent per-op table buffer of at least `bytes`, for an op issued on `s`. Only call
+/// when PersistOpTables() (or PersistChurn()).
 ///
 /// `which` separates tables that are live AT THE SAME TIME inside one op (evalLinearWSum holds its
-/// weights and its pointer table at once), so they can never be handed the same buffer.
-void* OpTableBuffer(int device, size_t bytes, int which);
+/// weights and its pointer table at once), so they can never be handed the same buffer. `s` is made
+/// to wait (stream-ordered, no host sync) until the buffer's previous user released it.
+void* OpTableBuffer(int device, size_t bytes, int which, cudaStream_t s);
 
-/// @brief DIAGNOSTIC / CANDIDATE FIX (R4, candidate C1): give each ISSUING SLOT its own
-/// `cudaMemPool_t` for the per-op device tables (`FIDESLIB_SLOT_MEMPOOL=1`, concurrent mode only).
+/// @brief Mark a buffer from OpTableBuffer as free for its next user once the work already queued
+/// on `s` completes. Call it where the table would otherwise be freed: on the stream, and at the
+/// point, where every kernel that reads the table has been joined.
+void OpTableRelease(int device, void* p, int which, cudaStream_t s);
+
+/// @brief Whether each ISSUING SLOT gets its own `cudaMemPool_t` for the per-op device tables.
+/// Concurrent mode only. ON BY DEFAULT there, together with PersistOpTables() (see it for why);
+/// `FIDESLIB_SLOT_MEMPOOL=0` is the kill switch, and setting it to a non-zero value explicitly
+/// also prints the tables' pool counts at exit. Read once.
 ///
-/// WHAT IT DISCRIMINATES. `cudaMallocAsync` / `cudaFreeAsync` draw from the DEVICE DEFAULT memory
+/// WHAT IT DISCRIMINATED. `cudaMallocAsync` / `cudaFreeAsync` draw from the DEVICE DEFAULT memory
 /// pool -- one object shared by every stream and every host thread, whose three reuse policies
 /// (same-stream fast path, `ReuseAllowOpportunistic`, `ReuseFollowEventDependencies`) this fork
 /// never changes, so all three are on. The same-stream fast path is sound because the driver takes
