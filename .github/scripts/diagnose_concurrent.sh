@@ -8,13 +8,18 @@
 # The gcp-ephemeral VM is stopped about 99 minutes into the job, so no variant starts after
 # DEADLINE minutes of this script, and the artifacts always get uploaded.
 #
-# Every variant runs with lightweight GPU core dumps on: a kernel that faults leaves a dump
-# that names the kernel and the source line, read below with cuda-gdb when the runner has it.
+# Every variant runs with lightweight GPU core dumps on (no device memory in them): a kernel that
+# faults leaves a dump that names the kernel and the source line, read below with cuda-gdb when the
+# runner has it.
 set -u
 out=diag
 mkdir -p "$out"
 export FIDESLIB_TEST_BACKEND=cuda FIDESLIB_CONCURRENT_OPS=1
-export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1 CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION=0 CUDA_ENABLE_LIGHTWEIGHT_COREDUMP=1
+# The driver no longer reads CUDA_ENABLE_LIGHTWEIGHT_COREDUMP: without these flags it dumps all of the
+# device memory, which takes minutes. The flags are the set cuda-gdb lists as lightweight. After the
+# dump the driver aborts the process (no skip_abort here), so a whole dump ends the run with SIGABRT.
+export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1 CUDA_COREDUMP_SHOW_PROGRESS=1
+export CUDA_COREDUMP_GENERATION_FLAGS=skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory
 export CUDA_COREDUMP_FILE="$PWD/$out/gpucore_%p.nvcudmp"
 # The library exits through exit(0) on a CUDA failure, which cut the dumps short; hold it instead.
 export FIDESLIB_FAILURE_HOLD_S=120
