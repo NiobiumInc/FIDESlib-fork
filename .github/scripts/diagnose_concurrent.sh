@@ -45,7 +45,7 @@ run() {
 		"$(grep -m1 -o 'Cuda failure.*' "$out/$file.log")" \
 		"$(grep -m1 -o 'corrupted [a-z -]*\|double free[a-z -]*\|free(): [a-z -]*' "$out/$file.log")" | tee -a "$out/summary.txt"
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
-	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
+	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|repro\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
 	# Table-owner report (TableOwner.cuh): every site=<object>+0x<return address> decoded in place.
 	grep -E '^\[tableowner\] ' "$out/$file.log" | grep -v 'table checks on' | head -160 | while IFS= read -r line; do
 		echo "    $line"
@@ -105,6 +105,14 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 	nofence) run "$v" 300 env FIDESLIB_TABLE_RING_NOFENCE=1 ./fideslib-test --gtest_filter='OpTableRingTest.*' ;;
 	lock:*) run "$v" 1500 env FIDESLIB_CONCURRENT_OPS_DIAG="${x#lock:}" ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
 	env:*) run "$v" 1500 env $(printf '%s' "${x#env:}" | tr ',' ' ') ./fideslib-test --gtest_filter="$UNIT" --gtest_repeat=3 ;;
+	# The allocator alone, without the library (.github/diag/pool_reuse_repro.cu): repro:<pool mode>.N
+	repro:*)
+		if [ ! -x ./pool-reuse-repro ]; then
+			"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -O2 -std=c++17 -arch=native -o pool-reuse-repro ../.github/diag/pool_reuse_repro.cu >"$out/repro-build.log" 2>&1 ||
+				{ echo "repro build failed:" | tee -a "$out/summary.txt"; head -20 "$out/repro-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
+		fi
+		run "$v" 600 ./pool-reuse-repro --mode "${x#repro:}" --seconds 150
+		;;
 	memcheck-sor)
 		# Stream-ordered race tracking: a use of a cudaMallocAsync allocation after its
 		# cudaFreeAsync (or before its allocation) in stream order, whatever the timing.

@@ -132,12 +132,14 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		// DEBUG BRANCH ONLY (TableOwner.cuh). FIDESLIB_DEBUG_NO_XSTREAM_REUSE=1: a block freed on one
 		// stream goes to another stream only once that stream has an event (or legacy-stream)
 		// dependency on the free; internal dependencies and opportunistic reuse are off. =2: no reuse
-		// across streams at all.
-		if (const char* e = std::getenv("FIDESLIB_DEBUG_NO_XSTREAM_REUSE"); e != nullptr && (e[0] == '1' || e[0] == '2')) {
+		// across streams at all. =3: event-dependency reuse off, the other two on.
+		if (const char* e = std::getenv("FIDESLIB_DEBUG_NO_XSTREAM_REUSE"); e != nullptr && (e[0] == '1' || e[0] == '2' || e[0] == '3')) {
 			int off = 0;
-			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &off);
-			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &off);
-			if (e[0] == '2')
+			if (e[0] != '3') {
+				cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &off);
+				cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &off);
+			}
+			if (e[0] != '1')
 				cudaMemPoolSetAttribute(mp, cudaMemPoolReuseFollowEventDependencies, &off);
 			static std::once_flag shown;
 			std::call_once(shown, [&] {
