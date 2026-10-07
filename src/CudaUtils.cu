@@ -5,6 +5,8 @@
 #include "CudaUtils.cuh"
 #include <atomic>
 #include <deque>
+#include <dlfcn.h>
+#include <unordered_map>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -544,7 +546,303 @@ void DestroySlotMemPools() {
 	}
 }
 
+// ---- Table quarantine (DIAGNOSTIC, FIDESLIB_TABLE_QUARANTINE=1, concurrent mode only) ----
+//
+// Catches the per-op tables' race in the act instead of measuring what makes it go away. Every
+// table OpMallocAsync hands out is recorded with its call site, and UploadH2D records the bytes
+// uploaded into it. OpFreeAsync then, on the freeing stream and so after the op's own kernels,
+// snapshots the table into pinned memory, fills it with kPoison and keeps it out of the pool for
+// the next kHold frees. When an entry leaves quarantine:
+//   * snapshot != uploaded bytes: something wrote into the table while it was LIVE;
+//   * table != poison: something wrote into it AFTER its free;
+//   * a kernel that reads a table after its free has read 0xFBFB... as a pointer and faulted in
+//     place, which a GPU core dump attributes to that kernel.
+// Sites print as <object>+0x<offset>, for addr2line. Tables allocated or freed while their stream
+// is being captured into a graph are left alone: their events and copies would not run until the
+// graph does.
+
+bool TableQuarantine();
+void TableQuarantineReport();
+
+namespace {
+constexpr unsigned char kPoison = 0xFB;
+constexpr size_t kHold			= 4096;					///< frees a table stays out of the pool
+constexpr size_t kBatch			= 256;					///< entries checked per drain
+constexpr size_t kArena			= size_t{ 64 } << 20;	///< pinned snapshot ring
+
+struct QLive {
+	size_t bytes	 = 0;
+	const void* site = nullptr;
+	std::vector<unsigned char> uploaded; ///< empty until UploadH2D writes the table
+};
+
+struct QEntry {
+	void* p			 = nullptr;
+	size_t bytes	 = 0;
+	const void* site = nullptr;
+	int slot		 = -1;
+	int device		 = 0;
+	cudaEvent_t done{};
+	size_t off = 0, len = 0, charged = 0; ///< snapshot region in the arena; len 0 = no snapshot
+	std::vector<unsigned char> uploaded;
+};
+
+struct QState {
+	std::mutex mu;		 ///< everything below
+	std::mutex drain_mu; ///< one drainer at a time, so arena space comes back in FIFO order
+	std::unordered_map<void*, QLive> live;
+	std::deque<QEntry> fifo;
+	unsigned char* arena = nullptr;
+	size_t head = 0, tail = 0, inuse = 0;
+	cudaStream_t check[64] = {}; ///< per device, non-blocking; touched only under drain_mu
+};
+
+/// Never destroyed: a thread may still free a table during static destruction.
+QState& qstate() {
+	static auto* q = new QState();
+	return *q;
+}
+
+std::atomic<unsigned long long> q_tracked{ 0 }, q_checked{ 0 }, q_compared{ 0 }, q_untracked{ 0 }, q_live_bad{ 0 },
+  q_waf_bad{ 0 };
+std::atomic<int> q_printed{ 0 };
+
+std::string QSite(const void* site) {
+	Dl_info info{};
+	if (site != nullptr && dladdr(site, &info) != 0 && info.dli_fname != nullptr) {
+		char buf[600];
+		std::snprintf(buf, sizeof buf, "%s+0x%lx", info.dli_fname,
+		  static_cast<unsigned long>(reinterpret_cast<uintptr_t>(site) - reinterpret_cast<uintptr_t>(info.dli_fbase)));
+		return buf;
+	}
+	return "?";
+}
+
+bool QCapturing(cudaStream_t s) {
+	cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+	return cudaStreamIsCapturing(s, &st) == cudaSuccess && st != cudaStreamCaptureStatusNone;
+}
+
+/// A ring over the arena, released in allocation order. Call under QState::mu.
+bool QArenaAlloc(QState& q, size_t len, size_t& off, size_t& charged) {
+	if (len == 0) {
+		off = charged = 0;
+		return true;
+	}
+	if (q.inuse == 0)
+		q.head = q.tail = 0;
+	else if (q.head == q.tail)
+		return false;
+	if (q.head >= q.tail) {
+		if (kArena - q.head >= len) {
+			off		= q.head;
+			charged = len;
+		} else if (q.tail > len) {
+			off		= 0;
+			charged = len + (kArena - q.head);
+		} else {
+			return false;
+		}
+	} else if (q.tail - q.head > len) {
+		off		= q.head;
+		charged = len;
+	} else {
+		return false;
+	}
+	q.head = off + len;
+	q.inuse += charged;
+	return true;
+}
+
+unsigned long long QWord(const unsigned char* b, size_t i, size_t n) {
+	unsigned long long w = 0;
+	std::memcpy(&w, b + i, std::min<size_t>(8, n - i));
+	return w;
+}
+
+void QuarantineDrain(size_t n, bool steady) {
+	QState& q = qstate();
+	std::unique_lock<std::mutex> dl(q.drain_mu, std::defer_lock);
+	if (steady) {
+		if (!dl.try_lock())
+			return;
+	} else {
+		dl.lock();
+	}
+	std::vector<QEntry> batch;
+	{
+		std::lock_guard<std::mutex> lk(q.mu);
+		while (!q.fifo.empty() && batch.size() < n && (!steady || q.fifo.size() > kHold)) {
+			batch.push_back(std::move(q.fifo.front()));
+			q.fifo.pop_front();
+		}
+	}
+	if (batch.empty())
+		return;
+	int prev = 0;
+	cudaGetDevice(&prev);
+	std::vector<unsigned char> now;
+	for (QEntry& e : batch) {
+		cudaSetDevice(e.device);
+		const bool reached = cudaEventSynchronize(e.done) == cudaSuccess;
+		cudaEventDestroy(e.done);
+		if (!reached)
+			continue; // the context is gone; the process is about to report why
+		const unsigned long long checked = q_checked.fetch_add(1) + 1;
+		if ((checked & 0x3FFFu) == 0) {
+			std::printf("[quarantine] checked=%llu LIVE_OVERWRITTEN=%llu WRITE_AFTER_FREE=%llu (live)\n", checked,
+			  q_live_bad.load(), q_waf_bad.load());
+			std::fflush(stdout);
+		}
+		if (e.len > 0 && !e.uploaded.empty()) {
+			q_compared.fetch_add(1, std::memory_order_relaxed);
+			const unsigned char* snap = q.arena + e.off;
+			const size_t m			  = std::min(e.uploaded.size(), e.bytes);
+			for (size_t i = 0; i < m; ++i) {
+				if (snap[i] == e.uploaded[i])
+					continue;
+				q_live_bad.fetch_add(1);
+				if (q_printed.fetch_add(1) < 64) {
+					const size_t w = i & ~size_t{ 7 };
+					std::printf("[quarantine] LIVE TABLE OVERWRITTEN ptr=%p bytes=%zu offset=%zu uploaded=%016llx found=%016llx "
+								"slot=%d site=%s\n",
+					  e.p, e.bytes, w, QWord(e.uploaded.data(), w, m), QWord(snap, w, m), e.slot, QSite(e.site).c_str());
+					std::fflush(stdout);
+				}
+				break;
+			}
+		}
+		cudaStream_t& cs = q.check[e.device];
+		if (cs == nullptr)
+			cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking);
+		now.assign(e.bytes, kPoison);
+		if (cudaMemcpyAsync(now.data(), e.p, e.bytes, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+			cudaStreamSynchronize(cs) == cudaSuccess) {
+			for (size_t i = 0; i < e.bytes; ++i) {
+				if (now[i] == kPoison)
+					continue;
+				q_waf_bad.fetch_add(1);
+				if (q_printed.fetch_add(1) < 64) {
+					const size_t w = i & ~size_t{ 7 };
+					std::printf("[quarantine] WRITE AFTER FREE ptr=%p bytes=%zu offset=%zu found=%016llx freed-by-slot=%d site=%s\n",
+					  e.p, e.bytes, w, QWord(now.data(), w, e.bytes), e.slot, QSite(e.site).c_str());
+					std::fflush(stdout);
+				}
+				break;
+			}
+		}
+		cudaFreeAsync(e.p, cs);
+	}
+	cudaSetDevice(prev);
+	std::lock_guard<std::mutex> lk(q.mu);
+	for (const QEntry& e : batch) {
+		if (e.len == 0)
+			continue;
+		q.tail = e.off + e.len;
+		q.inuse -= e.charged;
+	}
+}
+
+void* QuarantineTrack(void* p, size_t bytes, const void* site, cudaStream_t s) {
+	if (p == nullptr || !TableQuarantine() || QCapturing(s))
+		return p;
+	QState& q = qstate();
+	std::lock_guard<std::mutex> lk(q.mu);
+	QLive& l = q.live[p]; // a reused address replaces the record its drained predecessor left
+	l.bytes	 = bytes;
+	l.site	 = site;
+	l.uploaded.clear();
+	q_tracked.fetch_add(1, std::memory_order_relaxed);
+	return p;
+}
+
+void QuarantineFree(void* p, cudaStream_t s) {
+	QState& q = qstate();
+	QEntry e;
+	e.p	   = p;
+	e.slot = ScratchSlot();
+	cudaGetDevice(&e.device);
+	{
+		std::lock_guard<std::mutex> lk(q.mu);
+		auto it = q.live.find(p);
+		if (it != q.live.end()) {
+			e.bytes	   = it->second.bytes;
+			e.site	   = it->second.site;
+			e.uploaded = std::move(it->second.uploaded);
+			q.live.erase(it);
+		}
+	}
+	if (e.bytes == 0 || QCapturing(s)) {
+		if (e.bytes == 0)
+			q_untracked.fetch_add(1, std::memory_order_relaxed);
+		cudaFreeAsync(p, s);
+		return;
+	}
+	const size_t len = (e.bytes + 63) & ~size_t{ 63 };
+	e.len			 = len <= kArena / 4 ? len : 0;
+	bool steady		 = false;
+	for (;;) {
+		{
+			std::lock_guard<std::mutex> lk(q.mu);
+			if (q.arena == nullptr && cudaHostAlloc(reinterpret_cast<void**>(&q.arena), kArena, cudaHostAllocPortable) != cudaSuccess) {
+				q.arena = nullptr;
+				e.len	= 0;
+			}
+			if (QArenaAlloc(q, e.len, e.off, e.charged)) {
+				if (e.len > 0)
+					cudaMemcpyAsync(q.arena + e.off, p, e.bytes, cudaMemcpyDeviceToHost, s);
+				cudaMemsetAsync(p, kPoison, e.bytes, s);
+				cudaEventCreateWithFlags(&e.done, cudaEventDisableTiming);
+				cudaEventRecord(e.done, s);
+				q.fifo.push_back(std::move(e));
+				steady = q.fifo.size() > kHold;
+				break;
+			}
+		}
+		QuarantineDrain(kBatch, false); // the arena is full: make room, then try again
+	}
+	if (steady)
+		QuarantineDrain(kBatch, true);
+}
+
+void QuarantineUpload(void* dst, const void* src, size_t bytes) {
+	if (!TableQuarantine() || dst == nullptr || src == nullptr || bytes == 0)
+		return;
+	QState& q = qstate();
+	std::lock_guard<std::mutex> lk(q.mu);
+	auto it = q.live.find(dst);
+	if (it == q.live.end() || bytes > it->second.bytes)
+		return;
+	const auto* b = static_cast<const unsigned char*>(src);
+	it->second.uploaded.assign(b, b + bytes);
+}
+} // namespace
+
+bool TableQuarantine() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_TABLE_QUARANTINE");
+		const bool on	= env != nullptr && env[0] != '\0' && std::atoi(env) != 0 && ConcurrentOps();
+		if (on) {
+			std::printf("[quarantine] ON: per-op tables are snapshotted, poisoned with 0x%02X and held for %zu frees; "
+						"summary prints at exit\n",
+			  kPoison, kHold);
+			std::fflush(stdout);
+			std::atexit(TableQuarantineReport);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+void TableQuarantineReport() {
+	std::printf("[quarantine] tracked=%llu checked=%llu compared=%llu untracked_frees=%llu LIVE_OVERWRITTEN=%llu "
+				"WRITE_AFTER_FREE=%llu (final)\n",
+	  q_tracked.load(), q_checked.load(), q_compared.load(), q_untracked.load(), q_live_bad.load(), q_waf_bad.load());
+	std::fflush(stdout);
+}
+
 void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
+	const void* const site = __builtin_return_address(0);
 	if (SlotMemPool()) {
 		const int slot = ScratchSlot();
 		if (slot > 0) {
@@ -559,7 +857,7 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 					if (e != cudaSuccess)
 						throw std::runtime_error(std::string("OpMallocAsync: cudaMallocFromPoolAsync failed: ") + cudaGetErrorString(e));
 					slot_pool_allocs.fetch_add(1, std::memory_order_relaxed);
-					return p;
+					return QuarantineTrack(p, bytes, site, s);
 				}
 			}
 		}
@@ -569,11 +867,15 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 	// checking the status (the call sites' CudaCheckError macros do that where they always did).
 	void* p = nullptr;
 	cudaMallocAsync(&p, bytes, s);
-	return p;
+	return QuarantineTrack(p, bytes, site, s);
 }
 
 void OpFreeAsync(void* p, const cudaStream_t s) {
 	// Unconditional by design -- see CudaUtils.cuh OpFreeAsync.
+	if (TableQuarantine()) {
+		QuarantineFree(p, s);
+		return;
+	}
 	cudaFreeAsync(p, s);
 }
 
@@ -3293,11 +3595,13 @@ static bool StageUploadUngated(void* dst, const void* src, size_t bytes, int dev
 }
 
 void UploadH2D(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+	QuarantineUpload(dst, src, bytes);
 	if (!PinnedStagingUpload(dst, src, bytes, device, stream))
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
 }
 
 void UploadH2DMGPU(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+	QuarantineUpload(dst, src, bytes);
 	// EITHER variable: FIDESLIB_PINNED_STAGING for the sweep 0f72c59 meant to be whole, and
 	// FIDESLIB_PINNED_MGPU for the three sites it missed, on their own. See CudaUtils.cuh.
 	if (!(PinnedStagingEnabled() || PinnedMGPU()) || !StageUploadUngated(dst, src, bytes, device, stream))
