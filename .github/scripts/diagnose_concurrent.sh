@@ -7,10 +7,16 @@
 #   env:VAR=1,VAR2=1.N     the unit with those environment variables set
 # The gcp-ephemeral VM is stopped about 99 minutes into the job, so no variant starts after
 # DEADLINE minutes of this script, and the artifacts always get uploaded.
+#
+# Every variant runs with lightweight GPU core dumps on: a kernel that faults leaves a dump
+# that names the kernel and the source line, read below with cuda-gdb when the runner has it.
 set -u
 out=diag
 mkdir -p "$out"
 export FIDESLIB_TEST_BACKEND=cuda FIDESLIB_CONCURRENT_OPS=1
+export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1 CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION=0 CUDA_ENABLE_LIGHTWEIGHT_COREDUMP=1
+export CUDA_COREDUMP_FILE="$PWD/$out/gpucore_%p.nvcudmp"
+GDB="${CUDA_PATH:-/usr/local/cuda}/bin/cuda-gdb"
 T=ConcurrencyTests/ConcurrentOpsTest
 UNIT="$T.LanesMatchSerial/*:$T.SharedOperandsMatchSerial/*"
 SAN="${CUDA_PATH:-/usr/local/cuda}/bin/compute-sanitizer"
@@ -30,10 +36,32 @@ run() {
 		"$(grep -m1 -o 'Cuda failure.*' "$out/$file.log")" \
 		"$(grep -m1 -o 'corrupted [a-z -]*\|double free[a-z -]*\|free(): [a-z -]*' "$out/$file.log")" | tee -a "$out/summary.txt"
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
-	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\])' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
+	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
+	# Quarantine sites are <object>+0x<return address>; one byte back is the call itself.
+	grep -o 'site=[^ ]*+0x[0-9a-f]*' "$out/$file.log" | sort | uniq -c | sort -rn | head -8 | while read -r n site; do
+		obj=${site#site=}
+		off=${obj##*+}
+		obj=${obj%+*}
+		printf '    %5s x %s\n' "$n" "$(addr2line -f -C -i -e "$obj" "$(printf '0x%x' $((off - 1)))" 2>&1 | paste -sd' ')"
+	done | tee -a "$out/summary.txt"
+	local core i=0
+	for core in "$out"/gpucore_*.nvcudmp; do
+		[ -f "$core" ] || continue
+		i=$((i + 1))
+		mv "$core" "$out/$file.gpucore$i.nvcudmp"
+		core="$out/$file.gpucore$i.nvcudmp"
+		if [ -x "$GDB" ]; then
+			timeout 300 "$GDB" -nx -batch -ex 'set pagination off' -ex "target cudacore $core" \
+				-ex 'info cuda kernels' -ex 'bt' -ex 'info line *$pc' -ex 'x/6i $pc' ./fideslib-test >"$core.txt" 2>&1
+			{ echo "    ===== $(basename "$core")"; grep -v '^\s*$' "$core.txt" | head -40 | sed 's/^/    /'; } | tee -a "$out/summary.txt"
+		else
+			echo "    ===== $(basename "$core") written; no cuda-gdb at $GDB" | tee -a "$out/summary.txt"
+		fi
+	done
 }
 
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee "$out/gpu.txt"
+echo "cuda-gdb: $([ -x "$GDB" ] && "$GDB" --version | head -1 || echo none)" | tee -a "$out/summary.txt"
 DEADLINE=${DEADLINE:-78}
 for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 	if [ $SECONDS -gt $((DEADLINE * 60)) ]; then
