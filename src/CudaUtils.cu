@@ -6,6 +6,7 @@
 #include <atomic>
 #include <deque>
 #include <dlfcn.h>
+#include <thread>
 #include <unordered_map>
 #include <cassert>
 #include <chrono>
@@ -832,6 +833,21 @@ bool TableQuarantine() {
 		return on;
 	}();
 	return enabled;
+}
+
+void breakpoint() {
+	static const int hold = [] {
+		const char* env = std::getenv("FIDESLIB_FAILURE_HOLD_S");
+		return env != nullptr ? std::atoi(env) : 0;
+	}();
+	if (hold <= 0)
+		return;
+	static std::atomic<bool> said{ false };
+	if (!said.exchange(true)) {
+		std::printf("[failurehold] holding %d s so the GPU core dump is complete\n", hold);
+		std::fflush(stdout);
+	}
+	std::this_thread::sleep_for(std::chrono::seconds(hold));
 }
 
 void TableQuarantineReport() {

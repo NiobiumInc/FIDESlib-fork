@@ -676,8 +676,11 @@ int getNumDevices();
 
 void CudaHostSync();
 
-inline void breakpoint() {
-}
+/// @brief Called by every CUDA failure path right before its exit(0). DIAGNOSTIC: with
+/// FIDESLIB_FAILURE_HOLD_S=<seconds> the failing thread waits that long first, so a GPU core dump
+/// the driver is still writing (CUDA_ENABLE_COREDUMP_ON_EXCEPTION) is whole when the process ends.
+/// Unset, it returns at once.
+void breakpoint();
 
 // TODO: Remove the cudart unloading.
 #define CudaCheckErrorMod                                                                    \
