@@ -14,6 +14,7 @@
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -679,48 +680,54 @@ void CudaHostSync();
 inline void breakpoint() {
 }
 
-// TODO: Remove the cudart unloading.
-#define CudaCheckErrorMod                                                                    \
-	do {                                                                                     \
-		cudaDeviceSynchronize();                                                             \
-		cudaError_t e = cudaGetLastError();                                                  \
-		if (e == cudaErrorCudartUnloading) {                                                 \
-			exit(0);                                                                         \
-		} else if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {             \
-                                                                                             \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-			FIDESlib::breakpoint();                                                          \
-			exit(0);                                                                         \
-		}                                                                                    \
+/// @brief What the CUDA error checks below throw.
+///
+/// A sticky error such as an illegal memory access leaves the CUDA context unusable for the rest
+/// of the process: the exception reports the failure to the caller, it does not make the process
+/// recoverable. Where it cannot propagate (a destructor, a thread's entry function, an OpenMP
+/// region) it ends the process through std::terminate, with a failing status and the message.
+class CudaError : public std::runtime_error {
+  public:
+	CudaError(cudaError_t error, const char* file, int line);
+	cudaError_t error() const noexcept { return error_; }
+	const char* file() const noexcept { return file_; }
+	int line() const noexcept { return line_; }
+
+  private:
+	cudaError_t error_;
+	const char* file_;
+	int line_;
+};
+
+/// @brief Report a CUDA failure the way the checks always have ("Cuda failure <file>:<line>:
+/// '<error>'" on stdout, and a backtrace on stderr when asked), then throw CudaError.
+[[noreturn]] void CudaFailure(cudaError_t error, const char* file, int line, bool with_backtrace);
+
+// The checks below throw CudaError on a failure and never end the process themselves.
+// cudaErrorCudartUnloading means the CUDA runtime is being torn down at process exit, so there is
+// nothing to report and nothing left to do: it is ignored.
+#define CudaCheckErrorMod                                                                               \
+	do {                                                                                                \
+		cudaDeviceSynchronize();                                                                        \
+		cudaError_t e = cudaGetLastError();                                                             \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled) \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, false);                                        \
 	} while (0)
 
-#define CudaCheckErrorModMGPU                                                                \
-	do {                                                                                     \
-		cudaStreamSynchronize(0);                                                            \
-		cudaError_t e = cudaGetLastError();                                                  \
-		if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {                    \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-			FIDESlib::breakpoint();                                                          \
-			exit(0);                                                                         \
-		}                                                                                    \
+#define CudaCheckErrorModMGPU                                                                           \
+	do {                                                                                                \
+		cudaStreamSynchronize(0);                                                                       \
+		cudaError_t e = cudaGetLastError();                                                             \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled) \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, false);                                        \
 	} while (0)
 
-// TODO: FIX THE CUDARTUNLOADING ERROR, IT HAPPENS WHEN THE LIBRARY IS BEING UNLOADED, CAN BE IGNORED FOR NOW
-#define CudaCheckErrorModNoSync                                                                                          \
-	do {                                                                                                                 \
-		/*cudaDeviceSynchronize();*/                                                                                     \
-		cudaError_t e = cudaGetLastError();                                                                              \
-		if (e == cudaErrorCudartUnloading) {                                                                             \
-			exit(0);                                                                                                     \
-		} else if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled && e != cudaErrorGraphExecUpdateFailure) { \
-			void* array[10];                                                                                             \
-			size_t size;                                                                                                 \
-			size = backtrace(array, 10);                                                                                 \
-			backtrace_symbols_fd(array, size, STDERR_FILENO);                                                            \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));                             \
-			FIDESlib::breakpoint();                                                                                      \
-			exit(0);                                                                                                     \
-		}                                                                                                                \
+#define CudaCheckErrorModNoSync                                                                                    \
+	do {                                                                                                           \
+		cudaError_t e = cudaGetLastError();                                                                        \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled &&         \
+			e != cudaErrorGraphExecUpdateFailure)                                                                  \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, true);                                                    \
 	} while (0)
 
 #define NCCLCHECK(cmd)                                                                              \

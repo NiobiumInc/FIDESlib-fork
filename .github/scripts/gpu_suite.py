@@ -16,10 +16,12 @@ minus the lists), so one pass can cover a part of the suite that needs its own
 environment, such as the concurrent-operations mode. --title names the summary
 section, so two passes in one job stay apart.
 
-With --isolate, every test runs in a process of its own. A test that kills its
-process (a CUDA error leaves the context unusable, and the library exits) then
-fails alone instead of hiding every test after it, and a test that ends without
-writing its report counts as a failure, never as a pass.
+With --isolate, every test runs in a process of its own. A CUDA error such as an
+illegal memory access leaves the context unusable for the rest of the process, so
+every test after it in the same process fails too, and a CudaError thrown where
+nothing catches it ends the process. Isolated, the test that hit it fails alone,
+and a test that ends without writing its report counts as a failure, never as a
+pass.
 
 The suite prints too much for a step log, so each pass writes its full output
 to <out>/<pass>.log and the step log keeps only gtest's progress lines. The
