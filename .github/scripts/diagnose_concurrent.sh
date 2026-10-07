@@ -16,6 +16,8 @@ mkdir -p "$out"
 export FIDESLIB_TEST_BACKEND=cuda FIDESLIB_CONCURRENT_OPS=1
 export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1 CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION=0 CUDA_ENABLE_LIGHTWEIGHT_COREDUMP=1
 export CUDA_COREDUMP_FILE="$PWD/$out/gpucore_%p.nvcudmp"
+# The library exits through exit(0) on a CUDA failure, which cut the dumps short; hold it instead.
+export FIDESLIB_FAILURE_HOLD_S=120
 GDB="${CUDA_PATH:-/usr/local/cuda}/bin/cuda-gdb"
 T=ConcurrencyTests/ConcurrentOpsTest
 UNIT="$T.LanesMatchSerial/*:$T.SharedOperandsMatchSerial/*"
@@ -52,8 +54,8 @@ run() {
 		core="$out/$file.gpucore$i.nvcudmp"
 		if [ -x "$GDB" ]; then
 			timeout 300 "$GDB" -nx -batch -ex 'set pagination off' -ex "target cudacore $core" \
-				-ex 'info cuda kernels' -ex 'bt' -ex 'info line *$pc' -ex 'x/6i $pc' ./fideslib-test >"$core.txt" 2>&1
-			{ echo "    ===== $(basename "$core")"; grep -v '^\s*$' "$core.txt" | head -40 | sed 's/^/    /'; } | tee -a "$out/summary.txt"
+				-ex 'info cuda kernels' -ex 'bt' -ex 'print $errorpc' -ex 'info line *$errorpc' -ex 'x/6i $errorpc' ./fideslib-test >"$core.txt" 2>&1
+			{ echo "    ===== $(basename "$core")"; grep -v '^\s*$' "$core.txt" | head -60 | sed 's/^/    /'; } | tee -a "$out/summary.txt"
 		else
 			echo "    ===== $(basename "$core") written; no cuda-gdb at $GDB" | tee -a "$out/summary.txt"
 		fi
