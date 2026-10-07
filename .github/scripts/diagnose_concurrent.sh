@@ -5,6 +5,8 @@
 #   lock:<kinds>.N         FIDESLIB_CONCURRENT_OPS_DIAG=<kinds> (those op kinds behind one host lock)
 #   asan.N                 the unit once, for a binary built with AddressSanitizer
 #   env:VAR=1,VAR2=1.N     the unit with those environment variables set
+#   repro:<pool mode>.N    the allocator alone (.github/diag/pool_reuse_repro.cu)
+#   probe.N                deterministic stream-ordering checks (.github/diag/ordering_probe.cu)
 # The gcp-ephemeral VM is stopped about 99 minutes into the job, so no variant starts after
 # DEADLINE minutes of this script, and the artifacts always get uploaded.
 #
@@ -45,7 +47,7 @@ run() {
 		"$(grep -m1 -o 'Cuda failure.*' "$out/$file.log")" \
 		"$(grep -m1 -o 'corrupted [a-z -]*\|double free[a-z -]*\|free(): [a-z -]*' "$out/$file.log")" | tee -a "$out/summary.txt"
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
-	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|repro\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
+	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|repro\]|pinnedstaging\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
 	# Table-owner report (TableOwner.cuh): every site=<object>+0x<return address> decoded in place.
 	grep -E '^\[tableowner\] ' "$out/$file.log" | grep -v 'table checks on' | head -160 | while IFS= read -r line; do
 		echo "    $line"
@@ -112,6 +114,15 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 				{ echo "repro build failed:" | tee -a "$out/summary.txt"; head -20 "$out/repro-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
 		fi
 		run "$v" 600 ./pool-reuse-repro --mode "${x#repro:}" --seconds 150
+		;;
+	# Deterministic orderings a table relies on, without the library (.github/diag/ordering_probe.cu).
+	probe)
+		if [ ! -x ./ordering-probe ]; then
+			"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -O2 -std=c++17 -arch=native -o ordering-probe ../.github/diag/ordering_probe.cu >"$out/probe-build.log" 2>&1 ||
+				{ echo "probe build failed:" | tee -a "$out/summary.txt"; head -20 "$out/probe-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
+		fi
+		run "$v" 600 ./ordering-probe --iters 100
+		grep '^\[probe\]' "$out/$(printf '%s' "$v" | tr ':,' '-_').log" | sed 's/^/    /' | tee -a "$out/summary.txt"
 		;;
 	memcheck-sor)
 		# Stream-ordered race tracking: a use of a cudaMallocAsync allocation after its

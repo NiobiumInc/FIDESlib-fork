@@ -3625,7 +3625,12 @@ bool StagingDeviceUsable(int device) {
 bool PinnedStagingEnabled() {
 	static const bool enabled = [] {
 		const char* env = std::getenv("FIDESLIB_PINNED_STAGING");
-		return env != nullptr && env[0] == '1' && env[1] == '\0';
+		const bool on	= env != nullptr && env[0] == '1' && env[1] == '\0';
+		if (on) { // DEBUG BRANCH ONLY: proves the variant took the pinned path
+			printf("[pinnedstaging] ON: host-to-device uploads go through %zu pinned slots per device\n", PinnedStagingSlots());
+			fflush(stdout);
+		}
+		return on;
 	}();
 	return enabled;
 }
@@ -3675,18 +3680,31 @@ static bool StageUploadUngated(void* dst, const void* src, size_t bytes, int dev
 	return StageThroughArena(pinned_staging[device], PinnedStagingSlots(), dst, bytes, stream, [&](void* slot) { std::memcpy(slot, src, bytes); });
 }
 
+/// DEBUG BRANCH ONLY: the first upload that took the pageable path although pinned staging is on.
+static void PinnedStagingFellBack(const size_t bytes) {
+	static std::atomic<bool> said{ false };
+	if (PinnedStagingEnabled() && !said.exchange(true)) {
+		printf("[pinnedstaging] FELL BACK to a pageable upload (%zu bytes)\n", bytes);
+		fflush(stdout);
+	}
+}
+
 __attribute__((noinline)) void UploadH2D(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
 	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
-	if (!PinnedStagingUpload(dst, src, bytes, device, stream))
+	if (!PinnedStagingUpload(dst, src, bytes, device, stream)) {
+		PinnedStagingFellBack(bytes);
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+	}
 }
 
 __attribute__((noinline)) void UploadH2DMGPU(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
 	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
 	// EITHER variable: FIDESLIB_PINNED_STAGING for the sweep 0f72c59 meant to be whole, and
 	// FIDESLIB_PINNED_MGPU for the three sites it missed, on their own. See CudaUtils.cuh.
-	if (!(PinnedStagingEnabled() || PinnedMGPU()) || !StageUploadUngated(dst, src, bytes, device, stream))
+	if (!(PinnedStagingEnabled() || PinnedMGPU()) || !StageUploadUngated(dst, src, bytes, device, stream)) {
+		PinnedStagingFellBack(bytes);
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+	}
 }
 
 bool PinnedStagingUpload(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
