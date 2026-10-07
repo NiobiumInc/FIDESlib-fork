@@ -59,7 +59,7 @@ run() {
 		core="$out/$file.gpucore$i.nvcudmp"
 		if [ -x "$GDB" ]; then
 			timeout 300 "$GDB" -nx -batch -ex 'set pagination off' -ex "target cudacore $core" \
-				-ex 'info cuda kernels' -ex 'bt' -ex 'print $errorpc' -ex 'info line *$errorpc' -ex 'x/6i $errorpc' ./fideslib-test >"$core.txt" 2>&1
+				-ex 'info cuda kernels' -ex 'bt' -ex 'print $errorpc' -ex 'info line *$errorpc' -ex 'x/6i $errorpc' "${GDB_PROG:-./fideslib-test}" >"$core.txt" 2>&1
 			{ echo "    ===== $(basename "$core")"; grep -v '^\s*$' "$core.txt" | head -60 | sed 's/^/    /'; } | tee -a "$out/summary.txt"
 		else
 			echo "    ===== $(basename "$core") written; no cuda-gdb at $GDB" | tee -a "$out/summary.txt"
@@ -69,6 +69,27 @@ run() {
 
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee "$out/gpu.txt"
 echo "cuda-gdb: $([ -x "$GDB" ] && "$GDB" --version | head -1 || echo none)" | tee -a "$out/summary.txt"
+# Self-test of the dump pipeline before the long runs: a kernel that writes through a bad pointer must
+# leave a dump in which cuda-gdb finds that kernel. If it does not, stop here; the runs below would
+# only produce more dumps that cannot be read.
+mkdir -p "$out/selftest"
+cat >"$out/selftest/fault.cu" <<'EOF'
+#include <unistd.h>
+__global__ void dump_selftest_fault(int* p) { *p = 1; }
+int main() {
+	dump_selftest_fault<<<1, 1>>>(reinterpret_cast<int*>(0x10));
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		sleep(120); // the same hold as the library's failure path
+	return 0;
+}
+EOF
+"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -lineinfo -o "$out/selftest/fault" "$out/selftest/fault.cu"
+GDB_PROG="$out/selftest/fault" run selftest 300 "$out/selftest/fault"
+if ! grep -q dump_selftest_fault "$out/selftest.gpucore1.nvcudmp.txt" 2>/dev/null; then
+	echo "dump self-test failed: no readable GPU core dump names the faulting kernel" | tee -a "$out/summary.txt"
+	{ echo '```'; cat "$out/summary.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+	exit 1
+fi
 DEADLINE=${DEADLINE:-78}
 for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 	if [ $SECONDS -gt $((DEADLINE * 60)) ]; then
