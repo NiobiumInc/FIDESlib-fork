@@ -453,7 +453,8 @@ struct MemEvent {
 	cudaStream_t stream;
 	void* site;
 	int tid;
-	char op; ///< 'A' allocation, 'F' free
+	char op;		 ///< 'A' allocation, 'F' free, 'U' table upload, 'K' kernel launch reading a table
+	int upload_slot; ///< 'U': its entry in the upload ring, else -1
 };
 constexpr size_t kMemLogSize = size_t{ 1 } << 21;
 MemEvent* mem_log() {
@@ -474,7 +475,19 @@ int MemLogTid() {
 	thread_local const int tid = next.fetch_add(1);
 	return tid;
 }
-void MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s, void* site) {
+/// The first bytes of every table upload, so the report can name the upload that wrote a value.
+struct UploadCopy {
+	unsigned long long seq;
+	unsigned long long words[64];
+};
+constexpr size_t kUploadRing = size_t{ 1 } << 16;
+UploadCopy* upload_ring() {
+	static auto* v = new UploadCopy[kUploadRing]();
+	return v;
+}
+std::atomic<unsigned long long> upload_seq{ 0 };
+
+unsigned long long MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s, void* site, const int upload_slot = -1) {
 	const unsigned long long seq = mem_seq.fetch_add(1) + 1;
 	MemEvent& e					 = mem_log()[seq % kMemLogSize];
 	e.seq						 = 0;
@@ -484,12 +497,15 @@ void MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s,
 	e.site						 = site;
 	e.tid						 = MemLogTid();
 	e.op						 = op;
+	e.upload_slot				 = upload_slot;
 	e.seq						 = seq;
+	return seq;
 }
 std::mutex& table_report_mu() {
 	static std::mutex mu;
 	return mu;
 }
+unsigned long long bad_word_addr = 0, bad_value = 0; ///< set by TableOwnerReport before printing
 void PrintMemEvent(const MemEvent& e, const unsigned long long now, const unsigned long long x, const char* what) {
 	Dl_info info{};
 	const char* obj	   = "?";
@@ -499,8 +515,17 @@ void PrintMemEvent(const MemEvent& e, const unsigned long long now, const unsign
 		off = static_cast<unsigned long>(static_cast<const char*>(e.site) - static_cast<const char*>(info.dli_fbase));
 	}
 	const auto p = reinterpret_cast<unsigned long long>(e.ptr);
-	std::printf("[tableowner] %s %c seq=%llu (%llu events ago) ptr=0x%llx bytes=%zu offset_of_bad=%lld stream=%p tid=%d site=%s+0x%lx\n", what, e.op,
-	  e.seq, now - e.seq, p, e.bytes, static_cast<long long>(x - p), static_cast<void*>(e.stream), e.tid, obj, off);
+	char carried[96] = "";
+	if (e.op == 'U' && e.upload_slot >= 0 && bad_word_addr >= p) {
+		const UploadCopy& u			  = upload_ring()[static_cast<size_t>(e.upload_slot)];
+		const unsigned long long word = (bad_word_addr - p) / 8;
+		if (u.seq == e.seq && word < 64 && (bad_word_addr - p) % 8 == 0)
+			std::snprintf(carried, sizeof(carried), " carried=0x%llx%s", u.words[word], u.words[word] == bad_value ? " MATCHES-BAD-VALUE" : "");
+		else
+			std::snprintf(carried, sizeof(carried), " carried=?");
+	}
+	std::printf("[tableowner] %s %c seq=%llu (%llu events ago) ptr=0x%llx bytes=%zu offset_of_bad=%lld stream=%p tid=%d site=%s+0x%lx%s\n", what, e.op,
+	  e.seq, now - e.seq, p, e.bytes, static_cast<long long>(x - p), static_cast<void*>(e.stream), e.tid, obj, off, carried);
 }
 } // namespace
 
@@ -529,6 +554,23 @@ void MemLogFree(void* p, const cudaStream_t s, void* site) {
 	MemLogPut('F', p, bytes, s, site);
 }
 
+void MemLogUpload(void* dst, const void* src, const size_t bytes, const cudaStream_t s, void* site) {
+	if (dst == nullptr || src == nullptr || bytes == 0)
+		return;
+	const unsigned long long useq = upload_seq.fetch_add(1);
+	const int slot				  = static_cast<int>(useq % kUploadRing);
+	UploadCopy& u				  = upload_ring()[static_cast<size_t>(slot)];
+	u.seq						  = 0;
+	std::memcpy(u.words, src, bytes < sizeof(u.words) ? bytes : sizeof(u.words));
+	u.seq = MemLogPut('U', dst, bytes, s, site, slot);
+	// The ring entry and the event carry the same seq; a reader that sees them differ skips it.
+	mem_log()[u.seq % kMemLogSize].upload_slot = slot;
+}
+
+__attribute__((noinline)) void MemLogLaunch(void* table, const cudaStream_t s, void*) {
+	MemLogPut('K', table, 8, s, __builtin_return_address(0));
+}
+
 void TableOwnerReport() {
 	std::lock_guard<std::mutex> lk(table_report_mu());
 	static bool done = false;
@@ -553,6 +595,8 @@ void TableOwnerReport() {
 	}
 	// The memory that held the bad value: the table itself (level 1) or the array it points to.
 	const unsigned long long x	 = r->level == 1 ? r->table : r->array;
+	bad_word_addr				 = x + static_cast<unsigned long long>(r->index) * 8;
+	bad_value					 = r->value;
 	const unsigned long long now = mem_seq.load();
 	const unsigned long long lo	 = now > kMemLogSize ? now - kMemLogSize + 1 : 1;
 	int covering = 0, near = 0;
@@ -563,10 +607,10 @@ void TableOwnerReport() {
 		const auto p	 = reinterpret_cast<unsigned long long>(e.ptr);
 		const size_t len = e.bytes > 0 ? e.bytes : 1;
 		if (p <= x && x < p + len) {
-			if (covering < 24)
+			if (covering < 60)
 				PrintMemEvent(e, now, x, "COVERS");
 			++covering;
-		} else if (near < 12 && ((p + len <= x && x - (p + len) < 65536) || (p > x && p - x < 65536))) {
+		} else if (near < 4 && ((p + len <= x && x - (p + len) < 65536) || (p > x && p - x < 65536))) {
 			PrintMemEvent(e, now, x, "NEAR");
 			++near;
 		}
@@ -3476,12 +3520,14 @@ static bool StageUploadUngated(void* dst, const void* src, size_t bytes, int dev
 	return StageThroughArena(pinned_staging[device], PinnedStagingSlots(), dst, bytes, stream, [&](void* slot) { std::memcpy(slot, src, bytes); });
 }
 
-void UploadH2D(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+__attribute__((noinline)) void UploadH2D(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
 	if (!PinnedStagingUpload(dst, src, bytes, device, stream))
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
 }
 
-void UploadH2DMGPU(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+__attribute__((noinline)) void UploadH2DMGPU(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
+	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
 	// EITHER variable: FIDESLIB_PINNED_STAGING for the sweep 0f72c59 meant to be whole, and
 	// FIDESLIB_PINNED_MGPU for the three sites it missed, on their own. See CudaUtils.cuh.
 	if (!(PinnedStagingEnabled() || PinnedMGPU()) || !StageUploadUngated(dst, src, bytes, device, stream))

@@ -36,6 +36,10 @@ const TableReport* TableReportHost();
 
 void MemLogAlloc(void* p, size_t bytes, cudaStream_t s, void* site);
 void MemLogFree(void* p, cudaStream_t s, void* site);
+/// A table upload (destination, the first bytes of the source) and a launch of one of the three checked
+/// kernels with its table, so the report shows the order of upload, launch and free.
+void MemLogUpload(void* dst, const void* src, size_t bytes, cudaStream_t s, void* site);
+void MemLogLaunch(void* table, cudaStream_t s, void* site);
 
 /// Prints the report and the ring events around its address, once per process.
 void TableOwnerReport();

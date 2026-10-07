@@ -2,6 +2,7 @@
 // Created by carlosad on 8/06/25.
 //
 
+#include "TableOwner.cuh" // DEBUG BRANCH ONLY
 #include "CKKS/Context.cuh"
 #include "CKKS/Conv.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
@@ -497,6 +498,7 @@ void LimbPartition::dotKSKfusedMGPU(LimbPartition& out2, const LimbPartition& di
 
 		if (num_special + num_limbs > 0) {
 			FIDESlib::UploadH2DMGPU(digits.data, h_digits.data(), cc.dnum * 6 * sizeof(void**), device, s.ptr());
+			FIDESlib::MemLogLaunch(digits.data, s.ptr(), nullptr); // DEBUG BRANCH ONLY: TableOwner.cuh
 			fusedDotKSK_2_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)num_special + num_limbs }, 128, 0, s.ptr()>>>(
 			  out1.limbptr.data, out1.SPECIALlimbptr.data, out2.limbptr.data, out2.SPECIALlimbptr.data, digits.data, i, id, num_special, 0);
 		}
@@ -1373,6 +1375,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(LimbPartition& c0,
 
 			if (num_special > 0) {
 
+				FIDESlib::MemLogLaunch(digits, s.ptr(), nullptr); // DEBUG BRANCH ONLY: TableOwner.cuh
 				fusedDotKSK_2_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)num_special }, 128, 0, s.ptr()>>>(
 				  out1.limbptr.data, out1.SPECIALlimbptr.data, out2.limbptr.data, out2.SPECIALlimbptr.data, digits, num_d, id, num_special, 0);
 			}
@@ -1745,6 +1748,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(LimbPartition& c0,
 			if (limb_size > 0) {
 				for (uint32_t start = 0; start < limb_size; start += cc.batch) {
 					uint32_t num = std::min(static_cast<uint32_t>(cc.batch), limb_size - start);
+					FIDESlib::MemLogLaunch(digits, stream.ptr(), nullptr); // DEBUG BRANCH ONLY: TableOwner.cuh
 					fusedDotKSK_2_<<<dim3{ (uint32_t)cc.N / 128, num }, 128, 0, stream.ptr()>>>(
 					  out1.limbptr.data, out1.SPECIALlimbptr.data, out2.limbptr.data, out2.SPECIALlimbptr.data, digits, i, id, num_special, num_special + start);
 				}

@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 1/10/25.
 //
+#include "TableOwner.cuh" // DEBUG BRANCH ONLY
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -445,6 +446,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 	void*** const pt_q_base = prepared ? prepared_pt_q : data_ptrs_d + offset_pt;
 	void*** const pt_p_base = prepared ? prepared_pt_p : (ext ? data_ptrs_d + soffset_pt : nullptr);
 
+	FIDESlib::MemLogLaunch(data_ptrs_d, s.ptr(), nullptr); // DEBUG BRANCH ONLY: TableOwner.cuh
 	if constexpr (!VER2) {
 		if (limbsize > 0) {
 			dotProductLtBatchedPt___<<<grid, block, shmem_bytes, s.ptr()>>>(data_ptrs_d + offset_out_c0,

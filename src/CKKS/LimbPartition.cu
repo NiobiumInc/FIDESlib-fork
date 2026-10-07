@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include "TableOwner.cuh" // DEBUG BRANCH ONLY
 #include <algorithm>
 #include "CudaUtils.cuh"
 #include <array>
@@ -2650,6 +2651,7 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
 	}
 	UploadH2D(d_psptr, psptr.data(), psptr.size() * sizeof(void**), device, s.ptr());
 
+	FIDESlib::MemLogLaunch(d_psptr, s.ptr(), nullptr); // DEBUG BRANCH ONLY: TableOwner.cuh
 	if (!limb.empty() && limbsize > 0)
 		eval_linear_w_sum_<<<dim3{ (uint32_t)cc.N / 128, (uint32_t)limbsize }, 128, 0, s.ptr()>>>(n, limbptr.data, d_psptr, elems, PARTITION(id, 0));
 	if (!persist_tables) {
