@@ -457,7 +457,13 @@ void* OpTableBuffer(const int device, const size_t bytes, const int which, const
 		// The new op's upload into this buffer waits for the previous user's kernels. An event
 		// that was never recorded is already complete, so the first pass through the ring waits
 		// on nothing.
-		cudaStreamWaitEvent(s, r.done[i], 0);
+		// DEBUG BRANCH ONLY: FIDESLIB_TABLE_RING_NOFENCE=1 drops the wait, to show the test catches it.
+		static const bool no_fence = [] {
+			const char* env = std::getenv("FIDESLIB_TABLE_RING_NOFENCE");
+			return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+		}();
+		if (!no_fence)
+			cudaStreamWaitEvent(s, r.done[i], 0);
 	}
 	return r.buf[i];
 }
