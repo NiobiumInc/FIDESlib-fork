@@ -15,9 +15,9 @@ set -u
 out=diag
 mkdir -p "$out"
 export FIDESLIB_TEST_BACKEND=cuda FIDESLIB_CONCURRENT_OPS=1
-# The driver no longer reads CUDA_ENABLE_LIGHTWEIGHT_COREDUMP: without these flags it dumps all of the
-# device memory, which takes minutes. The flags are the set cuda-gdb lists as lightweight. After the
-# dump the driver aborts the process (no skip_abort here), so a whole dump ends the run with SIGABRT.
+# Newer drivers no longer read CUDA_ENABLE_LIGHTWEIGHT_COREDUMP; without it a dump holds all of the
+# device memory. These flags are the set cuda-gdb lists as lightweight. After the dump the driver
+# aborts the process (no skip_abort here), so a whole dump ends the run with SIGABRT.
 export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1 CUDA_COREDUMP_SHOW_PROGRESS=1
 export CUDA_COREDUMP_GENERATION_FLAGS=skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory
 export CUDA_COREDUMP_FILE="$PWD/$out/gpucore_%p.nvcudmp"
@@ -57,6 +57,14 @@ run() {
 		i=$((i + 1))
 		mv "$core" "$out/$file.gpucore$i.nvcudmp"
 		core="$out/$file.gpucore$i.nvcudmp"
+		# A dump cut short ends before its ELF section table does.
+		local size need
+		size=$(stat -c %s "$core")
+		need=$(LC_ALL=C readelf -h "$core" 2>/dev/null | awk '/Start of section headers/ { o = $5 } /Size of section headers/ { e = $5 }
+			/Number of section headers/ { n = $5 } END { if (o != "") print o + n * e }')
+		echo "    dump $(basename "$core"): $size bytes, section table ends at ${need:-?}: $(
+			[ -n "$need" ] && { [ "$size" -ge "$need" ] && echo whole || echo TRUNCATED; } || echo 'not an ELF file')" |
+			tee -a "$out/summary.txt"
 		if [ -x "$GDB" ]; then
 			timeout 300 "$GDB" -nx -batch -ex 'set pagination off' -ex "target cudacore $core" \
 				-ex 'info cuda kernels' -ex 'bt' -ex 'print $errorpc' -ex 'info line *$errorpc' -ex 'x/6i $errorpc' "${GDB_PROG:-./fideslib-test}" >"$core.txt" 2>&1
@@ -74,16 +82,23 @@ echo "cuda-gdb: $([ -x "$GDB" ] && "$GDB" --version | head -1 || echo none)" | t
 # only produce more dumps that cannot be read.
 mkdir -p "$out/selftest"
 cat >"$out/selftest/fault.cu" <<'EOF'
+#include <cstdio>
 #include <unistd.h>
 __global__ void dump_selftest_fault(int* p) { *p = 1; }
 int main() {
 	dump_selftest_fault<<<1, 1>>>(reinterpret_cast<int*>(0x10));
-	if (cudaDeviceSynchronize() != cudaSuccess)
+	const cudaError_t launch = cudaGetLastError();
+	const cudaError_t sync = cudaDeviceSynchronize();
+	std::printf("launch: %s, sync: %s\n", cudaGetErrorString(launch), cudaGetErrorString(sync));
+	std::fflush(stdout);
+	if (sync != cudaSuccess)
 		sleep(120); // the same hold as the library's failure path
 	return 0;
 }
 EOF
-"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -lineinfo -o "$out/selftest/fault" "$out/selftest/fault.cu"
+# Machine code for the GPU present: the runner's driver can be older than the toolkit, and then it
+# cannot compile the toolkit's PTX, so a kernel built for another architecture never launches.
+"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -arch=native -lineinfo -o "$out/selftest/fault" "$out/selftest/fault.cu"
 GDB_PROG="$out/selftest/fault" run selftest 300 "$out/selftest/fault"
 if ! grep -q dump_selftest_fault "$out/selftest.gpucore1.nvcudmp.txt" 2>/dev/null; then
 	echo "dump self-test failed: no readable GPU core dump names the faulting kernel" | tee -a "$out/summary.txt"
