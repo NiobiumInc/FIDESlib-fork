@@ -6,6 +6,7 @@
 #include "CKKS/Ciphertext.cuh"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -128,6 +129,26 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		cudaDeviceGetDefaultMemPool(&mp, dev);
 		uint64_t threshold = UINT64_MAX; // 5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
 		cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
+		// DEBUG BRANCH ONLY (TableOwner.cuh). FIDESLIB_DEBUG_NO_XSTREAM_REUSE=1: a block freed on one
+		// stream goes to another stream only once that stream has an event (or legacy-stream)
+		// dependency on the free; internal dependencies and opportunistic reuse are off. =2: no reuse
+		// across streams at all.
+		if (const char* e = std::getenv("FIDESLIB_DEBUG_NO_XSTREAM_REUSE"); e != nullptr && (e[0] == '1' || e[0] == '2')) {
+			int off = 0;
+			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &off);
+			cudaMemPoolSetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &off);
+			if (e[0] == '2')
+				cudaMemPoolSetAttribute(mp, cudaMemPoolReuseFollowEventDependencies, &off);
+			static std::once_flag shown;
+			std::call_once(shown, [&] {
+				int a = -1, b = -1, c = -1;
+				cudaMemPoolGetAttribute(mp, cudaMemPoolReuseAllowInternalDependencies, &a);
+				cudaMemPoolGetAttribute(mp, cudaMemPoolReuseAllowOpportunistic, &b);
+				cudaMemPoolGetAttribute(mp, cudaMemPoolReuseFollowEventDependencies, &c);
+				printf("[noxsreuse] device %d: internal=%d opportunistic=%d follow-events=%d\n", dev, a, b, c);
+				fflush(stdout);
+			});
+		}
 		CudaCheckErrorModNoSync;
 	}
 

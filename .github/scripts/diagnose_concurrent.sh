@@ -47,7 +47,7 @@ run() {
 	grep -E '^\[  FAILED  \] .*\(([0-9]+) ms\)$' "$out/$file.log" | sed 's/, where GetParam.*//' | sed 's/^/    /' | tee -a "$out/summary.txt"
 	grep -E '^\[(tabletrace\] (HOT|allocs=.*\(final\))|noxsreuse\]|quarantine\] (LIVE|WRITE|tracked=))' "$out/$file.log" | head -20 | sed 's/^/    /' | tee -a "$out/summary.txt"
 	# Table-owner report (TableOwner.cuh): every site=<object>+0x<return address> decoded in place.
-	grep -E '^\[tableowner\] ' "$out/$file.log" | grep -v 'table checks on' | head -90 | while IFS= read -r line; do
+	grep -E '^\[tableowner\] ' "$out/$file.log" | grep -v 'table checks on' | head -160 | while IFS= read -r line; do
 		echo "    $line"
 		site=$(printf '%s' "$line" | grep -o 'site=[^ ]*+0x[0-9a-f]*')
 		if [ -n "$site" ]; then

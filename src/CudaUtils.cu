@@ -40,6 +40,8 @@
 
 #include <cuda_runtime.h>
 
+#include "TableOwnerFences.cuh" // DEBUG BRANCH ONLY: after every other header
+
 namespace FIDESlib {
 
 extern std::vector<cudaDeviceProp> GPUprop;
@@ -453,10 +455,11 @@ struct MemEvent {
 	cudaStream_t stream;
 	void* site;
 	int tid;
-	char op;		 ///< 'A' allocation, 'F' free, 'U' table upload, 'K' kernel launch reading a table
+	char op;		 ///< 'A' allocation, 'F' free, 'U' table upload, 'K' kernel launch reading a table,
+				 ///< 'R' event record (ptr = the event), 'W' stream wait on an event (ptr = the event)
 	int upload_slot; ///< 'U': its entry in the upload ring, else -1
 };
-constexpr size_t kMemLogSize = size_t{ 1 } << 21;
+constexpr size_t kMemLogSize = size_t{ 1 } << 23; // records and waits are most of the events
 MemEvent* mem_log() {
 	static auto* v = new MemEvent[kMemLogSize]();
 	return v;
@@ -571,6 +574,157 @@ __attribute__((noinline)) void MemLogLaunch(void* table, const cudaStream_t s, v
 	MemLogPut('K', table, 8, s, __builtin_return_address(0));
 }
 
+void MemLogFence(const char op, cudaEvent_t e, const cudaStream_t s, void* site) {
+	MemLogPut(op, static_cast<void*>(e), 0, s, site);
+}
+
+namespace {
+/// The ring event with this seq, or nullptr once the ring has overwritten it.
+const MemEvent* MemLogAt(const unsigned long long q) {
+	const MemEvent& e = mem_log()[q % kMemLogSize];
+	return e.seq == q ? &e : nullptr;
+}
+
+/// Whether the log orders the allocation `al` (stream Y) after the free `fr` (stream X), printed as one
+/// line, with the records and waits on X and Y in between when it does not.
+///
+/// The allocator may hand a block freed on stream X to an allocation on stream Y only once Y is ordered
+/// after the free. With FIDESLIB_DEBUG_NO_XSTREAM_REUSE=1 the only way it may know that is a chain of
+/// event records and waits (or an op on the legacy default stream) issued after the free; with =2 it
+/// may not reuse across streams at all.
+///
+/// The log is written next to the calls, not atomically with them: A, R and W are logged after their
+/// call, F before. Across threads that can only add edges that were not there (an R logged after a
+/// free it actually preceded), never hide one, so "NOT ORDERED" is the strong reading.
+void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo) {
+	const cudaStream_t X = fr.stream, Y = al.stream;
+	char head[256];
+	std::snprintf(head, sizeof(head), "[tableowner] REUSE step %d: free seq=%llu tid=%d stream=%p -> allocation seq=%llu tid=%d stream=%p:", step, fr.seq,
+	  fr.tid, static_cast<void*>(X), al.seq, al.tid, static_cast<void*>(Y));
+	if (X == Y) {
+		std::printf("%s SAME STREAM\n", head);
+		return;
+	}
+	// Streams ordered after the free, and the seq at which each became so.
+	std::unordered_map<cudaStream_t, unsigned long long> reach{ { X, fr.seq } };
+	// Events whose latest record sits on a stream already ordered after the free: (record seq, stream).
+	std::unordered_map<cudaEvent_t, std::pair<unsigned long long, cudaStream_t>> covering;
+	std::vector<std::string> edges;
+	unsigned long long legacy = 0;
+	for (unsigned long long q = fr.seq + 1; q < al.seq; ++q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e == nullptr)
+			continue;
+		const auto ev = static_cast<cudaEvent_t>(e->ptr);
+		if (e->stream == nullptr && legacy == 0)
+			legacy = q;
+		if (e->op == 'R') {
+			if (reach.count(e->stream) != 0)
+				covering[ev] = { q, e->stream };
+			else
+				covering.erase(ev);
+		} else if (e->op == 'W') {
+			const auto c = covering.find(ev);
+			if (c != covering.end() && reach.count(e->stream) == 0) {
+				reach[e->stream] = q;
+				char line[256];
+				std::snprintf(line, sizeof(line), "[tableowner] REUSE   edge seq=%llu tid=%d stream=%p waits on event=%p recorded at seq=%llu on stream=%p", q,
+				  e->tid, static_cast<void*>(e->stream), e->ptr, c->second.first, static_cast<void*>(c->second.second));
+				edges.emplace_back(line);
+			}
+		}
+	}
+	// An event Y waited on BEFORE it was re-recorded on a stream past the free: a dependency only if
+	// the allocator read the event's state at allocation time instead of at the wait.
+	std::unordered_map<cudaEvent_t, unsigned long long> waited;
+	const unsigned long long back = al.seq > 400000 ? al.seq - 400000 : 1;
+	for (unsigned long long q = al.seq - 1; q >= back && q >= lo && q > 0; --q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e != nullptr && e->op == 'W' && e->stream == Y)
+			waited.emplace(static_cast<cudaEvent_t>(e->ptr), q);
+	}
+	int stale = 0;
+	for (const auto& [ev, rec] : covering) {
+		const auto w = waited.find(ev);
+		if (w != waited.end() && w->second < rec.first)
+			++stale;
+	}
+	if (reach.count(Y) != 0) {
+		std::printf("%s ordered by %zu record/wait edges from seq=%llu, %d stale-event candidates\n", head, edges.size(), reach[Y], stale);
+		// The edges that lead to Y, newest first: each one's recording stream must have been reached earlier.
+		for (auto it = edges.rbegin(); it != edges.rend() && it - edges.rbegin() < 8; ++it)
+			std::printf("%s\n", it->c_str());
+		return;
+	}
+	if (legacy != 0) {
+		std::printf("%s ordered only by an op on the legacy default stream at seq=%llu, %d stale-event candidates\n", head, legacy, stale);
+		return;
+	}
+	std::printf("%s NOT ORDERED by any logged record, wait or legacy-stream op; %d stale-event candidates\n", head, stale);
+	int shown = 0;
+	for (unsigned long long q = fr.seq + 1; q < al.seq && shown < 16; ++q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e != nullptr && (e->op == 'R' || e->op == 'W') && (e->stream == X || e->stream == Y)) {
+			std::printf("[tableowner] REUSE   between: %c seq=%llu tid=%d stream=%p event=%p\n", e->op, q, e->tid, static_cast<void*>(e->stream), e->ptr);
+			++shown;
+		}
+	}
+	shown = 0;
+	for (const auto& [ev, rec] : covering) {
+		const auto w = waited.find(ev);
+		if (w != waited.end() && w->second < rec.first && shown++ < 6)
+			std::printf("[tableowner] REUSE   stale: event=%p waited on by stream %p at seq=%llu, re-recorded at seq=%llu on stream=%p past the free\n",
+			  static_cast<void*>(ev), static_cast<void*>(Y), w->second, rec.first, static_cast<void*>(rec.second));
+	}
+}
+
+/// Follows the memory that held the bad value from the upload that wrote it through every later
+/// hand-off to a new owner (free, then the next allocation covering it), and says for each whether the
+/// log orders the new owner after the free. The kernel that read the value ran after some owner's
+/// upload that came later in host order, so at least one of these hand-offs did not hold.
+void ReuseReport(const unsigned long long x, const unsigned long long now, const unsigned long long lo) {
+	const char* mode = std::getenv("FIDESLIB_DEBUG_NO_XSTREAM_REUSE");
+	std::printf("[tableowner] REUSE pool setting FIDESLIB_DEBUG_NO_XSTREAM_REUSE=%s\n", mode != nullptr ? mode : "unset (all three reuse policies on)");
+	// The newest upload into this memory that carried the bad value.
+	const MemEvent* up = nullptr;
+	for (unsigned long long q = now; q >= lo && q > 0 && up == nullptr; --q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e == nullptr || e->op != 'U' || e->upload_slot < 0)
+			continue;
+		const auto p = reinterpret_cast<unsigned long long>(e->ptr);
+		if (!(p <= bad_word_addr && bad_word_addr < p + e->bytes) || (bad_word_addr - p) % 8 != 0 || (bad_word_addr - p) / 8 >= 64)
+			continue;
+		const UploadCopy& u = upload_ring()[static_cast<size_t>(e->upload_slot)];
+		if (u.seq == e->seq && u.words[(bad_word_addr - p) / 8] == bad_value)
+			up = e;
+	}
+	if (up == nullptr) {
+		std::printf("[tableowner] REUSE no logged upload carried the bad value\n");
+		return;
+	}
+	std::printf("[tableowner] REUSE the bad value came from the upload at seq=%llu tid=%d stream=%p\n", up->seq, up->tid, static_cast<void*>(up->stream));
+	const auto covers = [&](const MemEvent& e) {
+		const auto p = reinterpret_cast<unsigned long long>(e.ptr);
+		return p <= x && x < p + (e.bytes > 0 ? e.bytes : 1);
+	};
+	const MemEvent* fr = nullptr;
+	int step = 0;
+	for (unsigned long long q = up->seq + 1; q <= now && step < 12; ++q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e == nullptr || !covers(*e))
+			continue;
+		if (fr == nullptr && e->op == 'F')
+			fr = e;
+		else if (fr != nullptr && e->op == 'A') {
+			ReuseStep(++step, *fr, *e, lo);
+			fr = nullptr;
+		}
+	}
+	if (step == 0)
+		std::printf("[tableowner] REUSE %s\n", fr == nullptr ? "the uploading owner never freed the memory in the log" : "no allocation took the memory after the free");
+}
+} // namespace
+
 void TableOwnerReport() {
 	std::lock_guard<std::mutex> lk(table_report_mu());
 	static bool done = false;
@@ -607,7 +761,7 @@ void TableOwnerReport() {
 		const auto p	 = reinterpret_cast<unsigned long long>(e.ptr);
 		const size_t len = e.bytes > 0 ? e.bytes : 1;
 		if (p <= x && x < p + len) {
-			if (covering < 60)
+			if (covering < 30)
 				PrintMemEvent(e, now, x, "COVERS");
 			++covering;
 		} else if (near < 4 && ((p + len <= x && x - (p + len) < 65536) || (p > x && p - x < 65536))) {
@@ -616,6 +770,7 @@ void TableOwnerReport() {
 		}
 	}
 	std::printf("[tableowner] %d logged events cover 0x%llx (%llu events in the log)\n", covering, x, now - lo + 1);
+	ReuseReport(x, now, lo);
 	std::fflush(stdout);
 }
 
@@ -3590,3 +3745,22 @@ bool PinnedStagingUploadGather(void* dst, const void* const* srcs, size_t n, siz
 // cudaErrorCudartUnloading problem this file already documents.
 
 } // namespace FIDESlib
+
+// ---- DEBUG BRANCH ONLY: the wrappers of TableOwnerFences.cuh. Logged after the call (see ReuseReport). ----
+__attribute__((noinline)) cudaError_t TableOwnerEventRecord(cudaEvent_t e, cudaStream_t s) {
+	const cudaError_t r = (cudaEventRecord)(e, s);
+	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0));
+	return r;
+}
+
+__attribute__((noinline)) cudaError_t TableOwnerEventRecordWithFlags(cudaEvent_t e, cudaStream_t s, unsigned int flags) {
+	const cudaError_t r = (cudaEventRecordWithFlags)(e, s, flags);
+	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0));
+	return r;
+}
+
+__attribute__((noinline)) cudaError_t TableOwnerStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned int flags) {
+	const cudaError_t r = (cudaStreamWaitEvent)(s, e, flags);
+	FIDESlib::MemLogFence('W', e, s, __builtin_return_address(0));
+	return r;
+}

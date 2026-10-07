@@ -13,6 +13,8 @@
 
 #include <mutex>
 
+#include "TableOwnerFences.cuh" // DEBUG BRANCH ONLY: after every other header
+
 namespace FIDESlib::CKKS {
 
 /// GUARDS THE TWO CUDA-GRAPH CACHES BELOW, and nothing else.

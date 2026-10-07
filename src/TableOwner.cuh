@@ -40,8 +40,12 @@ void MemLogFree(void* p, cudaStream_t s, void* site);
 /// kernels with its table, so the report shows the order of upload, launch and free.
 void MemLogUpload(void* dst, const void* src, size_t bytes, cudaStream_t s, void* site);
 void MemLogLaunch(void* table, cudaStream_t s, void* site);
+/// An event record ('R') or a stream wait on an event ('W'), from the wrappers of TableOwnerFences.cuh.
+void MemLogFence(char op, cudaEvent_t e, cudaStream_t s, void* site);
 
-/// Prints the report and the ring events around its address, once per process.
+/// Prints the report and the ring events around its address, once per process. When an upload in the
+/// log carried the bad value, it also follows the records and waits between that owner's free and the
+/// next allocation of the memory, and says whether any of them ordered the new owner after the free.
 void TableOwnerReport();
 
 } // namespace FIDESlib
