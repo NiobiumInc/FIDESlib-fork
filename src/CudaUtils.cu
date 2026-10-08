@@ -546,12 +546,20 @@ __global__ void FreeCheckKernel(const unsigned long long* marks, const FreeCheck
 	}
 }
 
-__global__ void FreeMarkSpin(const unsigned long long ns) {
+/// Spins until *flag is non-zero or `ns` have passed, whichever comes first (flag may be null).
+__global__ void FreeMarkSpin(const volatile unsigned int* flag, const unsigned long long ns) {
 	unsigned long long start, now;
 	asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
 	do {
+		if (flag != nullptr && *flag != 0)
+			return;
 		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
 	} while (now - start < ns);
+}
+
+__global__ void FreeMarkSetFlag(unsigned int* flag) {
+	atomicExch(flag, 1u);
+	__threadfence_system();
 }
 
 /// Where each generation lived, so a violation can be matched to its log entries.
@@ -769,10 +777,10 @@ const MemEvent* MemLogAt(const unsigned long long q) {
 /// b's started. A chain is PROVEN when every link (the free before the record, each record before its
 /// wait, the last wait before the allocation) is; otherwise two calls on it overlapped and the log
 /// cannot say which of them the driver saw first.
-void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo) {
+void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo) {
 	const cudaStream_t X = fr.stream, Y = al.stream;
 	char head[256];
-	std::snprintf(head, sizeof(head), "[tableowner] REUSE step %d: free seq=%llu tid=%d stream=%p -> allocation seq=%llu tid=%d stream=%p:", step, fr.seq,
+	std::snprintf(head, sizeof(head), "[tableowner] REUSE %s %d: free seq=%llu tid=%d stream=%p -> allocation seq=%llu tid=%d stream=%p:", kind, step, fr.seq,
 	  fr.tid, static_cast<void*>(X), al.seq, al.tid, static_cast<void*>(Y));
 	if (X == Y) {
 		std::printf("%s SAME STREAM\n", head);
@@ -906,12 +914,42 @@ void ReuseReport(const unsigned long long x, const unsigned long long now, const
 		if (fr == nullptr && e->op == 'F')
 			fr = e;
 		else if (fr != nullptr && e->op == 'A') {
-			ReuseStep(++step, *fr, *e, lo);
+			ReuseStep("step", ++step, *fr, *e, lo);
 			fr = nullptr;
 		}
 	}
 	if (step == 0)
 		std::printf("[tableowner] REUSE %s\n", fr == nullptr ? "the uploading owner never freed the memory in the log" : "no allocation took the memory after the free");
+
+	// The reader may instead be an earlier owner whose kernel ran late, after the uploading owner's
+	// upload: the last logged launch on this table before that upload. Every hand-off between that
+	// owner's free and the uploading owner's allocation had to order the upload after the launch.
+	const MemEvent* k = nullptr;
+	for (unsigned long long q = up->seq - 1; q >= lo && q > 0 && k == nullptr; --q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e != nullptr && e->op == 'K' && reinterpret_cast<unsigned long long>(e->ptr) == x)
+			k = e;
+	}
+	if (k == nullptr) {
+		std::printf("[tableowner] REUSE late-reader: no logged launch on this table before that upload\n");
+		return;
+	}
+	PrintMemEvent(*k, now, x, "REUSE late-reader candidate");
+	fr	 = nullptr;
+	step = 0;
+	for (unsigned long long q = k->seq + 1; q < up->seq && step < 12; ++q) {
+		const MemEvent* e = MemLogAt(q);
+		if (e == nullptr || !covers(*e))
+			continue;
+		if (fr == nullptr && e->op == 'F')
+			fr = e;
+		else if (fr != nullptr && e->op == 'A') {
+			ReuseStep("late-reader step", ++step, *fr, *e, lo);
+			fr = nullptr;
+		}
+	}
+	if (step == 0)
+		std::printf("[tableowner] REUSE late-reader: no hand-off between that launch and the upload\n");
 }
 
 /// Prints the violations the device recorded and the host has not printed yet, with the records and
@@ -948,7 +986,7 @@ void FreeMarkPoll() {
 		if (fr != nullptr && al != nullptr && fr->seq >= lo) {
 			PrintMemEvent(*fr, now, reinterpret_cast<unsigned long long>(fr->ptr), "FREEMARK-FREE");
 			PrintMemEvent(*al, now, reinterpret_cast<unsigned long long>(al->ptr), "FREEMARK-ALLOC");
-			ReuseStep(static_cast<int>(st.printed), *fr, *al, lo);
+			ReuseStep("step", static_cast<int>(st.printed), *fr, *al, lo);
 		} else {
 			std::printf("[freemark]   the free or the allocation is no longer in the log\n");
 		}
@@ -982,32 +1020,47 @@ void FreeMarkInit() {
 		st.dev	= static_cast<FreeMarkReport*>(d);
 		st.gens = new GenInfo[kGenRing]();
 
-		// Self-test on two private blocking streams. Mark 1 waits behind 20 ms of spinning and nothing
-		// orders check 2 after it: the check must report it. Mark 3 is followed by an event the
-		// checking stream waits on: check 4 must not.
+		// Self-test on two private non-blocking streams (no other thread's legacy-stream op can order
+		// them). Check 2 runs first, then sets a flag that the spin ahead of mark 1 waits for: nothing
+		// orders the check after the mark, and the check must report it. Mark 3 is followed by an
+		// event the checking stream waits on: check 4 must not.
 		cudaStream_t a = nullptr, b = nullptr;
 		cudaEvent_t e  = nullptr;
-		cudaStreamCreateWithFlags(&a, cudaStreamDefault);
-		cudaStreamCreateWithFlags(&b, cudaStreamDefault);
+		unsigned int* flag = nullptr;
+		cudaStreamCreateWithFlags(&a, cudaStreamNonBlocking);
+		cudaStreamCreateWithFlags(&b, cudaStreamNonBlocking);
 		cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+		cudaMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned int));
+		cudaMemset(flag, 0, sizeof(unsigned int));
+		// Lazy loading (the default since CUDA 12.2) loads a kernel at its first launch, and the load
+		// may synchronize the context: a first launch of the check would wait for the mark before it.
+		// Launch every kernel once, with no effect, before the test.
+		FreeMarkSpin<<<1, 1, 0, a>>>(nullptr, 0);
+		FreeMarkKernel<<<1, 1, 0, a>>>(st.marks, 0);
+		FreeCheckKernel<<<1, 1, 0, a>>>(st.marks, FreeCheckArgs{}, st.dev);
+		FreeMarkSetFlag<<<1, 1, 0, a>>>(flag);
+		cudaMemsetAsync(flag, 0, sizeof(unsigned int), a);
+		const cudaError_t warm = cudaStreamSynchronize(a);
 		FreeCheckArgs c{};
 		c.n = 1;
-		FreeMarkSpin<<<1, 1, 0, a>>>(20'000'000);
+		FreeMarkSpin<<<1, 1, 0, a>>>(flag, 2'000'000'000);
 		FreeMarkKernel<<<1, 1, 0, a>>>(st.marks, 1);
 		c.old[0] = 1;
 		c.gen	 = 2;
 		FreeCheckKernel<<<1, 1, 0, b>>>(st.marks, c, st.dev);
-		FreeMarkSpin<<<1, 1, 0, a>>>(20'000'000);
+		FreeMarkSetFlag<<<1, 1, 0, b>>>(flag);
+		FreeMarkSpin<<<1, 1, 0, a>>>(nullptr, 20'000'000);
 		FreeMarkKernel<<<1, 1, 0, a>>>(st.marks, 3);
 		cudaEventRecord(e, a);
 		cudaStreamWaitEvent(b, e, 0);
 		c.old[0] = 3;
 		c.gen	 = 4;
 		FreeCheckKernel<<<1, 1, 0, b>>>(st.marks, c, st.dev);
-		const cudaError_t r = cudaDeviceSynchronize();
+		const cudaError_t r = warm != cudaSuccess ? warm : cudaDeviceSynchronize();
 		const bool ok		= r == cudaSuccess && st.host->count == 1 && st.host->v[0].gen == 2 && st.host->v[0].old_gen == 1;
 		std::printf("[freemark] self-test %s: unordered check reported %u violation(s), first gen %llu old %llu (want 1, 2, 1)%s%s\n", ok ? "PASSED" : "FAILED",
 		  st.host->count, st.host->v[0].gen, st.host->v[0].old_gen, r == cudaSuccess ? "" : " ", r == cudaSuccess ? "" : cudaGetErrorString(r));
+		cudaFree(flag);
 		cudaEventDestroy(e);
 		cudaStreamDestroy(a);
 		cudaStreamDestroy(b);
