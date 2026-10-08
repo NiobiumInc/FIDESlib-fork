@@ -123,7 +123,7 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 			"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -O2 -std=c++17 -arch=native -o pool-mark-repro ../.github/diag/pool_mark_repro.cu >"$out/markrepro-build.log" 2>&1 ||
 				{ echo "markrepro build failed:" | tee -a "$out/summary.txt"; head -20 "$out/markrepro-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
 		fi
-		run "$v" 900 ./pool-mark-repro --mode "${x#markrepro:}" --iters 2000 --seconds 90
+		run "$v" 900 ./pool-mark-repro --mode "${x#markrepro:}" --iters 2000 --seconds 30
 		grep '^\[markrepro\]' "$out/$(printf '%s' "$v" | tr ':,' '-_').log" | sed 's/^/    /' | tee -a "$out/summary.txt"
 		;;
 	# Deterministic orderings a table relies on, without the library (.github/diag/ordering_probe.cu).

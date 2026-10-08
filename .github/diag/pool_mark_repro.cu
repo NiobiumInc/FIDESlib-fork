@@ -13,7 +13,11 @@
 //   --case overlap   two threads and one shared handle H. Thread A makes H wait on its free while
 //                    thread B, at the same moment, records an event on H, makes its own stream wait on
 //                    that event, and allocates. Whichever order the driver gives the two calls on H,
-//                    the allocator must agree with the device.
+//                    the allocator must agree with the device. Run twice: reusing one event per thread
+//                    (overlap) and with a fresh event every iteration (overlap-fresh).
+//   --case chain     one thread, the overlap calls in fixed orders (no race possible): chain (H waited
+//                    only on an older record of the event), late-wait (H waits on the new record after
+//                    eH was recorded) and chain-control (before it; the only one where reuse is safe).
 //   --case stress    several threads on a small set of shared blocking handles, with random fences
 //                    through per-thread events, the way the library's concurrent lanes issue them.
 //   --mode 0..3      the pool's reuse policies, as in pool_reuse_repro.cu (1: event dependencies only)
@@ -149,6 +153,8 @@ struct Tracker {
 		}
 		if (a.n > 0) {
 			Check<<<1, 1, 0, s>>>(marks, a, dev);
+			// A check that failed to launch would hide a violation; a mark that failed would invent one.
+			Ok("Check launch", cudaGetLastError());
 			checks.fetch_add(1);
 			if (other > 0)
 				cross.fetch_add(1);
@@ -161,6 +167,7 @@ struct Tracker {
 	void Free(void* p, const size_t bytes, const cudaStream_t s) {
 		const unsigned long long gen = next_gen.fetch_add(1);
 		Mark<<<1, 1, 0, s>>>(marks, gen);
+		Ok("Mark launch", cudaGetLastError());
 		{
 			std::lock_guard<std::mutex> lk(mu);
 			freed[reinterpret_cast<unsigned long long>(p)] = { gen, bytes, s };
@@ -246,6 +253,7 @@ void StaleCase(const int mode, const unsigned long long iters, const bool contro
 		Ok("cudaMallocAsync", cudaMallocAsync(&p, 64, O));
 		T.Took(p, 64, O);
 		Spin<<<1, 1, 0, O>>>(nullptr, 2'000'000);
+		Ok("Spin launch", cudaGetLastError());
 		T.Free(p, 64, O);
 		Ok("record", cudaEventRecord(eO, O));
 		Ok("wait", cudaStreamWaitEvent(S, eO, 0));
@@ -292,13 +300,20 @@ void BusyNs(const long long ns) {
 
 /// Two threads, one shared handle H. A: allocate on O, spin, mark, free, record eO on O; then, at
 /// the barrier, H waits on eO. B: at the barrier, records eH on H, N waits on eH, N allocates.
-void OverlapCase(const int mode, const unsigned long long iters) {
+///
+/// With `fresh`, every iteration records into an event that was not recorded in the last kRing
+/// iterations. With one event re-recorded every iteration, a pool that wrongly followed an event's
+/// newest record (instead of the record a wait captured) would fail the same way as one that loses a
+/// race between the two threads' calls; with fresh events only the race remains.
+void OverlapCase(const int mode, const unsigned long long iters, const bool fresh) {
+	constexpr size_t kRing = 8192;
 	cudaStream_t O, H, N;
-	cudaEvent_t eO, eH;
 	for (cudaStream_t* s : { &O, &H, &N })
 		Ok("stream", cudaStreamCreateWithFlags(s, cudaStreamDefault));
-	Ok("event", cudaEventCreateWithFlags(&eO, cudaEventDisableTiming));
-	Ok("event", cudaEventCreateWithFlags(&eH, cudaEventDisableTiming));
+	std::vector<cudaEvent_t> eOs(fresh ? kRing : 1), eHs(fresh ? kRing : 1);
+	for (std::vector<cudaEvent_t>* v : { &eOs, &eHs })
+		for (cudaEvent_t& e : *v)
+			Ok("event", cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
 	T.Reset();
 	Barrier2 bar;
 	std::atomic<unsigned long long> same{ 0 };
@@ -311,7 +326,9 @@ void OverlapCase(const int mode, const unsigned long long iters) {
 			Ok("cudaMallocAsync", cudaMallocAsync(&p, 64, O));
 			T.Took(p, 64, O);
 			Spin<<<1, 1, 0, O>>>(nullptr, 20'000 + rng() % 200'000);
+			Ok("Spin launch", cudaGetLastError());
 			T.Free(p, 64, O);
+			const cudaEvent_t eO = eOs[i % eOs.size()];
 			Ok("record", cudaEventRecord(eO, O));
 			if (!bar.Wait(2 * i + 1)) {
 				stop = true;
@@ -333,6 +350,7 @@ void OverlapCase(const int mode, const unsigned long long iters) {
 				break;
 			}
 			BusyNs(static_cast<long long>(rng() % 3000));
+			const cudaEvent_t eH = eHs[i % eHs.size()];
 			Ok("record", cudaEventRecord(eH, H));
 			Ok("wait", cudaStreamWaitEvent(N, eH, 0));
 			void* q = nullptr;
@@ -352,7 +370,62 @@ void OverlapCase(const int mode, const unsigned long long iters) {
 	b.join();
 	if (stop)
 		std::printf("[markrepro] overlap: a thread timed out at the barrier\n");
-	PrintResult("overlap", mode, 2, iters, same.load());
+	PrintResult(fresh ? "overlap-fresh" : "overlap", mode, 2, iters, same.load());
+	for (void* q : kept)
+		cudaFreeAsync(q, N);
+	Ok("sync", cudaDeviceSynchronize());
+	for (cudaStream_t s : { O, H, N })
+		cudaStreamDestroy(s);
+	for (std::vector<cudaEvent_t>* v : { &eOs, &eHs })
+		for (cudaEvent_t e : *v)
+			cudaEventDestroy(e);
+}
+
+/// One thread, the overlap case's calls in a fixed order, so no race between threads is possible.
+/// H waits on an earlier record of eO; O allocates, spins, marks and frees p and records eO again;
+/// then H's event eH is recorded, and N waits on eH and allocates.
+///   chain:     nothing else. eH captures only H's wait on the OLD record of eO, so N is not ordered
+///              after p's free and may not get p. A pool that followed eO's NEWEST record would.
+///   late-wait: H also waits on the new record of eO, but after eH was recorded and before N waits
+///              and allocates. N is still not ordered after the free. A pool that read H's state at
+///              the allocation instead of the state eH captured would hand N the block.
+///   control:   H waits on the new record BEFORE eH is recorded: N is ordered after the free, the pool
+///              may hand it p, and the check must pass.
+void ChainCase(const int mode, const unsigned long long iters, const char* variant) {
+	const std::string v = variant;
+	cudaStream_t O, H, N;
+	cudaEvent_t eO, eH;
+	for (cudaStream_t* s : { &O, &H, &N })
+		Ok("stream", cudaStreamCreateWithFlags(s, cudaStreamDefault));
+	Ok("event", cudaEventCreateWithFlags(&eO, cudaEventDisableTiming));
+	Ok("event", cudaEventCreateWithFlags(&eH, cudaEventDisableTiming));
+	T.Reset();
+	unsigned long long same = 0;
+	std::vector<void*> kept; // N keeps its blocks, as in StaleCase
+	for (unsigned long long i = 0; i < iters; ++i) {
+		Ok("record", cudaEventRecord(eO, O));
+		Ok("wait", cudaStreamWaitEvent(H, eO, 0)); // H depends on this (old) record of eO
+		void* p = nullptr;
+		Ok("cudaMallocAsync", cudaMallocAsync(&p, 64, O));
+		T.Took(p, 64, O);
+		Spin<<<1, 1, 0, O>>>(nullptr, 2'000'000);
+		Ok("Spin launch", cudaGetLastError());
+		T.Free(p, 64, O);
+		Ok("record", cudaEventRecord(eO, O)); // eO now stands after the free
+		if (v == "control")
+			Ok("wait", cudaStreamWaitEvent(H, eO, 0));
+		Ok("record", cudaEventRecord(eH, H));
+		if (v == "late-wait")
+			Ok("wait", cudaStreamWaitEvent(H, eO, 0));
+		Ok("wait", cudaStreamWaitEvent(N, eH, 0));
+		void* q = nullptr;
+		Ok("cudaMallocAsync", cudaMallocAsync(&q, 64, N));
+		same += q == p;
+		T.Took(q, 64, N);
+		kept.push_back(q);
+		Ok("sync", cudaDeviceSynchronize());
+	}
+	PrintResult(("chain-" + v).c_str(), mode, 1, iters, same);
 	for (void* q : kept)
 		cudaFreeAsync(q, N);
 	Ok("sync", cudaDeviceSynchronize());
@@ -388,6 +461,7 @@ void StressCase(const int mode, const int threads, const int nhandles, const dou
 				Ok("cudaMallocAsync", cudaMallocAsync(&p, bytes, s));
 				T.Took(p, bytes, s);
 				Spin<<<1, 1, 0, s>>>(nullptr, rng() % 50'000);
+				Ok("Spin launch", cudaGetLastError());
 				T.Free(p, bytes, s);
 				for (int f = static_cast<int>(rng() % 3); f > 0; --f) {
 					const size_t x = rng() % handles.size(), y = rng() % handles.size();
@@ -480,8 +554,17 @@ int main(int argc, char** argv) {
 		ran();
 		StaleCase(mode, iters, true);
 	}
+	if (which == "all" || which == "chain") {
+		ChainCase(mode, iters, "chain");
+		ran();
+		ChainCase(mode, iters, "late-wait");
+		ran();
+		ChainCase(mode, iters, "control");
+	}
 	if (which == "all" || which == "overlap") {
-		OverlapCase(mode, iters * 100);
+		OverlapCase(mode, iters * 100, false);
+		ran();
+		OverlapCase(mode, iters * 100, true);
 		ran();
 	}
 	if (which == "all" || which == "stress") {
