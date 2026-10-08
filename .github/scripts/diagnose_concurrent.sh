@@ -7,6 +7,7 @@
 #   env:VAR=1,VAR2=1.N     the unit with those environment variables set
 #   repro:<pool mode>.N    the allocator alone (.github/diag/pool_reuse_repro.cu)
 #   probe.N                deterministic stream-ordering checks (.github/diag/ordering_probe.cu)
+#   markrepro:<pool mode>.N  the allocator's hand-offs checked with free marks (.github/diag/pool_mark_repro.cu)
 # The gcp-ephemeral VM is stopped about 99 minutes into the job, so no variant starts after
 # DEADLINE minutes of this script, and the artifacts always get uploaded.
 #
@@ -114,6 +115,16 @@ for v in $(grep -v '^#' ../.github/diag-variants.txt); do
 				{ echo "repro build failed:" | tee -a "$out/summary.txt"; head -20 "$out/repro-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
 		fi
 		run "$v" 600 ./pool-reuse-repro --mode "${x#repro:}" --seconds 150
+		;;
+	# The allocator's hand-offs checked with free marks, without the library (.github/diag/pool_mark_repro.cu):
+	# markrepro:<pool mode>.N
+	markrepro:*)
+		if [ ! -x ./pool-mark-repro ]; then
+			"${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" -O2 -std=c++17 -arch=native -o pool-mark-repro ../.github/diag/pool_mark_repro.cu >"$out/markrepro-build.log" 2>&1 ||
+				{ echo "markrepro build failed:" | tee -a "$out/summary.txt"; head -20 "$out/markrepro-build.log" | sed 's/^/    /' | tee -a "$out/summary.txt"; }
+		fi
+		run "$v" 900 ./pool-mark-repro --mode "${x#markrepro:}" --iters 2000 --seconds 90
+		grep '^\[markrepro\]' "$out/$(printf '%s' "$v" | tr ':,' '-_').log" | sed 's/^/    /' | tee -a "$out/summary.txt"
 		;;
 	# Deterministic orderings a table relies on, without the library (.github/diag/ordering_probe.cu).
 	probe)
