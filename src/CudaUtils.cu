@@ -458,6 +458,7 @@ struct MemEvent {
 	char op;		 ///< 'A' allocation, 'F' free, 'U' table upload, 'K' kernel launch reading a table,
 				 ///< 'R' event record (ptr = the event), 'W' stream wait on an event (ptr = the event)
 	int upload_slot; ///< 'U': its entry in the upload ring, else -1
+	unsigned long long enter; ///< the log position when the call started (MemLogEnter), 0 if not stamped
 };
 constexpr size_t kMemLogSize = size_t{ 1 } << 23; // records and waits are most of the events
 MemEvent* mem_log() {
@@ -490,7 +491,8 @@ UploadCopy* upload_ring() {
 }
 std::atomic<unsigned long long> upload_seq{ 0 };
 
-unsigned long long MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s, void* site, const int upload_slot = -1) {
+unsigned long long MemLogPut(const char op, void* p, const size_t bytes, const cudaStream_t s, void* site, const int upload_slot = -1,
+  const unsigned long long enter = 0) {
 	const unsigned long long seq = mem_seq.fetch_add(1) + 1;
 	MemEvent& e					 = mem_log()[seq % kMemLogSize];
 	e.seq						 = 0;
@@ -501,8 +503,104 @@ unsigned long long MemLogPut(const char op, void* p, const size_t bytes, const c
 	e.tid						 = MemLogTid();
 	e.op						 = op;
 	e.upload_slot				 = upload_slot;
+	e.enter						 = enter;
 	e.seq						 = seq;
 	return seq;
+}
+
+// ---- FREE MARKS (TableOwner.cuh MemLogFreeMark) ----
+constexpr unsigned long long kMarkSlots = 1ull << 22; ///< one word per allocation, indexed by its generation
+constexpr int kMarkOld					= 8;		  ///< previous owners checked per allocation
+constexpr unsigned kMarkKept			= 8;		  ///< violations kept in detail
+struct FreeViolation {
+	unsigned long long gen;		///< the new allocation; written last, so non-zero means the entry is whole
+	unsigned long long old_gen; ///< the previous owner whose free had not been reached
+	unsigned long long seen;	///< what its mark slot held
+};
+struct FreeMarkReport {
+	unsigned int count;
+	unsigned int pad;
+	FreeViolation v[kMarkKept];
+};
+struct FreeCheckArgs {
+	unsigned long long old[kMarkOld];
+	unsigned long long gen;
+	int n;
+};
+
+__global__ void FreeMarkKernel(unsigned long long* marks, const unsigned long long gen) {
+	__stcg(&marks[gen % kMarkSlots], gen);
+}
+
+__global__ void FreeCheckKernel(const unsigned long long* marks, const FreeCheckArgs a, FreeMarkReport* r) {
+	for (int i = 0; i < a.n; ++i) {
+		const unsigned long long m = __ldcg(&marks[a.old[i] % kMarkSlots]);
+		if (m >= a.old[i])
+			continue;
+		const unsigned int k = atomicAdd(&r->count, 1u);
+		if (k < kMarkKept) {
+			atomicExch(&r->v[k].old_gen, a.old[i]);
+			atomicExch(&r->v[k].seen, m);
+			atomicExch(&r->v[k].gen, a.gen);
+		}
+	}
+}
+
+__global__ void FreeMarkSpin(const unsigned long long ns) {
+	unsigned long long start, now;
+	asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+	do {
+		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+	} while (now - start < ns);
+}
+
+/// Where each generation lived, so a violation can be matched to its log entries.
+struct GenInfo {
+	unsigned long long gen, a_seq, f_seq;
+	cudaStream_t a_stream, f_stream;
+	void* ptr;
+	size_t bytes;
+};
+constexpr size_t kGenRing = size_t{ 1 } << 20;
+struct LiveBlock {
+	unsigned long long gen;
+	size_t bytes;
+	bool marked; ///< MemLogFreeMark ran for it: only then may a later owner check its mark
+};
+struct FreedBlock {
+	unsigned long long gen;
+	size_t bytes;
+	cudaStream_t stream;
+};
+struct FreeMarkState {
+	bool on	  = false;
+	int device = -1;
+	unsigned long long* marks = nullptr; ///< device memory, kMarkSlots words
+	FreeMarkReport* host	  = nullptr; ///< mapped pinned
+	FreeMarkReport* dev		  = nullptr;
+	GenInfo* gens			  = nullptr;
+	std::mutex mu; ///< live, freed, max_freed, gens
+	std::unordered_map<void*, LiveBlock> live;
+	std::map<unsigned long long, FreedBlock> freed; ///< by start address: freed and not handed out again yet
+	size_t max_freed = 0;
+	std::atomic<unsigned long long> next_gen{ 16 }; ///< 1-15 are the self-test's
+	std::atomic<unsigned long long> checks{ 0 }, cross{ 0 };
+	std::mutex print_mu;
+	unsigned int printed = 0;
+};
+FreeMarkState& FM() {
+	static auto* st = new FreeMarkState();
+	return *st;
+}
+void FreeMarkPoll();
+void FreeMarkInit();
+bool FreeMarkReady(const cudaStream_t) {
+	FreeMarkInit();
+	FreeMarkState& st = FM();
+	if (!st.on)
+		return false;
+	int dev = -1;
+	return cudaGetDevice(&dev) == cudaSuccess && dev == st.device;
 }
 std::mutex& table_report_mu() {
 	static std::mutex mu;
@@ -532,17 +630,71 @@ void PrintMemEvent(const MemEvent& e, const unsigned long long now, const unsign
 }
 } // namespace
 
-void MemLogAlloc(void* p, const size_t bytes, const cudaStream_t s, void* site) {
+unsigned long long MemLogEnter() {
+	return mem_seq.load();
+}
+
+void MemLogAlloc(void* p, const size_t bytes, const cudaStream_t s, void* site, const unsigned long long enter) {
 	if (p == nullptr)
 		return;
 	{
 		std::lock_guard<std::mutex> lk(mem_size_mu());
 		mem_sizes()[p] = bytes;
 	}
-	MemLogPut('A', p, bytes, s, site);
+	const unsigned long long seq = MemLogPut('A', p, bytes, s, site, -1, enter);
+	if (!FreeMarkReady(s))
+		return;
+	FreeMarkState& st			 = FM();
+	const unsigned long long gen = st.next_gen.fetch_add(1);
+	FreeCheckArgs a{};
+	a.gen	   = gen;
+	bool cross = false;
+	{
+		std::lock_guard<std::mutex> lk(st.mu);
+		// Every block freed and not handed out since that overlaps this one: the allocator took them.
+		const auto lo = reinterpret_cast<unsigned long long>(p), hi = lo + bytes;
+		auto it		  = st.freed.lower_bound(hi);
+		for (int walked = 0; it != st.freed.begin() && walked < 256; ++walked) {
+			--it;
+			if (it->first + it->second.bytes <= lo) {
+				if (it->first + st.max_freed <= lo)
+					break;
+				continue;
+			}
+			if (a.n < kMarkOld)
+				a.old[a.n++] = it->second.gen;
+			cross = cross || it->second.stream != s;
+			it	  = st.freed.erase(it);
+		}
+		st.live[p]				 = { gen, bytes, false };
+		st.gens[gen % kGenRing] = { gen, seq, 0, s, nullptr, p, bytes };
+	}
+	if (a.n > 0) {
+		FreeCheckKernel<<<1, 1, 0, s>>>(st.marks, a, st.dev);
+		st.checks.fetch_add(1);
+		if (cross)
+			st.cross.fetch_add(1);
+	}
+	FreeMarkPoll();
 }
 
-void MemLogFree(void* p, const cudaStream_t s, void* site) {
+void MemLogFreeMark(void* p, const cudaStream_t s) {
+	if (p == nullptr || !FreeMarkReady(s))
+		return;
+	FreeMarkState& st = FM();
+	unsigned long long gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(st.mu);
+		const auto it = st.live.find(p);
+		if (it == st.live.end())
+			return;
+		it->second.marked = true;
+		gen				  = it->second.gen;
+	}
+	FreeMarkKernel<<<1, 1, 0, s>>>(st.marks, gen);
+}
+
+void MemLogFree(void* p, const cudaStream_t s, void* site, const unsigned long long enter) {
 	if (p == nullptr)
 		return;
 	size_t bytes = 0;
@@ -554,10 +706,28 @@ void MemLogFree(void* p, const cudaStream_t s, void* site) {
 			mem_sizes().erase(it);
 		}
 	}
-	MemLogPut('F', p, bytes, s, site);
+	const unsigned long long seq = MemLogPut('F', p, bytes, s, site, -1, enter);
+	FreeMarkState& st			 = FM();
+	if (!st.on)
+		return;
+	std::lock_guard<std::mutex> lk(st.mu);
+	const auto it = st.live.find(p);
+	if (it == st.live.end())
+		return;
+	const LiveBlock b = it->second;
+	st.live.erase(it);
+	if (!b.marked)
+		return; // no mark was launched before this free: a later check could only report it falsely
+	st.freed[reinterpret_cast<unsigned long long>(p)] = { b.gen, b.bytes, s };
+	st.max_freed									  = std::max(st.max_freed, b.bytes);
+	GenInfo& g										  = st.gens[b.gen % kGenRing];
+	if (g.gen == b.gen) {
+		g.f_seq	   = seq;
+		g.f_stream = s;
+	}
 }
 
-void MemLogUpload(void* dst, const void* src, const size_t bytes, const cudaStream_t s, void* site) {
+void MemLogUpload(void* dst, const void* src, const size_t bytes, const cudaStream_t s, void* site, const unsigned long long enter) {
 	if (dst == nullptr || src == nullptr || bytes == 0)
 		return;
 	const unsigned long long useq = upload_seq.fetch_add(1);
@@ -565,7 +735,7 @@ void MemLogUpload(void* dst, const void* src, const size_t bytes, const cudaStre
 	UploadCopy& u				  = upload_ring()[static_cast<size_t>(slot)];
 	u.seq						  = 0;
 	std::memcpy(u.words, src, bytes < sizeof(u.words) ? bytes : sizeof(u.words));
-	u.seq = MemLogPut('U', dst, bytes, s, site, slot);
+	u.seq = MemLogPut('U', dst, bytes, s, site, slot, enter);
 	// The ring entry and the event carry the same seq; a reader that sees them differ skips it.
 	mem_log()[u.seq % kMemLogSize].upload_slot = slot;
 }
@@ -574,8 +744,8 @@ __attribute__((noinline)) void MemLogLaunch(void* table, const cudaStream_t s, v
 	MemLogPut('K', table, 8, s, __builtin_return_address(0));
 }
 
-void MemLogFence(const char op, cudaEvent_t e, const cudaStream_t s, void* site) {
-	MemLogPut(op, static_cast<void*>(e), 0, s, site);
+void MemLogFence(const char op, cudaEvent_t e, const cudaStream_t s, void* site, const unsigned long long enter) {
+	MemLogPut(op, static_cast<void*>(e), 0, s, site, -1, enter);
 }
 
 namespace {
@@ -593,9 +763,12 @@ const MemEvent* MemLogAt(const unsigned long long q) {
 /// event records and waits (or an op on the legacy default stream) issued after the free; with =2 it
 /// may not reuse across streams at all.
 ///
-/// The log is written next to the calls, not atomically with them: A, R and W are logged after their
-/// call, F before. Across threads that can only add edges that were not there (an R logged after a
-/// free it actually preceded), never hide one, so "NOT ORDERED" is the strong reading.
+/// The log is written next to the calls, not atomically with them: A, F, U, R and W are logged after
+/// their call returns and carry the log position at which the call started (`enter`). An entry a
+/// provably came before an entry b in the driver when a.seq <= b.enter: a's call had returned before
+/// b's started. A chain is PROVEN when every link (the free before the record, each record before its
+/// wait, the last wait before the allocation) is; otherwise two calls on it overlapped and the log
+/// cannot say which of them the driver saw first.
 void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo) {
 	const cudaStream_t X = fr.stream, Y = al.stream;
 	char head[256];
@@ -605,12 +778,22 @@ void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const uns
 		std::printf("%s SAME STREAM\n", head);
 		return;
 	}
-	// Streams ordered after the free, and the seq at which each became so.
-	std::unordered_map<cudaStream_t, unsigned long long> reach{ { X, fr.seq } };
-	// Events whose latest record sits on a stream already ordered after the free: (record seq, stream).
-	std::unordered_map<cudaEvent_t, std::pair<unsigned long long, cudaStream_t>> covering;
+	// Streams ordered after the free: the seq at which each became so, and whether provably.
+	struct Reach {
+		unsigned long long seq;
+		bool proven;
+	};
+	std::unordered_map<cudaStream_t, Reach> reach{ { X, { fr.seq, fr.enter != 0 } } };
+	// Events whose latest record sits on a stream already ordered after the free.
+	struct Cover {
+		unsigned long long seq;
+		cudaStream_t stream;
+		bool proven;
+	};
+	std::unordered_map<cudaEvent_t, Cover> covering;
 	std::vector<std::string> edges;
 	unsigned long long legacy = 0;
+	const auto after		  = [](const unsigned long long a_seq, const MemEvent& b) { return b.enter != 0 && a_seq <= b.enter; };
 	for (unsigned long long q = fr.seq + 1; q < al.seq; ++q) {
 		const MemEvent* e = MemLogAt(q);
 		if (e == nullptr)
@@ -619,17 +802,22 @@ void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const uns
 		if (e->stream == nullptr && legacy == 0)
 			legacy = q;
 		if (e->op == 'R') {
-			if (reach.count(e->stream) != 0)
-				covering[ev] = { q, e->stream };
+			const auto r = reach.find(e->stream);
+			if (r != reach.end())
+				covering[ev] = { q, e->stream, r->second.proven && after(r->second.seq, *e) };
 			else
 				covering.erase(ev);
 		} else if (e->op == 'W') {
 			const auto c = covering.find(ev);
-			if (c != covering.end() && reach.count(e->stream) == 0) {
-				reach[e->stream] = q;
-				char line[256];
-				std::snprintf(line, sizeof(line), "[tableowner] REUSE   edge seq=%llu tid=%d stream=%p waits on event=%p recorded at seq=%llu on stream=%p", q,
-				  e->tid, static_cast<void*>(e->stream), e->ptr, c->second.first, static_cast<void*>(c->second.second));
+			if (c == covering.end())
+				continue;
+			const bool proven = c->second.proven && after(c->second.seq, *e);
+			const auto r	  = reach.find(e->stream);
+			if (r == reach.end() || (!r->second.proven && proven)) {
+				reach[e->stream] = { q, proven };
+				char line[288];
+				std::snprintf(line, sizeof(line), "[tableowner] REUSE   edge seq=%llu tid=%d stream=%p waits on event=%p recorded at seq=%llu on stream=%p%s", q,
+				  e->tid, static_cast<void*>(e->stream), e->ptr, c->second.seq, static_cast<void*>(c->second.stream), proven ? "" : " (link not proven)");
 				edges.emplace_back(line);
 			}
 		}
@@ -646,11 +834,13 @@ void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const uns
 	int stale = 0;
 	for (const auto& [ev, rec] : covering) {
 		const auto w = waited.find(ev);
-		if (w != waited.end() && w->second < rec.first)
+		if (w != waited.end() && w->second < rec.seq)
 			++stale;
 	}
 	if (reach.count(Y) != 0) {
-		std::printf("%s ordered by %zu record/wait edges from seq=%llu, %d stale-event candidates\n", head, edges.size(), reach[Y], stale);
+		const bool proven = reach[Y].proven && after(reach[Y].seq, al);
+		std::printf("%s ordered by %zu record/wait edges from seq=%llu, chain %s, %d stale-event candidates\n", head, edges.size(), reach[Y].seq,
+		  proven ? "PROVEN by call order" : "NOT PROVEN (calls on it overlapped)", stale);
 		// The edges that lead to Y, newest first: each one's recording stream must have been reached earlier.
 		for (auto it = edges.rbegin(); it != edges.rend() && it - edges.rbegin() < 8; ++it)
 			std::printf("%s\n", it->c_str());
@@ -672,9 +862,9 @@ void ReuseStep(const int step, const MemEvent& fr, const MemEvent& al, const uns
 	shown = 0;
 	for (const auto& [ev, rec] : covering) {
 		const auto w = waited.find(ev);
-		if (w != waited.end() && w->second < rec.first && shown++ < 6)
+		if (w != waited.end() && w->second < rec.seq && shown++ < 6)
 			std::printf("[tableowner] REUSE   stale: event=%p waited on by stream %p at seq=%llu, re-recorded at seq=%llu on stream=%p past the free\n",
-			  static_cast<void*>(ev), static_cast<void*>(Y), w->second, rec.first, static_cast<void*>(rec.second));
+			  static_cast<void*>(ev), static_cast<void*>(Y), w->second, rec.seq, static_cast<void*>(rec.stream));
 	}
 }
 
@@ -723,7 +913,127 @@ void ReuseReport(const unsigned long long x, const unsigned long long now, const
 	if (step == 0)
 		std::printf("[tableowner] REUSE %s\n", fr == nullptr ? "the uploading owner never freed the memory in the log" : "no allocation took the memory after the free");
 }
+
+/// Prints the violations the device recorded and the host has not printed yet, with the records and
+/// waits between the previous owner's free and the new allocation.
+void FreeMarkPoll() {
+	FreeMarkState& st = FM();
+	if (!st.on)
+		return;
+	const unsigned int count = *static_cast<volatile unsigned int*>(&st.host->count);
+	if (count <= st.printed || st.printed >= kMarkKept)
+		return;
+	std::lock_guard<std::mutex> lk(st.print_mu);
+	const unsigned long long now = mem_seq.load();
+	const unsigned long long lo	 = now > kMemLogSize ? now - kMemLogSize + 1 : 1;
+	while (st.printed < count && st.printed < kMarkKept) {
+		const volatile FreeViolation& v = st.host->v[st.printed];
+		const unsigned long long gen	= v.gen;
+		if (gen == 0)
+			break; // the device is still writing this entry
+		const unsigned long long old = v.old_gen, seen = v.seen;
+		++st.printed;
+		GenInfo o{}, n{};
+		{
+			std::lock_guard<std::mutex> g(st.mu);
+			o = st.gens[old % kGenRing];
+			n = st.gens[gen % kGenRing];
+		}
+		std::printf("[freemark] VIOLATION %u: an allocation ran on the device before a previous owner of its memory reached its free. New: gen %llu A seq=%llu "
+					"stream=%p %zu bytes at %p. Previous: gen %llu A seq=%llu F seq=%llu stream=%p %zu bytes at %p. Mark slot held %llu.\n",
+		  st.printed, gen, n.gen == gen ? n.a_seq : 0ull, static_cast<void*>(n.a_stream), n.bytes, n.ptr, old, o.gen == old ? o.a_seq : 0ull,
+		  o.gen == old ? o.f_seq : 0ull, static_cast<void*>(o.f_stream), o.bytes, o.ptr, seen);
+		const MemEvent* fr = (o.gen == old && o.f_seq != 0) ? MemLogAt(o.f_seq) : nullptr;
+		const MemEvent* al = n.gen == gen ? MemLogAt(n.a_seq) : nullptr;
+		if (fr != nullptr && al != nullptr && fr->seq >= lo) {
+			PrintMemEvent(*fr, now, reinterpret_cast<unsigned long long>(fr->ptr), "FREEMARK-FREE");
+			PrintMemEvent(*al, now, reinterpret_cast<unsigned long long>(al->ptr), "FREEMARK-ALLOC");
+			ReuseStep(static_cast<int>(st.printed), *fr, *al, lo);
+		} else {
+			std::printf("[freemark]   the free or the allocation is no longer in the log\n");
+		}
+	}
+	std::fflush(stdout);
+}
+
+/// Once per process, at the first logged allocation: the marks, the report, and a self-test that must
+/// see a violation where nothing orders the check after the mark, and none where an event wait does.
+void FreeMarkInit() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		FreeMarkState& st = FM();
+		const char* env	  = std::getenv("FIDESLIB_DEBUG_FREEMARK");
+		if (env != nullptr && env[0] == '0') {
+			std::printf("[freemark] OFF (FIDESLIB_DEBUG_FREEMARK=0)\n");
+			std::fflush(stdout);
+			return;
+		}
+		void* h = nullptr;
+		void* d = nullptr;
+		if (cudaGetDevice(&st.device) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&st.marks), kMarkSlots * 8) != cudaSuccess ||
+			cudaMemset(st.marks, 0, kMarkSlots * 8) != cudaSuccess || cudaHostAlloc(&h, sizeof(FreeMarkReport), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+			cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+			std::printf("[freemark] could not set up: %s\n", cudaGetErrorString(cudaGetLastError()));
+			std::fflush(stdout);
+			return;
+		}
+		std::memset(h, 0, sizeof(FreeMarkReport));
+		st.host = static_cast<FreeMarkReport*>(h);
+		st.dev	= static_cast<FreeMarkReport*>(d);
+		st.gens = new GenInfo[kGenRing]();
+
+		// Self-test on two private blocking streams. Mark 1 waits behind 20 ms of spinning and nothing
+		// orders check 2 after it: the check must report it. Mark 3 is followed by an event the
+		// checking stream waits on: check 4 must not.
+		cudaStream_t a = nullptr, b = nullptr;
+		cudaEvent_t e  = nullptr;
+		cudaStreamCreateWithFlags(&a, cudaStreamDefault);
+		cudaStreamCreateWithFlags(&b, cudaStreamDefault);
+		cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+		FreeCheckArgs c{};
+		c.n = 1;
+		FreeMarkSpin<<<1, 1, 0, a>>>(20'000'000);
+		FreeMarkKernel<<<1, 1, 0, a>>>(st.marks, 1);
+		c.old[0] = 1;
+		c.gen	 = 2;
+		FreeCheckKernel<<<1, 1, 0, b>>>(st.marks, c, st.dev);
+		FreeMarkSpin<<<1, 1, 0, a>>>(20'000'000);
+		FreeMarkKernel<<<1, 1, 0, a>>>(st.marks, 3);
+		cudaEventRecord(e, a);
+		cudaStreamWaitEvent(b, e, 0);
+		c.old[0] = 3;
+		c.gen	 = 4;
+		FreeCheckKernel<<<1, 1, 0, b>>>(st.marks, c, st.dev);
+		const cudaError_t r = cudaDeviceSynchronize();
+		const bool ok		= r == cudaSuccess && st.host->count == 1 && st.host->v[0].gen == 2 && st.host->v[0].old_gen == 1;
+		std::printf("[freemark] self-test %s: unordered check reported %u violation(s), first gen %llu old %llu (want 1, 2, 1)%s%s\n", ok ? "PASSED" : "FAILED",
+		  st.host->count, st.host->v[0].gen, st.host->v[0].old_gen, r == cudaSuccess ? "" : " ", r == cudaSuccess ? "" : cudaGetErrorString(r));
+		cudaEventDestroy(e);
+		cudaStreamDestroy(a);
+		cudaStreamDestroy(b);
+		std::memset(h, 0, sizeof(FreeMarkReport));
+		if (!ok) {
+			std::fflush(stdout);
+			return;
+		}
+		st.on = true;
+		std::printf("[freemark] ON: every logged free marks itself on its stream; every logged allocation checks, on its own stream, the marks of the "
+					"blocks it took over\n");
+		std::fflush(stdout);
+		std::atexit(FreeMarkSummary);
+	});
+}
 } // namespace
+
+void FreeMarkSummary() {
+	FreeMarkState& st = FM();
+	if (!st.on)
+		return;
+	FreeMarkPoll();
+	std::printf("[freemark] checks=%llu (cross-stream %llu) violations=%u\n", st.checks.load(), st.cross.load(),
+	  *static_cast<volatile unsigned int*>(&st.host->count));
+	std::fflush(stdout);
+}
 
 void TableOwnerReport() {
 	std::lock_guard<std::mutex> lk(table_report_mu());
@@ -734,6 +1044,7 @@ void TableOwnerReport() {
 	const TableReport* r   = TableReportHost();
 	if (r == nullptr || r->hit == 0) {
 		std::printf("[tableowner] no bad table entry was recorded\n");
+		FreeMarkSummary();
 		std::fflush(stdout);
 		return;
 	}
@@ -771,6 +1082,7 @@ void TableOwnerReport() {
 	}
 	std::printf("[tableowner] %d logged events cover 0x%llx (%llu events in the log)\n", covering, x, now - lo + 1);
 	ReuseReport(x, now, lo);
+	FreeMarkSummary();
 	std::fflush(stdout);
 }
 
@@ -908,10 +1220,11 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 				const cudaMemPool_t pool = SlotMemPoolFor(device, slot);
 				if (pool != nullptr) {
 					void* p = nullptr;
+					const unsigned long long enter = MemLogEnter();
 					const cudaError_t e = cudaMallocFromPoolAsync(&p, bytes, pool, s);
 					if (e != cudaSuccess)
 						throw std::runtime_error(std::string("OpMallocAsync: cudaMallocFromPoolAsync failed: ") + cudaGetErrorString(e));
-					MemLogAlloc(p, bytes, s, __builtin_return_address(0));
+					MemLogAlloc(p, bytes, s, __builtin_return_address(0), enter);
 					slot_pool_allocs.fetch_add(1, std::memory_order_relaxed);
 					return p;
 				}
@@ -922,15 +1235,18 @@ void* OpMallocAsync(const size_t bytes, const cudaStream_t s) {
 	// Default mode and slot 0: byte-identical to the cudaMallocAsync this replaced, down to not
 	// checking the status (the call sites' CudaCheckError macros do that where they always did).
 	void* p = nullptr;
+	const unsigned long long enter = MemLogEnter();
 	cudaMallocAsync(&p, bytes, s);
-	MemLogAlloc(p, bytes, s, __builtin_return_address(0));
+	MemLogAlloc(p, bytes, s, __builtin_return_address(0), enter);
 	return p;
 }
 
 void OpFreeAsync(void* p, const cudaStream_t s) {
 	// Unconditional by design -- see CudaUtils.cuh OpFreeAsync.
-	MemLogFree(p, s, __builtin_return_address(0));
+	const unsigned long long enter = MemLogEnter();
+	MemLogFreeMark(p, s);
 	cudaFreeAsync(p, s);
+	MemLogFree(p, s, __builtin_return_address(0), enter);
 }
 
 void TableTraceReport();
@@ -2701,8 +3017,9 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 	if (0) {
 		cudaMalloc(&ptr, bytes);
 	} else if (1) {
+		const unsigned long long enter = MemLogEnter();
 		cudaMallocAsync(&ptr, bytes, 0);
-		MemLogAlloc(ptr, bytes, 0, __builtin_return_address(0));
+		MemLogAlloc(ptr, bytes, 0, __builtin_return_address(0), enter);
 	} else {
 		if (size_to_memory[id][bytes].empty()) {
 			cudaSetDevice(id);
@@ -2857,8 +3174,10 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 	if (0) {
 		cudaFree(ptr);
 	} else if (1) {
-		MemLogFree(ptr, 0, __builtin_return_address(0));
+		const unsigned long long enter = MemLogEnter();
+		MemLogFreeMark(ptr, 0);
 		cudaFreeAsync(ptr, 0);
+		MemLogFree(ptr, 0, __builtin_return_address(0), enter);
 	} else {
 		auto* p    = new pointerdata;
 		p->id      = id;
@@ -3690,21 +4009,23 @@ static void PinnedStagingFellBack(const size_t bytes) {
 }
 
 __attribute__((noinline)) void UploadH2D(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
-	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
+	const unsigned long long enter = MemLogEnter(); // DEBUG BRANCH ONLY
 	if (!PinnedStagingUpload(dst, src, bytes, device, stream)) {
 		PinnedStagingFellBack(bytes);
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
 	}
+	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0), enter); // DEBUG BRANCH ONLY
 }
 
 __attribute__((noinline)) void UploadH2DMGPU(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
-	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0)); // DEBUG BRANCH ONLY
+	const unsigned long long enter = MemLogEnter(); // DEBUG BRANCH ONLY
 	// EITHER variable: FIDESLIB_PINNED_STAGING for the sweep 0f72c59 meant to be whole, and
 	// FIDESLIB_PINNED_MGPU for the three sites it missed, on their own. See CudaUtils.cuh.
 	if (!(PinnedStagingEnabled() || PinnedMGPU()) || !StageUploadUngated(dst, src, bytes, device, stream)) {
 		PinnedStagingFellBack(bytes);
 		cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
 	}
+	MemLogUpload(dst, src, bytes, stream, __builtin_return_address(0), enter); // DEBUG BRANCH ONLY
 }
 
 bool PinnedStagingUpload(void* dst, const void* src, size_t bytes, int device, cudaStream_t stream) {
@@ -3764,21 +4085,25 @@ bool PinnedStagingUploadGather(void* dst, const void* const* srcs, size_t n, siz
 
 } // namespace FIDESlib
 
-// ---- DEBUG BRANCH ONLY: the wrappers of TableOwnerFences.cuh. Logged after the call (see ReuseReport). ----
+// ---- DEBUG BRANCH ONLY: the wrappers of TableOwnerFences.cuh. Logged after the call, stamped with the
+// log position before it (see ReuseStep). ----
 __attribute__((noinline)) cudaError_t TableOwnerEventRecord(cudaEvent_t e, cudaStream_t s) {
-	const cudaError_t r = (cudaEventRecord)(e, s);
-	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0));
+	const unsigned long long enter = FIDESlib::MemLogEnter();
+	const cudaError_t r			   = (cudaEventRecord)(e, s);
+	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0), enter);
 	return r;
 }
 
 __attribute__((noinline)) cudaError_t TableOwnerEventRecordWithFlags(cudaEvent_t e, cudaStream_t s, unsigned int flags) {
-	const cudaError_t r = (cudaEventRecordWithFlags)(e, s, flags);
-	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0));
+	const unsigned long long enter = FIDESlib::MemLogEnter();
+	const cudaError_t r			   = (cudaEventRecordWithFlags)(e, s, flags);
+	FIDESlib::MemLogFence('R', e, s, __builtin_return_address(0), enter);
 	return r;
 }
 
 __attribute__((noinline)) cudaError_t TableOwnerStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned int flags) {
-	const cudaError_t r = (cudaStreamWaitEvent)(s, e, flags);
-	FIDESlib::MemLogFence('W', e, s, __builtin_return_address(0));
+	const unsigned long long enter = FIDESlib::MemLogEnter();
+	const cudaError_t r			   = (cudaStreamWaitEvent)(s, e, flags);
+	FIDESlib::MemLogFence('W', e, s, __builtin_return_address(0), enter);
 	return r;
 }

@@ -34,14 +34,30 @@ void TableCheckInit();
 /// The report as the host sees it (mapped pinned memory), or nullptr before TableCheckInit().
 const TableReport* TableReportHost();
 
-void MemLogAlloc(void* p, size_t bytes, cudaStream_t s, void* site);
-void MemLogFree(void* p, cudaStream_t s, void* site);
-/// A table upload (destination, the first bytes of the source) and a launch of one of the three checked
-/// kernels with its table, so the report shows the order of upload, launch and free.
-void MemLogUpload(void* dst, const void* src, size_t bytes, cudaStream_t s, void* site);
+/// The log position before a call: pass it as `enter` to the entry logged after the call returns. An
+/// entry whose seq is below another's `enter` provably returned before that other call started, which is
+/// what the report needs to call a chain of records and waits proven (0: not stamped).
+unsigned long long MemLogEnter();
+/// Logged after the allocation returns. With the free marks on, also launches on `s` a check that the
+/// previous owners of this memory had reached their free (see MemLogFreeMark).
+void MemLogAlloc(void* p, size_t bytes, cudaStream_t s, void* site, unsigned long long enter = 0);
+/// FREE MARKS. Call right BEFORE cudaFreeAsync(p, s): launches on `s` a one-thread kernel that marks the
+/// free of this allocation as reached. The check launched on the next owner's stream after its
+/// allocation must then find the mark, whatever the timing, if the allocator ordered that stream after
+/// the free; a missing mark is a hand-off the device did not order. Off with FIDESLIB_DEBUG_FREEMARK=0.
+void MemLogFreeMark(void* p, cudaStream_t s);
+/// Logged after cudaFreeAsync returns.
+void MemLogFree(void* p, cudaStream_t s, void* site, unsigned long long enter = 0);
+/// A table upload (destination, the first bytes of the source), logged after the copy is issued, and a
+/// launch of one of the three checked kernels with its table, so the report shows the order of upload,
+/// launch and free.
+void MemLogUpload(void* dst, const void* src, size_t bytes, cudaStream_t s, void* site, unsigned long long enter = 0);
 void MemLogLaunch(void* table, cudaStream_t s, void* site);
 /// An event record ('R') or a stream wait on an event ('W'), from the wrappers of TableOwnerFences.cuh.
-void MemLogFence(char op, cudaEvent_t e, cudaStream_t s, void* site);
+void MemLogFence(char op, cudaEvent_t e, cudaStream_t s, void* site, unsigned long long enter = 0);
+
+/// The free-mark totals and any violation not printed yet. Also runs at exit and from TableOwnerReport.
+void FreeMarkSummary();
 
 /// Prints the report and the ring events around its address, once per process. When an upload in the
 /// log carried the bad value, it also follows the records and waits between that owner's free and the
