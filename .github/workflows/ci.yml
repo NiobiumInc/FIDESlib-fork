@@ -13,12 +13,16 @@ on:
   push:
     branches: [nb_main]
   workflow_dispatch:
+  # The release workflow runs these checks on the commit it is about to release.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # In a run called from the release workflow, github.workflow names the caller: the ci-
+  # prefix keeps that run out of the release's own concurrency group.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
