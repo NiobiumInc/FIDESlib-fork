@@ -50,6 +50,21 @@ namespace FIDESlib {
 /// plus one thread_local read per scratch accessor.
 bool ConcurrentOps();
 
+/// @brief In the concurrent mode, turn off `pool`'s reuse of a block freed on one stream for an
+/// allocation on another stream on the strength of event dependencies alone
+/// (cudaMemPoolReuseFollowEventDependencies). Does nothing in the default mode.
+///
+/// In the concurrent mode several threads share stream handles. When one thread makes a shared
+/// stream wait on an event recorded after a free while another thread, at the same moment, records
+/// an event on that same stream and makes its own stream wait on it, the driver's pool can take the
+/// second thread's stream as ordered after the free while the device runs it without that order:
+/// the block's new owner then writes it while the previous owner's kernels still read it (a per-op
+/// table read as polynomial data, an illegal address). A program with no FIDESlib code reproduces
+/// it with the pool's default settings, and never with this policy off. The pool keeps its other
+/// two ways to reuse across streams, a dependency it inserts itself and a free that has already
+/// completed, which do not depend on the order of two threads' calls.
+void ConfigurePoolForConcurrentOps(cudaMemPool_t pool);
+
 /// @brief DIAGNOSTIC (FIDESLIB_CONCURRENT_OPS_DIAG; concurrent mode only): a comma list of
 /// primitives to serialize PROCESS-WIDE behind one recursive lock -- `fence` (Stream::wait /
 /// Stream::record), `modup`, `ksk` (the dot-KSK family), `moddown`, `rescale`, `mult`
@@ -270,8 +285,10 @@ void* OpTableBuffer(int device, size_t bytes, int which);
 ///
 /// WHAT IT DISCRIMINATES. `cudaMallocAsync` / `cudaFreeAsync` draw from the DEVICE DEFAULT memory
 /// pool -- one object shared by every stream and every host thread, whose three reuse policies
-/// (same-stream fast path, `ReuseAllowOpportunistic`, `ReuseFollowEventDependencies`) this fork
-/// never changes, so all three are on. The same-stream fast path is sound because the driver takes
+/// (same-stream fast path, `ReuseAllowOpportunistic`, `ReuseFollowEventDependencies`) are all on
+/// in the default mode. (The concurrent mode now turns `ReuseFollowEventDependencies` off: that
+/// policy was the cross-lane hand-off this option was built to find; see
+/// ConfigurePoolForConcurrentOps.) The same-stream fast path is sound because the driver takes
 /// program order on one stream to BE dependency order; under FIDESLIB_CONCURRENT_OPS that premise
 /// is false at exactly one point -- two lane threads issue allocs, frees and copies to the SAME
 /// pooled `cudaStream_t` handle (Stream::init hands out stream_pool[dev][idx++ % POOL_SIZE]). A
