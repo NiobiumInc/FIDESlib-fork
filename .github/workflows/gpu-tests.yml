@@ -193,55 +193,11 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
-      # unless told otherwise; cuda makes them exercise the CUDA engine, which
-      # is what this job is for. The CPU backend has its own job in ci.yml.
-      - name: Test
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results "${args[@]}"
-
-      # The concurrent-operations suite, in a process of its own: the library reads
-      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
-      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
-      # It runs even when the default-mode suite failed, so both results are reported.
-      # Every test gets a process of its own: a CUDA error leaves the context unusable for
-      # the rest of the process, so one crash would otherwise hide every test after it.
-      - name: Test concurrent operations
+      # Temporary measurement branch: the concurrent lane tests in one process, repeated (see the script).
+      - name: Measure the concurrent lane tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
-
-      # The lane tests again, together in ONE process, three times over, with no retry. A race
-      # between the threads of the concurrent mode shows only there: in the pass above every test
-      # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
-      # allocator's cross-stream reuse on event dependencies broke exactly that way (see
-      # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
-      # A crash here hides the tests after it in this pass, but the pass above runs each of them.
-      - name: Test concurrent operations in one process
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
-            --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
+        run: ../.github/scripts/measure_concurrent.sh
 
       - name: Upload test reports
         if: always()
