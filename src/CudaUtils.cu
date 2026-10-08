@@ -595,6 +595,9 @@ struct FreeMarkState {
 	std::atomic<unsigned long long> checks{ 0 }, cross{ 0 };
 	std::mutex print_mu;
 	unsigned int printed = 0;
+	/// (free seq, allocation seq) of every cross-stream hand-off, classified at exit like a violation's,
+	/// so the classes of the violations can be compared with those of the hand-offs that held.
+	std::vector<std::pair<unsigned long long, unsigned long long>> handoffs;
 };
 FreeMarkState& FM() {
 	static auto* st = new FreeMarkState();
@@ -602,7 +605,11 @@ FreeMarkState& FM() {
 }
 void FreeMarkPoll();
 void FreeMarkInit();
-bool FreeMarkReady(const cudaStream_t) {
+bool FreeMarkReady(const cudaStream_t s) {
+	// The legacy default stream is ordered with every blocking stream: a mark or a check there would add
+	// a device-wide barrier the library does not have. Blocks it allocates or frees are not tracked.
+	if (s == nullptr || s == cudaStreamLegacy)
+		return false;
 	FreeMarkInit();
 	FreeMarkState& st = FM();
 	if (!st.on)
@@ -671,7 +678,12 @@ void MemLogAlloc(void* p, const size_t bytes, const cudaStream_t s, void* site, 
 			}
 			if (a.n < kMarkOld)
 				a.old[a.n++] = it->second.gen;
-			cross = cross || it->second.stream != s;
+			if (it->second.stream != s) {
+				cross				 = true;
+				const GenInfo& g = st.gens[it->second.gen % kGenRing];
+				if (g.gen == it->second.gen && g.f_seq != 0 && st.handoffs.size() < (size_t{ 1 } << 22))
+					st.handoffs.emplace_back(g.f_seq, seq);
+			}
 			it	  = st.freed.erase(it);
 		}
 		st.live[p]				 = { gen, bytes, false };
@@ -777,14 +789,20 @@ const MemEvent* MemLogAt(const unsigned long long q) {
 /// b's started. A chain is PROVEN when every link (the free before the record, each record before its
 /// wait, the last wait before the allocation) is; otherwise two calls on it overlapped and the log
 /// cannot say which of them the driver saw first.
-void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo) {
+/// What a hand-off's log shows, as ReuseStep classifies it.
+enum HandOffClass { kSameStream, kChainProven, kChainNotProven, kLegacyOnly, kNotOrdered };
+
+/// With `print` false, classifies the hand-off and prints nothing (and skips the stale-event search).
+HandOffClass ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEvent& al, const unsigned long long lo, const bool print = true) {
 	const cudaStream_t X = fr.stream, Y = al.stream;
-	char head[256];
-	std::snprintf(head, sizeof(head), "[tableowner] REUSE %s %d: free seq=%llu tid=%d stream=%p -> allocation seq=%llu tid=%d stream=%p:", kind, step, fr.seq,
+	char head[256] = "";
+	if (print)
+		std::snprintf(head, sizeof(head), "[tableowner] REUSE %s %d: free seq=%llu tid=%d stream=%p -> allocation seq=%llu tid=%d stream=%p:", kind, step, fr.seq,
 	  fr.tid, static_cast<void*>(X), al.seq, al.tid, static_cast<void*>(Y));
 	if (X == Y) {
-		std::printf("%s SAME STREAM\n", head);
-		return;
+		if (print)
+			std::printf("%s SAME STREAM\n", head);
+		return kSameStream;
 	}
 	// Streams ordered after the free: the seq at which each became so, and whether provably.
 	struct Reach {
@@ -823,6 +841,8 @@ void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEv
 			const auto r	  = reach.find(e->stream);
 			if (r == reach.end() || (!r->second.proven && proven)) {
 				reach[e->stream] = { q, proven };
+				if (!print)
+					continue;
 				char line[288];
 				std::snprintf(line, sizeof(line), "[tableowner] REUSE   edge seq=%llu tid=%d stream=%p waits on event=%p recorded at seq=%llu on stream=%p%s", q,
 				  e->tid, static_cast<void*>(e->stream), e->ptr, c->second.seq, static_cast<void*>(c->second.stream), proven ? "" : " (link not proven)");
@@ -832,6 +852,11 @@ void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEv
 	}
 	// An event Y waited on BEFORE it was re-recorded on a stream past the free: a dependency only if
 	// the allocator read the event's state at allocation time instead of at the wait.
+	if (!print) {
+		if (reach.count(Y) != 0)
+			return reach[Y].proven && after(reach[Y].seq, al) ? kChainProven : kChainNotProven;
+		return legacy != 0 ? kLegacyOnly : kNotOrdered;
+	}
 	std::unordered_map<cudaEvent_t, unsigned long long> waited;
 	const unsigned long long back = al.seq > 400000 ? al.seq - 400000 : 1;
 	for (unsigned long long q = al.seq - 1; q >= back && q >= lo && q > 0; --q) {
@@ -852,11 +877,11 @@ void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEv
 		// The edges that lead to Y, newest first: each one's recording stream must have been reached earlier.
 		for (auto it = edges.rbegin(); it != edges.rend() && it - edges.rbegin() < 8; ++it)
 			std::printf("%s\n", it->c_str());
-		return;
+		return proven ? kChainProven : kChainNotProven;
 	}
 	if (legacy != 0) {
 		std::printf("%s ordered only by an op on the legacy default stream at seq=%llu, %d stale-event candidates\n", head, legacy, stale);
-		return;
+		return kLegacyOnly;
 	}
 	std::printf("%s NOT ORDERED by any logged record, wait or legacy-stream op; %d stale-event candidates\n", head, stale);
 	int shown = 0;
@@ -874,6 +899,7 @@ void ReuseStep(const char* kind, const int step, const MemEvent& fr, const MemEv
 			std::printf("[tableowner] REUSE   stale: event=%p waited on by stream %p at seq=%llu, re-recorded at seq=%llu on stream=%p past the free\n",
 			  static_cast<void*>(ev), static_cast<void*>(Y), w->second, rec.seq, static_cast<void*>(rec.stream));
 	}
+	return kNotOrdered;
 }
 
 /// Follows the memory that held the bad value from the upload that wrote it through every later
@@ -1085,6 +1111,37 @@ void FreeMarkSummary() {
 	FreeMarkPoll();
 	std::printf("[freemark] checks=%llu (cross-stream %llu) violations=%u\n", st.checks.load(), st.cross.load(),
 	  *static_cast<volatile unsigned int*>(&st.host->count));
+	// Once, at the end: how the log classifies the cross-stream hand-offs that are still in it, so the
+	// violations' classes can be compared with the hand-offs' in general. Nothing of this runs while
+	// the library does.
+	static std::atomic<bool> classified{ false };
+	if (!classified.exchange(true)) {
+		std::vector<std::pair<unsigned long long, unsigned long long>> h;
+		{
+			std::lock_guard<std::mutex> lk(st.mu);
+			h = st.handoffs;
+		}
+		const unsigned long long now = mem_seq.load();
+		const unsigned long long lo	 = now > kMemLogSize ? now - kMemLogSize + 1 : 1;
+		unsigned long long n[5] = {}, gone = 0, far = 0;
+		for (const auto& [f, a] : h) {
+			const MemEvent* fr = f >= lo ? MemLogAt(f) : nullptr;
+			const MemEvent* al = a >= lo ? MemLogAt(a) : nullptr;
+			if (fr == nullptr || al == nullptr || fr->op != 'F' || al->op != 'A') {
+				++gone;
+				continue;
+			}
+			if (a - f > 200000) {
+				++far;
+				continue;
+			}
+			++n[ReuseStep("", 0, *fr, *al, lo, false)];
+		}
+		std::printf("[freemark] cross-stream hand-offs in the log: %llu classified: chain proven %llu, chain NOT proven %llu, legacy-stream only %llu, "
+					"not ordered %llu, same stream %llu (%llu no longer in the log, %llu too far apart)\n",
+		  n[kChainProven] + n[kChainNotProven] + n[kLegacyOnly] + n[kNotOrdered] + n[kSameStream], n[kChainProven], n[kChainNotProven], n[kLegacyOnly],
+		  n[kNotOrdered], n[kSameStream], gone, far);
+	}
 	std::fflush(stdout);
 }
 
