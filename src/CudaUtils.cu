@@ -22,6 +22,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #include "nvtx3/nvtx3.hpp"
 #include <iostream>
@@ -47,6 +48,14 @@ bool ConcurrentOps() {
 		return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
 	}();
 	return enabled;
+}
+
+/// See CudaUtils.cuh.
+void ConfigurePoolForConcurrentOps(const cudaMemPool_t pool) {
+	if (!ConcurrentOps() || pool == nullptr)
+		return;
+	int follow = 0;
+	cudaMemPoolSetAttribute(pool, cudaMemPoolReuseFollowEventDependencies, &follow);
 }
 
 /// See CudaUtils.cuh (ConcurrentOpsDiag). Parsed once; the mask is 0 unless the concurrent mode
@@ -525,6 +534,8 @@ cudaMemPool_t SlotMemPoolFor(const int device, const int slot) {
 	// keeps its reserve across ops instead of returning it to the driver at every free.
 	uint64_t threshold = UINT64_MAX;
 	cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+	// A slot's thread still issues on shared stream handles, so its pool gets the same reuse policy.
+	ConfigurePoolForConcurrentOps(pool);
 
 	pools[i] = pool;
 	return pool;
@@ -587,8 +598,9 @@ bool TableTrace() {
 			// The report MUST be unmissable: an earlier run of this instrument over
 			// 16 reps printed nothing, because the reporter had no caller. A banner at
 			// enable time says the trace is ON (so silence later means zero events, not a dead
-			// instrument), and atexit guarantees the counters print however the process ends,
-			// including the exit(0) the CudaCheckError macros take.
+			// instrument), and atexit prints the counters at a normal exit. A CUDA failure that
+			// nothing catches ends in std::terminate, which skips atexit: the live heartbeat lines
+			// are what is left in that case.
 			printf("[tabletrace] ON: per-op device tables traced (alloc/free/hot-reuse); summary prints at exit\n");
 			fflush(stdout);
 			std::atexit(TableTraceReport);
@@ -3027,14 +3039,33 @@ namespace {
 std::atomic<PoolFailureReporter> pool_failure_reporter{ nullptr };
 } // namespace
 
+CudaError::CudaError(const cudaError_t error, const char* const file, const int line)
+	: std::runtime_error(std::string("Cuda failure ") + file + ":" + std::to_string(line) + ": '" + cudaGetErrorString(error) + "'"),
+	  error_(error), file_(file), line_(line) {
+}
+
+void CudaFailure(const cudaError_t error, const char* const file, const int line, const bool with_backtrace) {
+	if (with_backtrace) {
+		void* frames[10];
+		const int n = backtrace(frames, 10);
+		backtrace_symbols_fd(frames, n, STDERR_FILENO);
+	}
+	CudaError failure(error, file, line);
+	std::printf("%s\n", failure.what());
+	std::fflush(stdout);
+	breakpoint();
+	throw failure;
+}
+
 void SetPoolFailureReporter(const PoolFailureReporter fn) {
 	pool_failure_reporter.store(fn, std::memory_order_relaxed);
 }
 
 void MemPoolFailureReport(const int id_locked, const int bytes, const char* const what) {
-	// Everything here is best effort. The caller is about to exit(0) through CudaCheckError, so a
-	// throw out of this function would replace a diagnosable failure with std::terminate and no
-	// output at all; that is what the catch-all is for.
+	// Everything here is best effort. The caller is about to report the failure through
+	// CudaCheckError, which throws CudaError, so an exception out of this function would replace
+	// that report with a less useful one, or with std::terminate in a destructor; that is what the
+	// catch-all is for.
 	try {
 		std::string out = "\n==== FIDESlib POOL FAILURE ====\n";
 		char buf[256];

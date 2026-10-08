@@ -14,6 +14,7 @@
 #include <iosfwd>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,21 @@ namespace FIDESlib {
 /// uncontended lock per fence, per auxiliary-polynomial checkout and per first-touch device load,
 /// plus one thread_local read per scratch accessor.
 bool ConcurrentOps();
+
+/// @brief In the concurrent mode, turn off `pool`'s reuse of a block freed on one stream for an
+/// allocation on another stream on the strength of event dependencies alone
+/// (cudaMemPoolReuseFollowEventDependencies). Does nothing in the default mode.
+///
+/// In the concurrent mode several threads share stream handles. When one thread makes a shared
+/// stream wait on an event recorded after a free while another thread, at the same moment, records
+/// an event on that same stream and makes its own stream wait on it, the driver's pool can take the
+/// second thread's stream as ordered after the free while the device runs it without that order:
+/// the block's new owner then writes it while the previous owner's kernels still read it (a per-op
+/// table read as polynomial data, an illegal address). A program with no FIDESlib code reproduces
+/// it with the pool's default settings, and never with this policy off. The pool keeps its other
+/// two ways to reuse across streams, a dependency it inserts itself and a free that has already
+/// completed, which do not depend on the order of two threads' calls.
+void ConfigurePoolForConcurrentOps(cudaMemPool_t pool);
 
 /// @brief DIAGNOSTIC (FIDESLIB_CONCURRENT_OPS_DIAG; concurrent mode only): a comma list of
 /// primitives to serialize PROCESS-WIDE behind one recursive lock -- `fence` (Stream::wait /
@@ -269,8 +285,10 @@ void* OpTableBuffer(int device, size_t bytes, int which);
 ///
 /// WHAT IT DISCRIMINATES. `cudaMallocAsync` / `cudaFreeAsync` draw from the DEVICE DEFAULT memory
 /// pool -- one object shared by every stream and every host thread, whose three reuse policies
-/// (same-stream fast path, `ReuseAllowOpportunistic`, `ReuseFollowEventDependencies`) this fork
-/// never changes, so all three are on. The same-stream fast path is sound because the driver takes
+/// (same-stream fast path, `ReuseAllowOpportunistic`, `ReuseFollowEventDependencies`) are all on
+/// in the default mode. (The concurrent mode now turns `ReuseFollowEventDependencies` off: that
+/// policy was the cross-lane hand-off this option was built to find; see
+/// ConfigurePoolForConcurrentOps.) The same-stream fast path is sound because the driver takes
 /// program order on one stream to BE dependency order; under FIDESLIB_CONCURRENT_OPS that premise
 /// is false at exactly one point -- two lane threads issue allocs, frees and copies to the SAME
 /// pooled `cudaStream_t` handle (Stream::init hands out stream_pool[dev][idx++ % POOL_SIZE]). A
@@ -679,48 +697,54 @@ void CudaHostSync();
 inline void breakpoint() {
 }
 
-// TODO: Remove the cudart unloading.
-#define CudaCheckErrorMod                                                                    \
-	do {                                                                                     \
-		cudaDeviceSynchronize();                                                             \
-		cudaError_t e = cudaGetLastError();                                                  \
-		if (e == cudaErrorCudartUnloading) {                                                 \
-			exit(0);                                                                         \
-		} else if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {             \
-                                                                                             \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-			FIDESlib::breakpoint();                                                          \
-			exit(0);                                                                         \
-		}                                                                                    \
+/// @brief What the CUDA error checks below throw.
+///
+/// A sticky error such as an illegal memory access leaves the CUDA context unusable for the rest
+/// of the process: the exception reports the failure to the caller, it does not make the process
+/// recoverable. Where it cannot propagate (a destructor, a thread's entry function, an OpenMP
+/// region) it ends the process through std::terminate, with a failing status and the message.
+class CudaError : public std::runtime_error {
+  public:
+	CudaError(cudaError_t error, const char* file, int line);
+	cudaError_t error() const noexcept { return error_; }
+	const char* file() const noexcept { return file_; }
+	int line() const noexcept { return line_; }
+
+  private:
+	cudaError_t error_;
+	const char* file_;
+	int line_;
+};
+
+/// @brief Report a CUDA failure the way the checks always have ("Cuda failure <file>:<line>:
+/// '<error>'" on stdout, and a backtrace on stderr when asked), then throw CudaError.
+[[noreturn]] void CudaFailure(cudaError_t error, const char* file, int line, bool with_backtrace);
+
+// The checks below throw CudaError on a failure and never end the process themselves.
+// cudaErrorCudartUnloading means the CUDA runtime is being torn down at process exit, so there is
+// nothing to report and nothing left to do: it is ignored.
+#define CudaCheckErrorMod                                                                               \
+	do {                                                                                                \
+		cudaDeviceSynchronize();                                                                        \
+		cudaError_t e = cudaGetLastError();                                                             \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled) \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, false);                                        \
 	} while (0)
 
-#define CudaCheckErrorModMGPU                                                                \
-	do {                                                                                     \
-		cudaStreamSynchronize(0);                                                            \
-		cudaError_t e = cudaGetLastError();                                                  \
-		if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {                    \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-			FIDESlib::breakpoint();                                                          \
-			exit(0);                                                                         \
-		}                                                                                    \
+#define CudaCheckErrorModMGPU                                                                           \
+	do {                                                                                                \
+		cudaStreamSynchronize(0);                                                                       \
+		cudaError_t e = cudaGetLastError();                                                             \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled) \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, false);                                        \
 	} while (0)
 
-// TODO: FIX THE CUDARTUNLOADING ERROR, IT HAPPENS WHEN THE LIBRARY IS BEING UNLOADED, CAN BE IGNORED FOR NOW
-#define CudaCheckErrorModNoSync                                                                                          \
-	do {                                                                                                                 \
-		/*cudaDeviceSynchronize();*/                                                                                     \
-		cudaError_t e = cudaGetLastError();                                                                              \
-		if (e == cudaErrorCudartUnloading) {                                                                             \
-			exit(0);                                                                                                     \
-		} else if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled && e != cudaErrorGraphExecUpdateFailure) { \
-			void* array[10];                                                                                             \
-			size_t size;                                                                                                 \
-			size = backtrace(array, 10);                                                                                 \
-			backtrace_symbols_fd(array, size, STDERR_FILENO);                                                            \
-			printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));                             \
-			FIDESlib::breakpoint();                                                                                      \
-			exit(0);                                                                                                     \
-		}                                                                                                                \
+#define CudaCheckErrorModNoSync                                                                                    \
+	do {                                                                                                           \
+		cudaError_t e = cudaGetLastError();                                                                        \
+		if (e != cudaSuccess && e != cudaErrorCudartUnloading && e != cudaErrorPeerAccessAlreadyEnabled &&         \
+			e != cudaErrorGraphExecUpdateFailure)                                                                  \
+			FIDESlib::CudaFailure(e, __FILE__, __LINE__, true);                                                    \
 	} while (0)
 
 #define NCCLCHECK(cmd)                                                                              \

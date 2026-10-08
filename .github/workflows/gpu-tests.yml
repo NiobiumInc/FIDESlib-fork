@@ -226,6 +226,24 @@ jobs:
             --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
             --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
 
+      # The lane tests again, together in ONE process, three times over, with no retry. A race
+      # between the threads of the concurrent mode shows only there: in the pass above every test
+      # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
+      # allocator's cross-stream reuse on event dependencies broke exactly that way (see
+      # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
+      # StagedLanesMatchSerial is the family that showed it most often.
+      # A crash here hides the tests after it in this pass, but the pass above runs each of them.
+      - name: Test concurrent operations in one process
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_CONCURRENT_OPS: '1'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
+            --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
+            --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
