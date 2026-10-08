@@ -231,6 +231,7 @@ jobs:
       # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
       # allocator's cross-stream reuse on event dependencies broke exactly that way (see
       # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
+      # StagedLanesMatchSerial is the family that showed it most often.
       # A crash here hides the tests after it in this pass, but the pass above runs each of them.
       - name: Test concurrent operations in one process
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -240,7 +241,7 @@ jobs:
           FIDESLIB_CONCURRENT_OPS: '1'
         run: |
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
+            --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
             --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
 
       - name: Upload test reports
