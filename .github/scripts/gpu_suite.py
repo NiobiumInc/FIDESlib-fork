@@ -23,6 +23,12 @@ nothing catches it ends the process. Isolated, the test that hit it fails alone,
 and a test that ends without writing its report counts as a failure, never as a
 pass.
 
+With --repeat N, the gate runs its tests N times over in one process
+(--gtest_repeat), and a test that fails in any repetition fails. gtest's XML
+report keeps only the last repetition, so the failures of the earlier ones are
+read from the log. --retries sets the extra attempts (default RETRIES); 0 makes
+a failure final, for a pass whose failures a retry in a fresh process would hide.
+
 The suite prints too much for a step log, so each pass writes its full output
 to <out>/<pass>.log and the step log keeps only gtest's progress lines. The
 report is Markdown, appended to $GITHUB_STEP_SUMMARY when that is set and
@@ -94,18 +100,27 @@ def parse(report):
     return results
 
 
-def run(binary, gtest_filter, report):
+# gtest's line for a test that failed, with or without a ", where GetParam() = ..." part.
+FAILED_LINE = re.compile(r"^\[  FAILED  \] ([^\s,]+)(?:, where .*)? \(\d+ ms\)$")
+
+
+def run(binary, gtest_filter, report, repeat=1):
     """Runs the suite. Returns (exit status, results), results None on no report.
 
     The full output goes to the report's .log twin; only gtest's own lines,
-    which start with '[', reach stdout.
+    which start with '[', reach stdout. With repeat > 1 the tests run that many
+    times over in this one process, and a test that failed in any repetition is
+    failed in the results.
     """
     if os.path.exists(report):
         os.remove(report)
     cmd = [binary, f"--gtest_filter={gtest_filter}", f"--gtest_output=xml:{report}"]
+    if repeat > 1:
+        cmd.append(f"--gtest_repeat={repeat}")
     log_path = os.path.splitext(report)[0] + ".log"
     print("$ " + " ".join(cmd), flush=True)
     print(f"Full output: {os.path.basename(log_path)} in the test reports artifact", flush=True)
+    failed_in_log = set()
     with open(log_path, "w") as log:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace")
@@ -114,10 +129,19 @@ def run(binary, gtest_filter, report):
             if line.startswith("["):
                 sys.stdout.write(line)
                 sys.stdout.flush()
+                match = FAILED_LINE.match(line.rstrip("\n"))
+                if match:
+                    failed_in_log.add(match.group(1))
         status = proc.wait()
     if not os.path.isfile(report) or os.path.getsize(report) == 0:
         return status, None
-    return status, parse(report)
+    results = parse(report)
+    if repeat > 1:
+        # The report holds the last repetition only.
+        for name in failed_in_log:
+            if results.get(name, ("", ""))[0] != "failed":
+                results[name] = ("failed", f"failed in one of {repeat} repetitions; see the log")
+    return status, results
 
 
 def list_tests(binary, gtest_filter):
@@ -193,19 +217,27 @@ def main():
                         help="heading of this pass's section in the job summary")
     parser.add_argument("--isolate", action="store_true",
                         help="run every test in a process of its own")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="run the gate tests this many times over in one process")
+    parser.add_argument("--retries", type=int, default=RETRIES,
+                        help=f"extra attempts for a gate test that fails (default {RETRIES})")
     args = parser.parse_args()
+    if args.repeat < 1 or args.retries < 0:
+        parser.error("--repeat must be at least 1 and --retries at least 0")
+    if args.repeat > 1 and args.isolate:
+        parser.error("--repeat runs the tests together in one process; it cannot go with --isolate")
 
     os.makedirs(args.out, exist_ok=True)
     benchmarks, known, flaky = (read_patterns(os.path.join(args.lists, name)) for name in LISTS)
 
-    # 1. Gate, with up to RETRIES more attempts for whatever fails.
+    # 1. Gate, with up to args.retries more attempts for whatever fails.
     excluded = benchmarks + known + flaky
     gate_filter = args.only + ("-" + ":".join(excluded) if excluded else "")
     if args.isolate:
         gate_status, gate = run_isolated(args.binary, list_tests(args.binary, gate_filter),
                                          os.path.join(args.out, "gate"))
     else:
-        gate_status, gate = run(args.binary, gate_filter, os.path.join(args.out, "gate.xml"))
+        gate_status, gate = run(args.binary, gate_filter, os.path.join(args.out, "gate.xml"), args.repeat)
     exit_status = 0
     failed = []        # gate tests that failed their first attempt
     pending = []       # gate tests that have failed every attempt so far
@@ -219,10 +251,10 @@ def main():
         failed = [name for name, (status, _) in gate.items() if status == "failed"]
         last_message = {name: gate[name][1] for name in failed}
         pending = list(failed)
-        for attempt in range(1, RETRIES + 1):
+        for attempt in range(1, args.retries + 1):
             if not pending:
                 break
-            print(f"Retry {attempt} of {RETRIES}: " + " ".join(pending), flush=True)
+            print(f"Retry {attempt} of {args.retries}: " + " ".join(pending), flush=True)
             if args.isolate:
                 status, results = run_isolated(args.binary, pending,
                                                os.path.join(args.out, f"gate-retry{attempt}"))
@@ -250,7 +282,7 @@ def main():
     for name in recovered:
         print(f"::warning::Passed on retry, possibly flaky: {name}")
     if pending:
-        print(f"::error::Failed all {RETRIES + 1} attempts: " + " ".join(pending))
+        print(f"::error::Failed all {args.retries + 1} attempt(s): " + " ".join(pending))
         exit_status = 1
 
     # 2 and 3. Report-only passes.
@@ -260,13 +292,15 @@ def main():
 
     lines = [f"## {args.title}", ""]
     if exit_status == 0:
-        lines.append(f"**Check: passed.** No test outside the lists failed all {RETRIES + 1} attempts.")
+        lines.append(f"**Check: passed.** No test outside the lists failed all {args.retries + 1} attempt(s).")
     elif pending:
-        lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {RETRIES + 1} attempts.")
+        lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {args.retries + 1} attempt(s).")
     else:
         lines.append("**Check: failed.** The suite did not finish; see the job log.")
     if args.isolate:
         lines += ["", "Each test ran in a process of its own."]
+    if args.repeat > 1:
+        lines += ["", f"The tests ran {args.repeat} times over in one process; a failure in any repetition counts."]
     lines += ["", "| Pass | Tests | Passed | Failed | Skipped | Disabled |", "|---|---:|---:|---:|---:|---:|"]
     lines.append(count_row("Check", gate, gate_status))
     for label, results, status in retry_rows:
