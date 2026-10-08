@@ -2252,6 +2252,35 @@ TEST_P(ConcurrentOpsTest, ChainDecodesPerStep) {
 	ClearCachedContexts();
 }
 
+/// The concurrent mode turns off the device default pool's reuse across streams on event
+/// dependencies (ConfigurePoolForConcurrentOps, CudaUtils.cuh): with several threads on shared
+/// stream handles the driver can take that dependency as there when the device does not order it.
+/// The default mode leaves the pool as it found it.
+TEST_P(ConcurrentOpsTest, PoolsDoNotReuseOnEventDependencies) {
+	CKKS::DeregisterAllContexts();
+	ClearCachedContexts();
+	std::vector<int> before;
+	for (int dev : devices) {
+		cudaMemPool_t pool = nullptr;
+		ASSERT_EQ(cudaDeviceGetDefaultMemPool(&pool, dev), cudaSuccess);
+		int follow = -1;
+		ASSERT_EQ(cudaMemPoolGetAttribute(pool, cudaMemPoolReuseFollowEventDependencies, &follow), cudaSuccess);
+		before.push_back(follow);
+	}
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc, UNIFORM);
+	FIDESlib::CKKS::Context GPUcc_		= CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	for (size_t i = 0; i < devices.size(); ++i) {
+		cudaMemPool_t pool = nullptr;
+		ASSERT_EQ(cudaDeviceGetDefaultMemPool(&pool, devices[i]), cudaSuccess);
+		int follow = -1;
+		ASSERT_EQ(cudaMemPoolGetAttribute(pool, cudaMemPoolReuseFollowEventDependencies, &follow), cudaSuccess);
+		if (FIDESlib::ConcurrentOps())
+			EXPECT_EQ(follow, 0) << "device " << devices[i] << ": the concurrent mode must not let the pool reuse on event dependencies";
+		else
+			EXPECT_EQ(follow, before[i]) << "device " << devices[i] << ": the default mode must leave the pool as it was";
+	}
+}
+
 INSTANTIATE_TEST_SUITE_P(ConcurrencyTests, ConcurrentOpsTest, testing::Values(TTALL64BOOT));
 
 } // namespace FIDESlib::Testing
