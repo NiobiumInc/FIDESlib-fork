@@ -1111,11 +1111,10 @@ class CKKSBootstrapTest : public ::testing::Test {
 	static constexpr uint32_t kBatchSize = 8; // gparams64_13_*.batchSize
 	static constexpr uint32_t kSlots	= 1u << 5; // OpenFHEBootstrap's `int slots = 1 << 5`
 	static constexpr uint32_t kLevelBudget = 2; // EvalBootstrapSetup({2,2})
-	// Deepest level EvalBootstrap accepts: L0 - (levelBudget_decode + 2), from the guard at
-	// ckksrns-fhe.cpp:1252-1256 (FIXEDAUTO, so no extra FLEXIBLEAUTOEXT tower). The CUDA test
-	// depletes to L-1, which it can only do because it bootstraps on the GPU and never calls the
-	// host EvalBootstrap that owns this guard; these tests do, so they deplete to the guard's limit
-	// instead — as depleted as the host path legally allows. Encrypting AT this level is what makes
+	// Deepest level the StC-first variant accepts: L0 - (levelBudget_decode + 2), from the guard in
+	// ckksrns-fhe.cpp's EvalBootstrapStCFirst (FIXEDAUTO, so no extra FLEXIBLEAUTOEXT tower). The
+	// default ModRaise-first variant these tests run has no such guard, but depleting to this
+	// level keeps the fixture valid under either. Encrypting AT this level is what makes
 	// bootstrap real: a full-level input gains no levels and returns unchanged (a false pass).
 	static constexpr uint32_t kMaxBootLevel = kDepth - (kLevelBudget + 2);
 
@@ -1166,8 +1165,7 @@ TEST_F(CKKSBootstrapTest, Bootstrap) {
 	// Encrypt DEPLETED so EvalBootstrap runs the real pipeline. A full-level input gains no levels,
 	// so bootstrap returns a clone of the input unchanged (HazeBootstrap.cpp:1237, mirroring OpenFHE
 	// ckksrns-fhe.cpp:835) — which still decrypts to v1 and passes: a false pass. kMaxBootLevel is
-	// the deepest level bootstrap accepts (ckksrns-fhe.cpp:1252-1256), so this is as depleted as the
-	// input can legally be; going further throws "Not enough levels to perform Bootstrapping".
+	// deep enough for the refresh to gain levels under either bootstrap variant (see the fixture).
 	auto pt		   = cc->MakeCKKSPackedPlaintext(v1, 1, kMaxBootLevel, nullptr, kSlots);
 	auto ct		   = cc->Encrypt(pt, keys.publicKey);
 	const size_t levelBefore = ct->GetLevel();
@@ -2698,13 +2696,11 @@ TEST(SparseSecretModEval, SparseKeyFreesFourLevelsEndToEnd) {
 	// Pin the absolute depths too, not just their difference -  asserting only the delta would still
 	// pass if both arms drifted together. A bootstrap reserves CtS + EvalMod + StC; the executed
 	// chain lands under that reservation by a backend-dependent amount, measured here rather than
-	// derived. The device backends come in 1 level under (uniform 19, sparse 15 at kBudget=3); the
-	// CPU backend comes in 4 under (16 and 12) because OpenFheEngine::bootstrapSetupPolicy routes
-	// modEvalLevels into OpenFHE's BTSlotsEncoding slot and passes -1 for modevallevels, so
-	// ckksrns-fhe.cpp takes the branch that derives lDec from the budget alone and ignores the
-	// approximation depth entirely. That divergence is pre-existing and flagged in place; it changes
-	// the offset on both arms equally, which is why the delta above is the real assertion.
-	const size_t budgetSlack = (RequestedBackend() == Backend::CPU) ? 4 : 1;
+	// derived. Every backend runs the same ModRaise-first circuit and comes in 1 level under
+	// (uniform 19, sparse 15 at kBudget=3). The CPU backend used to come in 4 under (16 and 12)
+	// because its setup selected the StC-first variant; one slack for all backends is what keeps
+	// that divergence from coming back unnoticed.
+	const size_t budgetSlack = 1;
 	EXPECT_EQ(uniformLevel, bootstrapModEvalLevels(UNIFORM_TERNARY) + 2 * kBudget - budgetSlack) << "uniform bootstrap consumed an unexpected depth; got " << uniformLevel;
 	EXPECT_EQ(sparseLevel, bootstrapModEvalLevels(SPARSE_TERNARY) + 2 * kBudget - budgetSlack) << "sparse bootstrap consumed an unexpected depth; got " << sparseLevel;
 

@@ -456,14 +456,14 @@ void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphe
 	return;
 }
 
-BootstrapSetupPolicy OpenFheEngine::bootstrapSetupPolicy(bool /*precompute*/, bool /*btsfirstboot*/, int32_t modEvalLevels) const {
-	// Behaviour preserved verbatim from the previous CPU evalBootstrapSetup, which called the 6-arg
-	// EvalBootstrapSetup(levelBudget, dim1, slots, correctionFactor, /*precompute=*/true, modall).
-	// NOTE (pre-existing, flagged — not a behavior change in this refactor): in OpenFHE's single
-	// signature (..., precompute, BTSlotsEncoding, modevallevels=-1), that 6th `modall` argument lands
-	// in BTSlotsEncoding, NOT modevallevels — so the CPU "configure mod-eval levels" intent is not
-	// actually in effect (modevallevels stays -1). Reproduced exactly here; needs a separate decision.
-	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/modEvalLevels != 0, /*modEvalLevels=*/-1 };
+BootstrapSetupPolicy OpenFheEngine::bootstrapSetupPolicy(bool /*precompute*/, bool btsfirstboot, int32_t /*modEvalLevels*/) const {
+	// BTSlotsEncoding selects OpenFHE's bootstrap variant: false is the ModRaise-first circuit the
+	// CUDA and haze engines run, true is StC-first. It follows the caller's btsfirstboot, so the
+	// default setup refreshes to the same level on every backend. (This policy used to pass the
+	// mod-eval level count in that position, which is never 0, so the CPU engine always ran
+	// StC-first and landed levels away from the device backends.) modevallevels stays at OpenFHE's
+	// -1 default and the host precomputation is always built.
+	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/btsfirstboot, /*modEvalLevels=*/-1 };
 }
 
 void OpenFheEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
