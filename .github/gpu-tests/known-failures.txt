@@ -39,6 +39,3 @@ OpenFHEBootstrapTests/OpenFHEBootstrapTest.SharedViewMatchesReducedSetDense/*
 # security level, and OpenFHE's default 128-bit level rejects it in SetUp
 # ("does not comply with HE standards recommendation").
 DeviceEncodeTest.*
-# The reduced-level refresh returns its input at the same level (19 and 19),
-# on the CUDA engine and on haze alike.
-BootstrapToLevelTest.ReducedLevelMatchesBootstrapThenDrop

@@ -58,17 +58,21 @@ class BootstrapToLevelTest : public ::testing::Test {
 	static constexpr uint32_t kBatchSize   = 8;
 	static constexpr uint32_t kSlots	   = 1u << 5;
 	static constexpr uint32_t kLevelBudget = 2;
-	// Deepest level the host EvalBootstrap accepts (ckksrns-fhe.cpp's own guard):
-	// L0 - (levelBudget_decode + 2). Encrypting AT it is what makes the refresh real — a
-	// full-level input gains no levels and comes back unchanged, which would pass every
-	// assertion below while exercising nothing.
-	static constexpr uint32_t kMaxBootLevel = kDepth - (kLevelBudget + 2);
+	// The input level. The refresh lands at the same level whatever the input's, so the input
+	// must sit deeper than that level plus the two levels the reduced-level requests below give
+	// back: a request for the input's own level is met by returning the input unchanged, which
+	// passes every value assertion while refreshing nothing. Two towers above the floor keeps
+	// the ModRaise-first circuit's adjust-then-raise prologue inside the chain.
+	static constexpr uint32_t kInputLevel = kDepth - 2;
 
 	CryptoContext<DCRTPoly> cc;
 	KeyPair<DCRTPoly> keys;
 	const std::vector<double> v1 = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
 
-	void SetUp() override {
+	void SetUp() override { MakeContext(GetTestBackend(), cc, keys); }
+
+	// A context on `backend` with this suite's parameters, keys and bootstrap precomputation.
+	static void MakeContext(TestBackend backend, CryptoContext<DCRTPoly>& ctx, KeyPair<DCRTPoly>& kp) {
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(kDepth);
 		params.SetScalingModSize(kScaleMod);
@@ -81,29 +85,30 @@ class BootstrapToLevelTest : public ::testing::Test {
 		params.SetSecretKeyDist(UNIFORM_TERNARY);
 		params.SetSecurityLevel(HEStd_NotSet);
 		params.SetReducedNoise(LinkedOpenFheReducedNoise()); // matches the oracle's variant
-		if (GetTestBackend() == TestBackend::CUDA)
+		if (backend == TestBackend::CUDA)
 			params.SetBackend(Backend::CUDA);
-		else if (GetTestBackend() == TestBackend::HAZE)
+		else if (backend == TestBackend::HAZE)
 			params.SetBackend(Backend::HAZE);
 
-		cc = GenCryptoContext(params);
-		cc->Enable(PKE);
-		cc->Enable(KEYSWITCH);
-		cc->Enable(LEVELEDSHE);
-		cc->Enable(ADVANCEDSHE);
-		cc->Enable(FHE);
-		keys = cc->KeyGen();
-		cc->EvalMultKeyGen(keys.secretKey);
-		cc->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0);
-		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
-		if (GetTestBackend() != TestBackend::CPU)
-			cc->LoadContext(keys.publicKey);
+		ctx = GenCryptoContext(params);
+		ctx->Enable(PKE);
+		ctx->Enable(KEYSWITCH);
+		ctx->Enable(LEVELEDSHE);
+		ctx->Enable(ADVANCEDSHE);
+		ctx->Enable(FHE);
+		kp = ctx->KeyGen();
+		ctx->EvalMultKeyGen(kp.secretKey);
+		ctx->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0);
+		ctx->EvalBootstrapKeyGen(kp.secretKey, kSlots);
+		if (backend != TestBackend::CPU)
+			ctx->LoadContext(kp.publicKey);
 	}
 
-	Ciphertext<DCRTPoly> DepletedInput() {
-		auto pt = cc->MakeCKKSPackedPlaintext(v1, 1, kMaxBootLevel, nullptr, kSlots);
-		return cc->Encrypt(pt, keys.publicKey);
+	Ciphertext<DCRTPoly> DepletedInput(CryptoContext<DCRTPoly>& ctx, const KeyPair<DCRTPoly>& kp) {
+		auto pt = ctx->MakeCKKSPackedPlaintext(v1, 1, kInputLevel, nullptr, kSlots);
+		return ctx->Encrypt(pt, kp.publicKey);
 	}
+	Ciphertext<DCRTPoly> DepletedInput() { return DepletedInput(cc, keys); }
 
 	// The level an ordinary refresh lands on, MEASURED — the floor every request below is
 	// stated against. Measured rather than derived so the assertions hold whatever the
@@ -139,6 +144,8 @@ TEST_F(BootstrapToLevelTest, ReducedLevelMatchesBootstrapThenDrop) {
 
 	auto ct = DepletedInput();
 	const size_t levelBefore = ct->GetLevel();
+	ASSERT_LT(target, levelBefore) << "the input is too shallow: a request for level " << target << " on an input at level " << levelBefore
+								   << " can be met by returning the input unchanged, so this test would exercise nothing";
 
 	auto reduced = cc->EvalBootstrapToLevel(ct, target);
 	ASSERT_LT(reduced->GetLevel(), levelBefore) << "the refresh gained no levels: it returned the input unchanged, so this test exercised nothing";
@@ -148,6 +155,10 @@ TEST_F(BootstrapToLevelTest, ReducedLevelMatchesBootstrapThenDrop) {
 	ASSERT_NO_FATAL_FAILURE(DropTo(full, target));
 	EXPECT_EQ(static_cast<uint32_t>(full->GetLevel()), target);
 
+	// Both results are read back. haze runs the recorded program at the first Decrypt and keeps
+	// only the values declared as outputs by then; MarkOutput is a no-op on the other backends.
+	cc->MarkOutput(reduced);
+	cc->MarkOutput(full);
 	const auto a = DecryptReal(cc, reduced, keys.secretKey, v1.size());
 	const auto b = DecryptReal(cc, full, keys.secretKey, v1.size());
 	for (size_t i = 0; i < v1.size(); ++i) {
@@ -188,11 +199,33 @@ TEST_F(BootstrapToLevelTest, InPlaceMatchesTheValueForm) {
 	cc->EvalBootstrapToLevelInPlace(inplace, target);
 	EXPECT_EQ(static_cast<uint32_t>(inplace->GetLevel()), target);
 
+	cc->MarkOutput(value); // both are read back; see ReducedLevelMatchesBootstrapThenDrop
+	cc->MarkOutput(inplace);
 	const auto a = DecryptReal(cc, value, keys.secretKey, v1.size());
 	const auto b = DecryptReal(cc, inplace, keys.secretKey, v1.size());
 	for (size_t i = 0; i < v1.size(); ++i)
 		EXPECT_NEAR(a[i], b[i], kBootstrapPrecision) << "slot " << i;
 }
 
+// The same setup refreshes to the same level on every backend. The CPU engine is the reference:
+// a backend that ran a different bootstrap variant (StC-first instead of ModRaise-first) or spent
+// a level the reference does not hands the caller a different level budget for the same program,
+// and every values-only test still passes.
+TEST_F(BootstrapToLevelTest, RefreshLandsOnTheCpuEngineLevel) {
+	if (GetTestBackend() == TestBackend::CPU)
+		GTEST_SKIP() << "compares a device backend against the CPU engine";
+	// The device refresh goes first: building a second context clears OpenFHE's process-global
+	// eval-key maps, which haze reads while it records the bootstrap.
+	const uint32_t deviceOut = MeasuredOutputLevel();
+
+	CryptoContext<DCRTPoly> cpu;
+	KeyPair<DCRTPoly> cpuKeys;
+	MakeContext(TestBackend::CPU, cpu, cpuKeys);
+	auto cpuIn		  = DepletedInput(cpu, cpuKeys);
+	const auto cpuOut = cpu->EvalBootstrap(cpuIn);
+	ASSERT_LT(cpuOut->GetLevel(), cpuIn->GetLevel()) << "the CPU refresh gained no levels";
+
+	EXPECT_EQ(deviceOut, static_cast<uint32_t>(cpuOut->GetLevel()));
+}
 
 } // namespace
