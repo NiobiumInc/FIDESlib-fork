@@ -168,12 +168,15 @@ HAZE_LIB=$(find "$HAZE_BUILD" -maxdepth 1 -name 'libhaze.*' -type f | head -1)
 
 if [ "${TEST_BUILD:-0}" = 1 ]; then
     echo "==> test build"
+    # The test executable links the static OpenFHE directly, so it needs the same -ldl as
+    # libhaze on glibc < 2.34 (appended after the objects: CMAKE_CXX_STANDARD_LIBRARIES).
     cmake -S "$REPO" -B "$BUILD_ROOT/fideslib-test" -DCMAKE_BUILD_TYPE=Release \
           -DFIDESLIB_ENABLE_CUDA=OFF -DFIDESLIB_ENABLE_HAZE=ON \
           -DFIDESLIB_COMPILE_TESTS=ON -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
           -DFIDESLIB_HAZE_DIR="$HAZE_SRC" -DFIDESLIB_HAZE_LIB="$HAZE_LIB" \
           -DFIDESLIB_INSTALL_OPENFHE=OFF -DOPENFHE_INSTALL_PREFIX="$OFHE_INS" \
-          -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null
+          -DCMAKE_CXX_FLAGS="$PREFIX_MAP" \
+          -DCMAKE_CXX_STANDARD_LIBRARIES="$HAZE_LINKER_FLAGS" >/dev/null
     cmake --build "$BUILD_ROOT/fideslib-test" -j"$JOBS" --target fideslib-cpu-test
     echo "==> test binary: $BUILD_ROOT/fideslib-test/fideslib-cpu-test"
     exit 0
