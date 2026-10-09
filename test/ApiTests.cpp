@@ -5,6 +5,7 @@
 // CPU-only build:  cmake -B build-cpu -DFIDESLIB_ENABLE_CUDA=OFF && cmake --build build-cpu --target fideslib-cpu-test
 // Run:    ./build-cpu/fideslib-cpu-test [--gtest_filter=-*Bootstrap*]
 
+#include <tuple>
 #include <algorithm>
 #include <any>
 #include <cmath>
@@ -431,33 +432,45 @@ static void ExpectCiphertextBitEqual(CryptoContext<DCRTPoly>& cc, Ciphertext<DCR
 	}
 }
 
-TEST_F(CKKSTest, EvalRotateManyMatchesEvalRotate) {
-	// The head ladder's +-2^i, which is the index set the score path actually walks, over the batch
-	// widths that bracket a page's live-body count: 1 (degenerate), 2, 7 (not a power of two, and
-	// not a divisor of the engine's batch cap), 32 (a full page of diagonals).
-	const std::vector<int32_t> indices = { 1, 2, 4, 8, -1, -2, -4, -8 };
-	for (uint32_t B : { 1u, 2u, 7u, 32u }) {
-		// Distinct contents per entry: a batch that silently rotated one input B times, or emitted
-		// its outputs in the wrong order, would pass with identical inputs.
-		std::vector<Ciphertext<DCRTPoly>> cts;
-		cts.reserve(B);
-		for (uint32_t b = 0; b < B; ++b) {
-			std::vector<double> v(kSlots);
-			for (uint32_t i = 0; i < kSlots; ++i)
-				v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
-			auto pt = cc->MakeCKKSPackedPlaintext(v);
-			cts.push_back(cc->Encrypt(pt, keys.publicKey));
-		}
-		for (int32_t idx : indices) {
-			auto many = cc->EvalRotateMany(cts, idx);
-			ASSERT_EQ(many.size(), cts.size()) << "B=" << B << " index=" << idx;
-			for (uint32_t b = 0; b < B; ++b) {
-				auto one = cc->EvalRotate(cts[b], idx);
-				ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[b], one, "B=" + std::to_string(B) + " index=" + std::to_string(idx) + " entry=" + std::to_string(b)));
-			}
-		}
+// One case per (batch width, index) on a fresh context: the haze backend records one program per
+// context and rejects compute after the first readback. Within a case, every result is declared an
+// output before any readback.
+class CKKSRotateManyTest : public CKKSTest, public ::testing::WithParamInterface<std::tuple<uint32_t, int32_t>> {};
+
+TEST_P(CKKSRotateManyTest, MatchesEvalRotate) {
+	const auto [B, idx] = GetParam();
+	// Distinct contents per entry: a batch that silently rotated one input B times, or emitted
+	// its outputs in the wrong order, would pass with identical inputs.
+	std::vector<Ciphertext<DCRTPoly>> cts;
+	cts.reserve(B);
+	for (uint32_t b = 0; b < B; ++b) {
+		std::vector<double> v(kSlots);
+		for (uint32_t i = 0; i < kSlots; ++i)
+			v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
+		auto pt = cc->MakeCKKSPackedPlaintext(v);
+		cts.push_back(cc->Encrypt(pt, keys.publicKey));
 	}
+	auto many = cc->EvalRotateMany(cts, idx);
+	ASSERT_EQ(many.size(), cts.size());
+	std::vector<Ciphertext<DCRTPoly>> serial;
+	for (uint32_t b = 0; b < B; ++b) {
+		cc->MarkOutput(many[b]);
+		serial.push_back(cc->EvalRotate(cts[b], idx));
+		cc->MarkOutput(serial.back());
+	}
+	for (uint32_t b = 0; b < B; ++b)
+		ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[b], serial[b], "entry=" + std::to_string(b)));
 }
+
+// The head ladder's +-2^i, which is the index set the score path actually walks, over the batch
+// widths that bracket a page's live-body count: 1 (degenerate), 2, 7 (not a power of two, and
+// not a divisor of the engine's batch cap), 32 (a full page of diagonals).
+INSTANTIATE_TEST_SUITE_P(BatchWidthsAndIndices, CKKSRotateManyTest,
+	::testing::Combine(::testing::Values(1u, 2u, 7u, 32u), ::testing::Values(1, 2, 4, 8, -1, -2, -4, -8)),
+	[](const ::testing::TestParamInfo<std::tuple<uint32_t, int32_t>>& info) {
+		const int32_t idx = std::get<1>(info.param);
+		return "B" + std::to_string(std::get<0>(info.param)) + (idx < 0 ? "_neg" : "_pos") + std::to_string(std::abs(idx));
+	});
 
 TEST_F(CKKSTest, EvalRotateManyEmptyBatch) {
 	std::vector<Ciphertext<DCRTPoly>> none;
@@ -482,6 +495,9 @@ TEST_F(CKKSTest, EvalRotateManyMixedLevels) {
 	ASSERT_EQ(many.size(), 2u);
 	auto ra = cc->EvalRotate(a, 1);
 	auto rb = cc->EvalRotate(b, 1);
+	// The haze backend needs every value read back below declared before the first readback.
+	for (auto* ct : { &many[0], &many[1], &ra, &rb })
+		cc->MarkOutput(*ct);
 	ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[0], ra, "mixed-levels entry=0"));
 	ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[1], rb, "mixed-levels entry=1"));
 }

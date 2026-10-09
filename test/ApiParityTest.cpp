@@ -15,6 +15,8 @@
 // result is synced back, so intermediate host shadows are stale. The oracle therefore replays the
 // whole chain in OpenFHE from the freshly-encrypted inputs (never from a mid-chain api ciphertext).
 
+#include <tuple>
+#include <cstdlib>
 #include <gtest/gtest.h>
 #include <openfhe.h>
 
@@ -288,48 +290,48 @@ TEST_F(ApiParityTest, EvalRotateSlotsAware) {
 // and approximate is not the contract. What EvalRotateMany promises is that BATCHING changes
 // nothing, which is exactly the serial-vs-batched comparison made here. The decrypted values are
 // still checked against OpenFHE so a batch that was self-consistently wrong cannot pass.
-TEST_F(ApiParityTest, EvalRotateMany) {
-	const std::vector<int32_t> indices = { 1, 2, 4, 8, -1, -2 };
-	for (uint32_t B : { 1u, 2u, 7u, 32u }) {
-		SCOPED_TRACE("batch width " + std::to_string(B));
-		std::vector<Ciphertext<DCRTPoly>> cts;
-		std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> lbs;
-		for (uint32_t b = 0; b < B; ++b) {
-			std::vector<double> v(kSlots);
-			for (uint32_t i = 0; i < kSlots; ++i)
-				v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
-			auto pt = cc->MakeCKKSPackedPlaintext(v);
-			cts.push_back(cc->Encrypt(pt, keys.publicKey));
-			lbs.push_back(LbCt(cts.back()));
-		}
-		// One program per context: every rotation is declared an output before any readback.
-		std::vector<std::vector<Ciphertext<DCRTPoly>>> batched, serial;
-		std::vector<std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>> oracles;
-		for (int32_t idx : indices) {
-			auto many = cc->EvalRotateMany(cts, idx);
-			std::vector<Ciphertext<DCRTPoly>> one;
-			std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> orc;
-			for (uint32_t b = 0; b < B; ++b) {
-				cc->MarkOutput(many[b]);
-				one.push_back(cc->EvalRotate(cts[b], idx));
-				cc->MarkOutput(one.back());
-				orc.push_back(LbCc(cc)->EvalRotate(lbs[b], idx));
-			}
-			batched.push_back(std::move(many));
-			serial.push_back(std::move(one));
-			oracles.push_back(std::move(orc));
-		}
-		for (size_t k = 0; k < indices.size(); ++k) {
-			for (uint32_t b = 0; b < B; ++b) {
-				SCOPED_TRACE("index " + std::to_string(indices[k]) + " entry " + std::to_string(b));
-				auto gb = HostCt(cc, batched[k][b]);
-				auto gs = HostCt(cc, serial[k][b]);
-				ASSERT_EQ_CIPHERTEXT(gb, gs);
-				ExpectSlotsNear(cc, keys.secretKey, gb, oracles[k][b], kSlots, 1e-5);
-			}
-		}
+// One case per (batch width, index), so each runs on a fresh context: the haze backend records one
+// program per context and rejects compute after the first readback, which a loop over cases that
+// reads back inside each iteration would hit. Within a case, both outputs are declared before any
+// readback.
+class ApiParityRotateManyTest : public ApiParityTest, public ::testing::WithParamInterface<std::tuple<uint32_t, int32_t>> {};
+
+TEST_P(ApiParityRotateManyTest, MatchesSerialAndOpenFHE) {
+	const auto [B, idx] = GetParam();
+	std::vector<Ciphertext<DCRTPoly>> cts;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> lbs;
+	for (uint32_t b = 0; b < B; ++b) {
+		std::vector<double> v(kSlots);
+		for (uint32_t i = 0; i < kSlots; ++i)
+			v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
+		auto pt = cc->MakeCKKSPackedPlaintext(v);
+		cts.push_back(cc->Encrypt(pt, keys.publicKey));
+		lbs.push_back(LbCt(cts.back()));
+	}
+	auto batched = cc->EvalRotateMany(cts, idx);
+	std::vector<Ciphertext<DCRTPoly>> serial;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> oracles;
+	for (uint32_t b = 0; b < B; ++b) {
+		cc->MarkOutput(batched[b]);
+		serial.push_back(cc->EvalRotate(cts[b], idx));
+		cc->MarkOutput(serial.back());
+		oracles.push_back(LbCc(cc)->EvalRotate(lbs[b], idx));
+	}
+	for (uint32_t b = 0; b < B; ++b) {
+		SCOPED_TRACE("entry " + std::to_string(b));
+		auto gb = HostCt(cc, batched[b]);
+		auto gs = HostCt(cc, serial[b]);
+		ASSERT_EQ_CIPHERTEXT(gb, gs);
+		ExpectSlotsNear(cc, keys.secretKey, gb, oracles[b], kSlots, 1e-5);
 	}
 }
+
+INSTANTIATE_TEST_SUITE_P(BatchWidthsAndIndices, ApiParityRotateManyTest,
+	::testing::Combine(::testing::Values(1u, 2u, 7u, 32u), ::testing::Values(1, 2, 4, 8, -1, -2)),
+	[](const ::testing::TestParamInfo<std::tuple<uint32_t, int32_t>>& info) {
+		const int32_t idx = std::get<1>(info.param);
+		return "B" + std::to_string(std::get<0>(info.param)) + (idx < 0 ? "_neg" : "_pos") + std::to_string(std::abs(idx));
+	});
 
 // EvalFastRotationPrecompute + the SINGLE-INDEX EvalFastRotation: the hoisting contract the way
 // callers actually use it -- precompute once, then rotate one index at a time, lazily. That shape is
