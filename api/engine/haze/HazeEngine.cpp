@@ -738,17 +738,16 @@ hazebk::ScalarEncodeParams HazeEngine::scalarParams() const {
 LimbChain HazeEngine::evalModDown(const std::vector<const void*>& survivorsEval,
 								  const LimbChain& droppedCoeff,
 								  const std::vector<uint64_t>& rescaleBase,
-								  const std::vector<uint64_t>& targetBase) {
+								  const std::vector<uint64_t>& targetBase,
+								  ModDownLift lift) {
 	// OpenFHE ApproxModDown / the CUDA NTT_RESCALE+NTT_MODDOWN fused path, expressed in
 	// haze's pointwise primitives. The caller has INTT'd ONLY the dropped `rescaleBase`
 	// limbs (coeff, in droppedCoeff); the `targetBase` survivors stay in eval. Steps:
 	//   1. lift  = basis-convert(droppedCoeff -> targetBase)         (coeff)
 	//   2. liftN = NTT(lift)                                         (eval)
 	//   3. z[q]  = (survivorsEval[q] - liftN[q]) * (prod rescaleBase)^{-1} mod q   (eval)
-	// hazeBasisConvert uses the configured FBC variant (== hazeModDown's lift), and the
-	// subtract + scalar-multiply commute with the NTT, so z equals the old
-	// INTT-all -> hazeModDown -> NTT-all result limb-for-limb while INTT'ing only the
-	// dropped limbs.
+	// The lift is centered for a rescale and follows the configured FBC variant for a keyswitch
+	// mod-down; the subtract + scalar-multiply commute with the NTT, so only the dropped limbs are INTT'd.
 	const size_t target = targetBase.size();
 
 	const hazeBasisConvertParams bcParams = {
@@ -758,7 +757,11 @@ LimbChain HazeEngine::evalModDown(const std::vector<const void*>& survivorsEval,
 		/*.dst_base_len =*/target,
 	};
 	LimbChain liftCoeff(target, polyBytes_);
-	hazeCheck(hazeBasisConvert(liftCoeff.data(), droppedCoeff.asConst().data(), &bcParams, nullptr), "hazeBasisConvert");
+	if (lift == ModDownLift::Centered) {
+		hazeCheck(hazeBasisConvertCentered(liftCoeff.data(), droppedCoeff.asConst().data(), &bcParams, nullptr), "hazeBasisConvertCentered");
+	} else {
+		hazeCheck(hazeBasisConvert(liftCoeff.data(), droppedCoeff.asConst().data(), &bcParams, nullptr), "hazeBasisConvert");
+	}
 
 	LimbChain liftEval(target, polyBytes_);
 	hazeCheck(hazeNTTMrp(liftEval.data(), liftCoeff.asConst().data(), targetBase.data(), target, nullptr), "hazeNTTMrp");
@@ -806,7 +809,7 @@ LimbChain HazeEngine::rescaleChainOneTower(const LimbChain& src, size_t srcTower
 		survivorsEval[i] = src[i];
 	}
 
-	return evalModDown(survivorsEval, droppedCoeff, rescaleBase, dstBase);
+	return evalModDown(survivorsEval, droppedCoeff, rescaleBase, dstBase, ModDownLift::Centered);
 }
 
 HazeEngine::Operand HazeEngine::multScalarCore(const Operand& x, double operand) {
@@ -1691,8 +1694,8 @@ HazeEngine::KsContribution HazeEngine::hybridKeyswitchFromDigits(const HoistedDi
 		survA[i] = accumA[i];
 		survB[i] = accumB[i];
 	}
-	LimbChain outA = evalModDown(survA, pCoeffA, pBase_, qSub);
-	LimbChain outB = evalModDown(survB, pCoeffB, pBase_, qSub);
+	LimbChain outA = evalModDown(survA, pCoeffA, pBase_, qSub, ModDownLift::Configured);
+	LimbChain outB = evalModDown(survB, pCoeffB, pBase_, qSub, ModDownLift::Configured);
 
 	return KsContribution{ std::move(outB), std::move(outA) };
 }

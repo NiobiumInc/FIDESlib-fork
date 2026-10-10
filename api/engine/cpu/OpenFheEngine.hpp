@@ -4,14 +4,18 @@
 #include "OpenFheVariant.hpp" // fideslib::LinkedOpenFheReducedNoise
 #include "engine/Engine.hpp"
 
+#include <string_view>
+
 namespace fideslib {
 
 /// @brief CPU backend. Most operations delegate to OpenFHE on the host; a few native ops
 /// (convolution, accumulate) are reimplemented. All CPU operation code lives in OpenFheEngine.cpp.
+/// Construction always succeeds regardless of reducedNoise: the linked OpenFHE fixes its FBC
+/// variant at compile time, but only key-switching operations (ModUp/ModDown via
+/// ApproxSwitchCRTBasis) are sensitive to it. Such a method refuses at call time instead, via
+/// requireLinkedVariant(), when reducedNoise() disagrees with LinkedOpenFheReducedNoise().
 class OpenFheEngine final : public Engine {
   public:
-	/// @brief Throws if reducedNoise disagrees with LinkedOpenFheReducedNoise(): the linked OpenFHE
-	/// has only one variant to run, so a mismatched request cannot be honoured, only refused.
 	explicit OpenFheEngine(bool reducedNoise);
 
 	const char* name() const override {
@@ -126,6 +130,15 @@ class OpenFheEngine final : public Engine {
 	void teardown() override;
 	void setDevices(const std::vector<int>& devices) override;
 	std::vector<int> devices() const override;
+
+  private:
+	/// @brief Throws std::runtime_error naming `op` if reducedNoise() disagrees with
+	/// LinkedOpenFheReducedNoise(). Every method whose OpenFHE call can key-switch (ModUp/ModDown
+	/// via ApproxSwitchCRTBasis) calls this first and refuses unconditionally whenever it COULD
+	/// key-switch, even on an input where the underlying OpenFHE call happens to no-op (e.g. a
+	/// degree-1 Relinearize or a rotation by 0); each call site in OpenFheEngine.cpp names the
+	/// OpenFHE call that key-switches.
+	void requireLinkedVariant(std::string_view op) const;
 };
 
 } // namespace fideslib

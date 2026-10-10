@@ -55,8 +55,8 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	void SetCiphertextAutoload(bool autoload);
 
 	/// @brief Selects the FBC variant: true for OpenFHE's WITH_REDUCED_NOISE centered variant.
-	/// Required (GenCryptoContext refuses unset); cpu refuses a value that differs from the linked
-	/// OpenFHE.
+	/// Required (GenCryptoContext refuses unset); cpu accepts any value here and instead refuses it
+	/// at the first key-switching operation that disagrees with the linked OpenFHE's variant.
 	void SetReducedNoise(bool enable);
 
 	// ---- Getters ----
