@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "TestEngineConfig.hpp" // FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM
 #include "fideslib.hpp"
 
 using namespace fideslib;
@@ -149,6 +150,7 @@ class PreparedLtTest : public ::testing::Test {
 // ---- 1. Equality with the vector overloads ----
 
 TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverload) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// gStep = 2: the backwards Horner fold and its bStep*stride rotation are live, which is the
 	// shape the application's matmul actually runs.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
@@ -178,6 +180,7 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverload) {
 }
 
 TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverloadAcrossShapes) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// Every branch the single transform has: gStep == 1, a short last giant step, and a non-zero
 	// offset. Random diagonals in each, so equality is not an artefact of one matrix.
 	struct Shape {
@@ -206,6 +209,7 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverloadAcrossShapes) {
 }
 
 TEST_F(PreparedLtTest, PreparedManyEqualsVectorMany) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The batched shape the application runs: several independent transforms of ONE source.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
 	std::vector<std::vector<std::vector<double>>> Ms;
@@ -232,6 +236,7 @@ TEST_F(PreparedLtTest, PreparedManyEqualsVectorMany) {
 }
 
 TEST_F(PreparedLtTest, PreparedHandleIsReusableAcrossCalls) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The whole point of the handle: prepare once, call many times. Every call must equal the
 	// vector overload, not just the first — a table that is consumed or invalidated by use would
 	// pass the single-call test and fail here.
@@ -254,6 +259,7 @@ TEST_F(PreparedLtTest, PreparedHandleIsReusableAcrossCalls) {
 }
 
 TEST_F(PreparedLtTest, PreparedHandleKeepsItsDiagonalsAlive) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The handle holds the diagonals BY SHARED HANDLE, so a caller that drops its own vector (the
 	// application's diagonal pool evicting an entry while a prepared transform still references it)
 	// cannot free the buffers the table points at.
@@ -319,6 +325,7 @@ TEST_F(PreparedLtTest, PreparedHandleThrowsOnReleasedDiagonal) {
 }
 
 TEST_F(PreparedLtTest, PreparedHandleAcceptsAnUntouchedDiagonalSet) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The negative control for the two throws above: the identity check must not be so eager that
 	// an ordinary reuse trips it. Encrypting, transforming and decrypting around the handle leaves
 	// the diagonals alone, so the second call still runs.
@@ -355,6 +362,7 @@ TEST_F(PreparedLtTest, PrepareRejectsBadArguments) {
 }
 
 TEST_F(PreparedLtTest, PreparedCallsRejectNullAndTheWrongHandleKind) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	const int n = static_cast<int>(kSlots);
 	auto M		= MakeRandomMatrix(n, 2u);
 	auto pts	= PackDiagonals(cc, M, n, 4, 1, 0);

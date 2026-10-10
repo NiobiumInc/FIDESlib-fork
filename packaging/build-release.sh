@@ -24,6 +24,11 @@
 #                 release floor; override for a local build on a newer host that isn't
 #                 meant to match the release floor)
 #   MAX_GLIBCXX   verify-artifact.sh's libstdc++ floor (default 3.4.29)
+#   TEST_BUILD=1  build fideslib-cpu-test (CPU and haze backends, static) against the same
+#                 three dependency builds and stop: no package. The haze CI job uses it,
+#                 so the tests run on what the release ships.
+#   DEPS_CACHED=1 skip steps 1-3 and reuse $BUILD_ROOT/{openfhe-install,haze-openfhe-install,haze}
+#                 from an earlier run (CI restores them from its cache)
 
 set -euo pipefail
 
@@ -120,39 +125,62 @@ OFHE_COMMON="-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=OFF -DBUILD_STATIC=ON
 echo "==> FIDESlib release $VERSION ($TRIPLE), $(${CXX:-c++} --version | head -1)"
 mkdir -p "$BUILD_ROOT" "$OUT_DIR"
 
-# ---- 1. OpenFHE oracle (patched; WITH_REDUCED_NOISE is required for haze parity) --
-# deps/build.sh (the normal dev-build path) applies deps/fideslib-ref-1.5.1.6.patch
-# before building deps/openfhe-src. FIDESlib's api/*.cpp and CUDA sources reach into
-# OpenFHE internals (m_FHE, m_bootPrecomMap, K_SPARSE, ...) that are protected/private
-# upstream and call an EvalBootstrapSetup overload the patch adds; without it, this
-# step compiles but step 4 fails.
-echo "==> [1/5] OpenFHE"
-git -C "$OFHE_SRC" checkout -- .
-git -C "$OFHE_SRC" apply "$REPO/deps/fideslib-ref-1.5.1.6.patch"
-cmake -S "$OFHE_SRC" -B "$BUILD_ROOT/openfhe" $OFHE_COMMON \
-      -DCMAKE_INSTALL_PREFIX="$OFHE_INS" -DWITH_OPENMP=ON \
-      -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null
-cmake --build "$BUILD_ROOT/openfhe" -j"$JOBS" --target install >/dev/null
+if [ "${DEPS_CACHED:-0}" = 1 ]; then
+    echo "==> [1-3/5] dependencies from cache"
+    [ -d "$OFHE_INS" ] && [ -d "$HAZE_OFHE_INS" ] && [ -d "$HAZE_BUILD" ] \
+        || { echo "DEPS_CACHED=1 but a cached build tree is missing under $BUILD_ROOT" >&2; exit 1; }
+else
+    # ---- 1. OpenFHE oracle (patched; WITH_REDUCED_NOISE is required for haze parity) --
+    # deps/build.sh (the normal dev-build path) applies deps/fideslib-ref-1.5.1.6.patch
+    # before building deps/openfhe-src. FIDESlib's api/*.cpp and CUDA sources reach into
+    # OpenFHE internals (m_FHE, m_bootPrecomMap, K_SPARSE, ...) that are protected/private
+    # upstream and call an EvalBootstrapSetup overload the patch adds; without it, this
+    # step compiles but step 4 fails.
+    echo "==> [1/5] OpenFHE"
+    git -C "$OFHE_SRC" checkout -- .
+    git -C "$OFHE_SRC" apply "$REPO/deps/fideslib-ref-1.5.1.6.patch"
+    cmake -S "$OFHE_SRC" -B "$BUILD_ROOT/openfhe" $OFHE_COMMON \
+          -DCMAKE_INSTALL_PREFIX="$OFHE_INS" -DWITH_OPENMP=ON \
+          -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null
+    cmake --build "$BUILD_ROOT/openfhe" -j"$JOBS" --target install >/dev/null
 
-# ---- 2. haze's instrumented OpenFHE ---------------------------------------------
-# A different OpenFHE from step 1: CPROBES-instrumented, absorbed whole into libhaze
-# and hidden behind its version script. OpenMP off, matching haze's own build.
-echo "==> [2/5] instrumented OpenFHE (haze)"
-cmake -S "$HAZE_OFHE_SRC" -B "$BUILD_ROOT/haze-openfhe" $OFHE_COMMON \
-      -DCMAKE_INSTALL_PREFIX="$HAZE_OFHE_INS" -DWITH_CPROBES=ON -DWITH_OPENMP=OFF \
-      -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null
-cmake --build "$BUILD_ROOT/haze-openfhe" -j"$JOBS" --target install >/dev/null
+    # ---- 2. haze's instrumented OpenFHE ---------------------------------------------
+    # A different OpenFHE from step 1: CPROBES-instrumented, absorbed whole into libhaze
+    # and hidden behind its version script. OpenMP off, matching haze's own build.
+    echo "==> [2/5] instrumented OpenFHE (haze)"
+    cmake -S "$HAZE_OFHE_SRC" -B "$BUILD_ROOT/haze-openfhe" $OFHE_COMMON \
+          -DCMAKE_INSTALL_PREFIX="$HAZE_OFHE_INS" -DWITH_CPROBES=ON -DWITH_OPENMP=OFF \
+          -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null
+    cmake --build "$BUILD_ROOT/haze-openfhe" -j"$JOBS" --target install >/dev/null
 
-# ---- 3. libhaze ------------------------------------------------------------------
-echo "==> [3/5] libhaze"
-cmake -S "$HAZE_SRC" -B "$HAZE_BUILD" -DCMAKE_BUILD_TYPE=Release \
-      -DOPENFHE_INSTALL_DIR="$HAZE_OFHE_INS" \
-      -DHAZE_BUILD_TESTS=OFF -DHAZE_BUILD_E2E_TESTS=OFF \
-      -DCMAKE_CXX_FLAGS="$HAZE_FLAGS" \
-      -DCMAKE_SHARED_LINKER_FLAGS="$HAZE_LINKER_FLAGS" >/dev/null
-cmake --build "$HAZE_BUILD" -j"$JOBS" --target haze >/dev/null
+    # ---- 3. libhaze ------------------------------------------------------------------
+    echo "==> [3/5] libhaze"
+    cmake -S "$HAZE_SRC" -B "$HAZE_BUILD" -DCMAKE_BUILD_TYPE=Release \
+          -DOPENFHE_INSTALL_DIR="$HAZE_OFHE_INS" \
+          -DHAZE_BUILD_TESTS=OFF -DHAZE_BUILD_E2E_TESTS=OFF \
+          -DCMAKE_CXX_FLAGS="$HAZE_FLAGS" \
+          -DCMAKE_SHARED_LINKER_FLAGS="$HAZE_LINKER_FLAGS" >/dev/null
+    cmake --build "$HAZE_BUILD" -j"$JOBS" --target haze >/dev/null
+fi
+
 HAZE_LIB=$(find "$HAZE_BUILD" -maxdepth 1 -name 'libhaze.*' -type f | head -1)
 [ -n "$HAZE_LIB" ] || { echo "libhaze not produced" >&2; exit 1; }
+
+if [ "${TEST_BUILD:-0}" = 1 ]; then
+    echo "==> test build"
+    # The test executable links the static OpenFHE directly, so it needs the same -ldl as
+    # libhaze on glibc < 2.34 (appended after the objects: CMAKE_CXX_STANDARD_LIBRARIES).
+    cmake -S "$REPO" -B "$BUILD_ROOT/fideslib-test" -DCMAKE_BUILD_TYPE=Release \
+          -DFIDESLIB_ENABLE_CUDA=OFF -DFIDESLIB_ENABLE_HAZE=ON \
+          -DFIDESLIB_COMPILE_TESTS=ON -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
+          -DFIDESLIB_HAZE_DIR="$HAZE_SRC" -DFIDESLIB_HAZE_LIB="$HAZE_LIB" \
+          -DFIDESLIB_INSTALL_OPENFHE=OFF -DOPENFHE_INSTALL_PREFIX="$OFHE_INS" \
+          -DCMAKE_CXX_FLAGS="$PREFIX_MAP" \
+          -DCMAKE_CXX_STANDARD_LIBRARIES="$HAZE_LINKER_FLAGS" >/dev/null
+    cmake --build "$BUILD_ROOT/fideslib-test" -j"$JOBS" --target fideslib-cpu-test
+    echo "==> test binary: $BUILD_ROOT/fideslib-test/fideslib-cpu-test"
+    exit 0
+fi
 
 # ---- 4. FIDESlib -----------------------------------------------------------------
 echo "==> [4/5] libfideslib"

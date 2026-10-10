@@ -133,6 +133,122 @@ jobs:
         working-directory: build
         run: ./fideslib-cpu-test
 
+  # The CPU and haze backends, built the way the release builds them (packaging/
+  # build-release.sh, in the release's manylinux_2_28 container: gcc-toolset-14,
+  # OpenFHE patched and with reduced noise, haze's own instrumented OpenFHE) and run
+  # over the whole suite. release.yml calls this workflow, so a failure here also
+  # stops a release. haze is an in-process simulator, so no hardware is needed.
+  #
+  # The haze suite is long (about 100 minutes on one hosted runner), so it is split
+  # into shards with gtest's own GTEST_TOTAL_SHARDS / GTEST_SHARD_INDEX: each test
+  # runs in exactly one shard, and the check fails if any shard fails. The cpu leg
+  # runs the whole suite in one shard.
+  haze:
+    name: ${{ matrix.backend }} tests, release build (${{ matrix.shard }}/${{ matrix.shards }})
+    needs: changes
+    # Runs unless the decision is an explicit "false"; a failed decision runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.run != 'false' }}
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { backend: cpu, shard: 0, shards: 1 }
+          - { backend: haze, shard: 0, shards: 4 }
+          - { backend: haze, shard: 1, shards: 4 }
+          - { backend: haze, shard: 2, shards: 4 }
+          - { backend: haze, shard: 3, shards: 4 }
+    env:
+      BUILD_ROOT: ${{ github.workspace }}/.ci/release-build
+      GT_ROOT: /opt/rh/gcc-toolset-14/root
+    steps:
+      # niobium-haze and its nested niobium-fhetch are public repos, so the default
+      # GITHUB_TOKEN clones them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      # The three dependency builds (OpenFHE, haze's OpenFHE, libhaze) depend only on
+      # the pinned sources, the patch and the build script, so those key the cache.
+      - name: Key the dependency cache
+        id: key
+        run: |
+          # The checkout's safe.directory entry is temporary, and git refuses a repository the
+          # container user does not own, so add it here. An empty state would hash to a
+          # constant and the cache would never follow a submodule bump, so it fails instead.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          state=$(git submodule status --recursive)
+          [ -n "$state" ] || { echo "::error::no submodule state to key the dependency cache on"; exit 1; }
+          src=$(printf '%s\n' "$state" | sed 's/^[ +-]//' | awk '{print $1, $2}' | sha256sum | cut -c1-16)
+          echo "deps=release-deps-manylinux-$src-${{ hashFiles('deps/build.sh', 'deps/*.patch', 'packaging/build-release.sh') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the dependency builds
+        id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci/release-build/openfhe-install
+            .ci/release-build/haze-openfhe-install
+            .ci/release-build/haze
+          key: ${{ steps.key.outputs.deps }}
+
+      - name: Build the test binary
+        run: |
+          JOBS="$(nproc)" \
+          OUT_DIR="$RUNNER_TEMP/dist" \
+          TEST_BUILD=1 \
+          DEPS_CACHED="${{ steps.deps.outputs.cache-hit == 'true' && '1' || '0' }}" \
+            bash packaging/build-release.sh
+
+      # One leg saves, so the legs that all missed at once do not race to write the
+      # same key. Saved after a successful build, so only a working set is stored.
+      - name: Save the dependency builds
+        if: steps.deps.outputs.cache-hit != 'true' && matrix.backend == 'haze' && matrix.shard == 0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci/release-build/openfhe-install
+            .ci/release-build/haze-openfhe-install
+            .ci/release-build/haze
+          key: ${{ steps.key.outputs.deps }}
+
+      # haze writes each program's trace under /tmp by default (several GB over a full
+      # run), so point it at the workspace disk.
+      - name: Test
+        working-directory: .ci/release-build/fideslib-test
+        env:
+          FIDESLIB_TEST_BACKEND: ${{ matrix.backend }}
+          FIDESLIB_HAZE_RUNS_DIR: ${{ runner.temp }}/haze-runs
+          GTEST_TOTAL_SHARDS: ${{ matrix.shards }}
+          GTEST_SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          source /opt/rh/gcc-toolset-14/enable
+          mkdir -p "$FIDESLIB_HAZE_RUNS_DIR"
+          ./fideslib-cpu-test --gtest_output="xml:$RUNNER_TEMP/results.xml"
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.backend }} tests, shard ${{ matrix.shard }} of ${{ matrix.shards }}"
+            if [ -f "$RUNNER_TEMP/results.xml" ]; then
+              head -2 "$RUNNER_TEMP/results.xml" | grep -o '<testsuites [^>]*' | grep -oE '(tests|failures|disabled|errors)="[0-9]+"' | tr '\n' ' '
+              echo
+            else
+              echo "No result file: the binary did not finish."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ${{ matrix.backend }}-test-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/results.xml
+          if-no-files-found: ignore
+
   cuda-compile:
     name: CUDA compile (sm_120, no GPU)
     needs: changes
