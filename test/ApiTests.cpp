@@ -5,6 +5,7 @@
 // CPU-only build:  cmake -B build-cpu -DFIDESLIB_ENABLE_CUDA=OFF && cmake --build build-cpu --target fideslib-cpu-test
 // Run:    ./build-cpu/fideslib-cpu-test [--gtest_filter=-*Bootstrap*]
 
+#include <tuple>
 #include <algorithm>
 #include <any>
 #include <cmath>
@@ -431,33 +432,45 @@ static void ExpectCiphertextBitEqual(CryptoContext<DCRTPoly>& cc, Ciphertext<DCR
 	}
 }
 
-TEST_F(CKKSTest, EvalRotateManyMatchesEvalRotate) {
-	// The head ladder's +-2^i, which is the index set the score path actually walks, over the batch
-	// widths that bracket a page's live-body count: 1 (degenerate), 2, 7 (not a power of two, and
-	// not a divisor of the engine's batch cap), 32 (a full page of diagonals).
-	const std::vector<int32_t> indices = { 1, 2, 4, 8, -1, -2, -4, -8 };
-	for (uint32_t B : { 1u, 2u, 7u, 32u }) {
-		// Distinct contents per entry: a batch that silently rotated one input B times, or emitted
-		// its outputs in the wrong order, would pass with identical inputs.
-		std::vector<Ciphertext<DCRTPoly>> cts;
-		cts.reserve(B);
-		for (uint32_t b = 0; b < B; ++b) {
-			std::vector<double> v(kSlots);
-			for (uint32_t i = 0; i < kSlots; ++i)
-				v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
-			auto pt = cc->MakeCKKSPackedPlaintext(v);
-			cts.push_back(cc->Encrypt(pt, keys.publicKey));
-		}
-		for (int32_t idx : indices) {
-			auto many = cc->EvalRotateMany(cts, idx);
-			ASSERT_EQ(many.size(), cts.size()) << "B=" << B << " index=" << idx;
-			for (uint32_t b = 0; b < B; ++b) {
-				auto one = cc->EvalRotate(cts[b], idx);
-				ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[b], one, "B=" + std::to_string(B) + " index=" + std::to_string(idx) + " entry=" + std::to_string(b)));
-			}
-		}
+// One case per (batch width, index) on a fresh context: the haze backend records one program per
+// context and rejects compute after the first readback. Within a case, every result is declared an
+// output before any readback.
+class CKKSRotateManyTest : public CKKSTest, public ::testing::WithParamInterface<std::tuple<uint32_t, int32_t>> {};
+
+TEST_P(CKKSRotateManyTest, MatchesEvalRotate) {
+	const auto [B, idx] = GetParam();
+	// Distinct contents per entry: a batch that silently rotated one input B times, or emitted
+	// its outputs in the wrong order, would pass with identical inputs.
+	std::vector<Ciphertext<DCRTPoly>> cts;
+	cts.reserve(B);
+	for (uint32_t b = 0; b < B; ++b) {
+		std::vector<double> v(kSlots);
+		for (uint32_t i = 0; i < kSlots; ++i)
+			v[i] = static_cast<double>(b + 1) + static_cast<double>(i) / 16.0;
+		auto pt = cc->MakeCKKSPackedPlaintext(v);
+		cts.push_back(cc->Encrypt(pt, keys.publicKey));
 	}
+	auto many = cc->EvalRotateMany(cts, idx);
+	ASSERT_EQ(many.size(), cts.size());
+	std::vector<Ciphertext<DCRTPoly>> serial;
+	for (uint32_t b = 0; b < B; ++b) {
+		cc->MarkOutput(many[b]);
+		serial.push_back(cc->EvalRotate(cts[b], idx));
+		cc->MarkOutput(serial.back());
+	}
+	for (uint32_t b = 0; b < B; ++b)
+		ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[b], serial[b], "entry=" + std::to_string(b)));
 }
+
+// The head ladder's +-2^i, which is the index set the score path actually walks, over the batch
+// widths that bracket a page's live-body count: 1 (degenerate), 2, 7 (not a power of two, and
+// not a divisor of the engine's batch cap), 32 (a full page of diagonals).
+INSTANTIATE_TEST_SUITE_P(BatchWidthsAndIndices, CKKSRotateManyTest,
+	::testing::Combine(::testing::Values(1u, 2u, 7u, 32u), ::testing::Values(1, 2, 4, 8, -1, -2, -4, -8)),
+	[](const ::testing::TestParamInfo<std::tuple<uint32_t, int32_t>>& info) {
+		const int32_t idx = std::get<1>(info.param);
+		return "B" + std::to_string(std::get<0>(info.param)) + (idx < 0 ? "_neg" : "_pos") + std::to_string(std::abs(idx));
+	});
 
 TEST_F(CKKSTest, EvalRotateManyEmptyBatch) {
 	std::vector<Ciphertext<DCRTPoly>> none;
@@ -482,6 +495,9 @@ TEST_F(CKKSTest, EvalRotateManyMixedLevels) {
 	ASSERT_EQ(many.size(), 2u);
 	auto ra = cc->EvalRotate(a, 1);
 	auto rb = cc->EvalRotate(b, 1);
+	// The haze backend needs every value read back below declared before the first readback.
+	for (auto* ct : { &many[0], &many[1], &ra, &rb })
+		cc->MarkOutput(*ct);
 	ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[0], ra, "mixed-levels entry=0"));
 	ASSERT_NO_FATAL_FAILURE(ExpectCiphertextBitEqual(cc, many[1], rb, "mixed-levels entry=1"));
 }
@@ -1111,11 +1127,10 @@ class CKKSBootstrapTest : public ::testing::Test {
 	static constexpr uint32_t kBatchSize = 8; // gparams64_13_*.batchSize
 	static constexpr uint32_t kSlots	= 1u << 5; // OpenFHEBootstrap's `int slots = 1 << 5`
 	static constexpr uint32_t kLevelBudget = 2; // EvalBootstrapSetup({2,2})
-	// Deepest level EvalBootstrap accepts: L0 - (levelBudget_decode + 2), from the guard at
-	// ckksrns-fhe.cpp:1252-1256 (FIXEDAUTO, so no extra FLEXIBLEAUTOEXT tower). The CUDA test
-	// depletes to L-1, which it can only do because it bootstraps on the GPU and never calls the
-	// host EvalBootstrap that owns this guard; these tests do, so they deplete to the guard's limit
-	// instead — as depleted as the host path legally allows. Encrypting AT this level is what makes
+	// Deepest level the StC-first variant accepts: L0 - (levelBudget_decode + 2), from the guard in
+	// ckksrns-fhe.cpp's EvalBootstrapStCFirst (FIXEDAUTO, so no extra FLEXIBLEAUTOEXT tower). The
+	// default ModRaise-first variant these tests run has no such guard, but depleting to this
+	// level keeps the fixture valid under either. Encrypting AT this level is what makes
 	// bootstrap real: a full-level input gains no levels and returns unchanged (a false pass).
 	static constexpr uint32_t kMaxBootLevel = kDepth - (kLevelBudget + 2);
 
@@ -1166,8 +1181,7 @@ TEST_F(CKKSBootstrapTest, Bootstrap) {
 	// Encrypt DEPLETED so EvalBootstrap runs the real pipeline. A full-level input gains no levels,
 	// so bootstrap returns a clone of the input unchanged (HazeBootstrap.cpp:1237, mirroring OpenFHE
 	// ckksrns-fhe.cpp:835) — which still decrypts to v1 and passes: a false pass. kMaxBootLevel is
-	// the deepest level bootstrap accepts (ckksrns-fhe.cpp:1252-1256), so this is as depleted as the
-	// input can legally be; going further throws "Not enough levels to perform Bootstrapping".
+	// deep enough for the refresh to gain levels under either bootstrap variant (see the fixture).
 	auto pt		   = cc->MakeCKKSPackedPlaintext(v1, 1, kMaxBootLevel, nullptr, kSlots);
 	auto ct		   = cc->Encrypt(pt, keys.publicKey);
 	const size_t levelBefore = ct->GetLevel();
@@ -1777,6 +1791,7 @@ TEST_F(CKKSTest, LinearTransformRotationIndices) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecSingleGiantStep) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// bStep = rowSize = 8 -> gStep = 1: no giant-step fold at all, pure baby steps.
 	// Keys: {1..8}, all generated by the fixture.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 8, stride = 1, offset = 0;
@@ -1790,6 +1805,7 @@ TEST_F(CKKSTest, LinearTransformMatVecSingleGiantStep) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecBabyGiantSplit) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// bStep = 4, rowSize = 8 -> gStep = 2: exercises the backwards fold and its
 	// bStep*stride = 4 rotation between giant steps.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
@@ -1803,6 +1819,7 @@ TEST_F(CKKSTest, LinearTransformMatVecBabyGiantSplit) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecShortLastGiantStep) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// bStep = 3, rowSize = 8 -> gStep = 3 with a 2-wide last giant step: the branch
 	// where the diagonal index runs past rowSize (CUDA null-pads it, CPU stops early).
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 3, stride = 1, offset = 0;
@@ -1816,6 +1833,7 @@ TEST_F(CKKSTest, LinearTransformMatVecShortLastGiantStep) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecWithOffset) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The bert-tiny sigma shape: a banded matrix whose diagonals run -2..+2, covered by
 	// rowSize = 5 with offset = -2 so index k maps to ciphertext rotation k - 2.
 	// Keys: {1, 2} from bStep, plus the offset -2.
@@ -1975,6 +1993,7 @@ TEST_F(CKKSTest, MakeCKKSPackedPlaintextDeviceManyRefusesBadBatches) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecExtendedBabyGiantSplit) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// Same case as LinearTransformMatVecBabyGiantSplit (gStep = 2, so the backwards fold and its
 	// bStep*stride rotation both run), with extended diagonals and ext = true.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
@@ -1988,6 +2007,7 @@ TEST_F(CKKSTest, LinearTransformMatVecExtendedBabyGiantSplit) {
 }
 
 TEST_F(CKKSTest, LinearTransformMatVecExtendedWithOffset) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The bert-tiny sigma shape again (rowSize = 5, offset = -2, short last giant step), extended:
 	// the offset branch of the fold is the one that moddowns before its final rotation.
 	const int n = static_cast<int>(kSlots), rowSize = 5, bStep = 2, stride = 1, offset = -2;
@@ -2001,6 +2021,7 @@ TEST_F(CKKSTest, LinearTransformMatVecExtendedWithOffset) {
 }
 
 TEST_F(CKKSTest, LinearTransformExtRequiresExtendedDiagonals) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// ext = true is a requirement, not a hint: the fused kernel would silently take the slow
 	// per-rotation-ModDown path off ordinary diagonals. The facade rejects the mismatch instead,
 	// on every backend, so the mistake surfaces on CPU too.
@@ -2058,6 +2079,7 @@ std::vector<double> DecryptSlots(CryptoContext<DCRTPoly>& cc, Ciphertext<DCRTPol
 } // namespace
 
 TEST_F(CKKSTest, LinearTransformManyMatchesIndependentCalls) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The q/k/v shape: THREE transforms of one source. bStep = 4, rowSize = n = 8 -> gStep = 2, so
 	// the per-transform backwards fold and its bStep*stride rotation both run and cannot be shared.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
@@ -2103,6 +2125,7 @@ TEST_F(CKKSTest, LinearTransformManyMatchesIndependentCalls) {
 }
 
 TEST_F(CKKSTest, LinearTransformManyWithOffsetAndExtendedDiagonals) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The gate/up shape: TWO transforms, this time on the banded rowSize = 5 / offset = -2 / short
 	// last giant step case, with extended diagonals — the fold branch that moddowns before its final
 	// offset rotation, run once per transform out of one batch.
@@ -2134,6 +2157,7 @@ TEST_F(CKKSTest, LinearTransformManyWithOffsetAndExtendedDiagonals) {
 }
 
 TEST_F(CKKSTest, LinearTransformManySingleSetEqualsSingleCall) {
+	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// Degenerate batch of one: the Many path must not be a different algorithm.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 8, stride = 1, offset = 0;
 	auto M	 = MakeRandomMatrix(n, 20260830u);
@@ -2698,13 +2722,11 @@ TEST(SparseSecretModEval, SparseKeyFreesFourLevelsEndToEnd) {
 	// Pin the absolute depths too, not just their difference -  asserting only the delta would still
 	// pass if both arms drifted together. A bootstrap reserves CtS + EvalMod + StC; the executed
 	// chain lands under that reservation by a backend-dependent amount, measured here rather than
-	// derived. The device backends come in 1 level under (uniform 19, sparse 15 at kBudget=3); the
-	// CPU backend comes in 4 under (16 and 12) because OpenFheEngine::bootstrapSetupPolicy routes
-	// modEvalLevels into OpenFHE's BTSlotsEncoding slot and passes -1 for modevallevels, so
-	// ckksrns-fhe.cpp takes the branch that derives lDec from the budget alone and ignores the
-	// approximation depth entirely. That divergence is pre-existing and flagged in place; it changes
-	// the offset on both arms equally, which is why the delta above is the real assertion.
-	const size_t budgetSlack = (RequestedBackend() == Backend::CPU) ? 4 : 1;
+	// derived. Every backend runs the same ModRaise-first circuit and comes in 1 level under
+	// (uniform 19, sparse 15 at kBudget=3). The CPU backend used to come in 4 under (16 and 12)
+	// because its setup selected the StC-first variant; one slack for all backends is what keeps
+	// that divergence from coming back unnoticed.
+	const size_t budgetSlack = 1;
 	EXPECT_EQ(uniformLevel, bootstrapModEvalLevels(UNIFORM_TERNARY) + 2 * kBudget - budgetSlack) << "uniform bootstrap consumed an unexpected depth; got " << uniformLevel;
 	EXPECT_EQ(sparseLevel, bootstrapModEvalLevels(SPARSE_TERNARY) + 2 * kBudget - budgetSlack) << "sparse bootstrap consumed an unexpected depth; got " << sparseLevel;
 

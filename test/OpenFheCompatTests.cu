@@ -687,7 +687,9 @@ TEST(OpenFHECompatTests, EvalBootstrapFlexExt) {
 
     std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
 
-    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x, 1, multDepth - (levelBudget[1] + 3), nullptr, numSlots);
+    // The ModRaise-first refresh lands at level 20 at these parameters, and an input no deeper
+    // than that comes back unchanged. multDepth - 2 leaves it levels to gain.
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x, 1, multDepth - 2, nullptr, numSlots);
 
     auto ctxt = cc->Encrypt(keys.publicKey, ptxt);
 
@@ -752,7 +754,9 @@ TEST(OpenFHECompatTests, EvalBootstrapDenseFlexExt) {
 
     std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
 
-    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x, 1, multDepth - (levelBudget[1] + 3), nullptr, numSlots);
+    // The ModRaise-first refresh lands at level 20 at these parameters, and an input no deeper
+    // than that comes back unchanged. multDepth - 2 leaves it levels to gain.
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x, 1, multDepth - 2, nullptr, numSlots);
 
     auto ctxt = cc->Encrypt(keys.publicKey, ptxt);
 

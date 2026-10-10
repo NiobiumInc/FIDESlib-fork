@@ -128,6 +128,7 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		cudaDeviceGetDefaultMemPool(&mp, dev);
 		uint64_t threshold = UINT64_MAX; // 5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
 		cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
+		ConfigurePoolForConcurrentOps(mp); // concurrent mode only; see CudaUtils.cuh
 		CudaCheckErrorModNoSync;
 	}
 

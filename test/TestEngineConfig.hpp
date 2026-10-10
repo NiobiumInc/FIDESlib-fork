@@ -59,4 +59,14 @@ inline void ConfigureTestEngine(fideslib::CCParams<fideslib::CryptoContextCKKSRN
 
 } // namespace FIDESlib::Testing
 
+// The haze backend does not implement linearTransformInPlace (it throws "not implemented"), so
+// the tests whose subject is that operation have nothing to check there. The skip names the
+// reason in the log; the tests still run on cpu and cuda. Expands to names the using file has in
+// scope: GetTestBackend() and TestBackend.
+#define FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM() \
+	do { \
+		if (GetTestBackend() == TestBackend::HAZE) \
+			GTEST_SKIP() << "linearTransformInPlace is not implemented by the haze backend"; \
+	} while (0)
+
 #endif // FIDESLIB_TEST_TESTENGINECONFIG_HPP

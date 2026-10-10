@@ -7,8 +7,6 @@
 # and no test fixes a seed, so p, and with it the limit, moves from run to run.
 # One gtest filter pattern per line.
 
-# LT/3, LT/5 and LT/7 have each failed; LT/3 failed twice in a row on the CI GPU.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapLT/*
 # These four families flip with no source change on the base commit and with
 # this fork's changes applied, over repeated runs on an RTX 5090. On the CI GPU,
 # Conjugate/2 passed only on retry and HoistedRotateAllLevels/1 failed twice.

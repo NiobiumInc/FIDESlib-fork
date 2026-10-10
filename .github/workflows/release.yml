@@ -51,9 +51,12 @@ on:
         type: boolean
         default: true
 
+# A new push to a pull request cancels that pull request's run still in progress: only
+# the latest commit's packages matter there. Pushes to nb_main and manual runs queue
+# instead, so a run that is publishing is never cut short.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every job reads the repository; only the release job, which creates the tag and the
 # release, needs write, and it declares that escalation itself.
@@ -210,6 +213,9 @@ jobs:
     needs: [build, version]
     name: consume ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    # A leg takes under ten minutes even on a slow package mirror. Without a limit a
+    # stalled apt-get held the whole run for the six-hour default.
+    timeout-minutes: 20
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
@@ -265,6 +271,7 @@ jobs:
 
       - name: Install a consumer toolchain only
         id: toolchain
+        timeout-minutes: 10
         shell: bash
         run: |
           # Deliberately just a compiler: no cmake, no OpenFHE, no nix, nothing built
@@ -290,7 +297,14 @@ jobs:
             # (the "no container" leg), which needs sudo for apt-get.
             SUDO=""
             [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo"
-            $SUDO apt-get update && $SUDO apt-get install -y g++
+            # The bare runner already ships g++, and that native toolchain is what the
+            # leg is meant to test, so it needs no package mirror at all. The
+            # containers do; for them apt gives up on a stalled connection and retries
+            # instead of waiting forever.
+            if ! command -v g++ >/dev/null; then
+              apt=($SUDO apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+              "${apt[@]}" update && "${apt[@]}" install -y g++
+            fi
           fi
 
       - name: Build and run the smoke consumer against the package

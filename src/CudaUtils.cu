@@ -50,6 +50,14 @@ bool ConcurrentOps() {
 	return enabled;
 }
 
+/// See CudaUtils.cuh.
+void ConfigurePoolForConcurrentOps(const cudaMemPool_t pool) {
+	if (!ConcurrentOps() || pool == nullptr)
+		return;
+	int follow = 0;
+	cudaMemPoolSetAttribute(pool, cudaMemPoolReuseFollowEventDependencies, &follow);
+}
+
 /// See CudaUtils.cuh (ConcurrentOpsDiag). Parsed once; the mask is 0 unless the concurrent mode
 /// is on AND the variable names at least one primitive.
 static unsigned ConcurrentOpsDiagMask() {
@@ -526,6 +534,8 @@ cudaMemPool_t SlotMemPoolFor(const int device, const int slot) {
 	// keeps its reserve across ops instead of returning it to the driver at every free.
 	uint64_t threshold = UINT64_MAX;
 	cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+	// A slot's thread still issues on shared stream handles, so its pool gets the same reuse policy.
+	ConfigurePoolForConcurrentOps(pool);
 
 	pools[i] = pool;
 	return pool;
