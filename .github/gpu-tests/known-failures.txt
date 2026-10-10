@@ -5,37 +5,47 @@
 # A pull request that fixes one of these deletes its line in the same pull
 # request. One gtest filter pattern per line.
 
+# Each test below was run alone, one process per test, and fails alone too.
+# (Run together in one process, a failure in a fixture's SetUp could leave
+# OpenFHE's process-wide parameter estimate set and make later contexts fail
+# with "EstimateLogP() failure"; that is not the reason for any line here.)
+
 # Inherited from upstream (they fail on the base commit 0ec4055):
 # GPU bootstrap precision.
+# Linear transform: error of about 2.6 against OpenFHE.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.LinearTransform/*
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/*
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/*
+# Coefficients to slots, parameters 3, 5 and 7: error of about 5e-11.
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/3
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/5
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/7
+# Dense bootstrap, the parameters that miss the bound by a small margin.
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/0
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/2
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/4
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/5
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/6
+OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/7
+# Chebyshev evaluation with FIXEDAUTO scaling: error of 2.5e-7 where the other
+# parameters reach 5e-10. The GPU evaluation differs from OpenFHE's by about
+# 1e-4 after a full bootstrap, the same size as the bootstrap's own error
+# against the true plaintext, so this is a different evaluation order and not a
+# measured precision loss.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/3
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/5
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/7
 
 # Inherited from upstream: CPU and GPU results differ bit for bit.
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.MultAllLevels/1
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMult/1
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMultAllLevels/1
 
-# Bootstrap through the API on the CUDA engine, FIXEDAUTO scaling. Level
-# budget {1,1} differs from OpenFHE by up to 0.18 on inputs from 0.1 to 0.8.
-# Level budget {2,2} aborts the whole suite with an uncaught OpenFHE
-# exception, a missing rotation key (automorphism index 78125), so {3,3} has
-# not run yet.
-LevelBudgets/ApiParityBootstrapTest.EvalBootstrap/*
-
 # Brought in with Niobium's branches: they fail the same way on those branches
 # without the upstream merge.
-# OpenFHE throws in the fixture's SetUp, during parameter generation:
-# PrecomputeCRTTables(): EstimateLogP() failure (the expected and the generated
-# sizeP differ). OpenFHEBootstrap/* passed on nb_main before this change.
+# Errors of 1.5e-5 to 5e-4 against the test's limit. These tests appear to
+# compare the GPU result against a fresh clone of the input (46 bits of
+# precision) while the GPU result went through a bootstrap, the reference
+# problem the OpenFHEBootstrapLT tests had before their reference became
+# EvalBootstrap; not yet confirmed for these.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrap/*
+# The 1e-6 tolerance is tighter than the bootstrap's own precision here
+# (observed 2e-5 to 5e-3).
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.SharedViewMatchesReducedSetSparse/*
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.SharedViewMatchesReducedSetDense/*
-# The fixture asks for ring dimension 8192 at depth 5 without setting a
-# security level, and OpenFHE's default 128-bit level rejects it in SetUp
-# ("does not comply with HE standards recommendation").
-DeviceEncodeTest.*
