@@ -14,9 +14,15 @@
 
 namespace fideslib {
 
+// Construction never checks reducedNoise against LinkedOpenFheReducedNoise(): the linked OpenFHE's
+// FBC variant only matters to operations that key-switch (ModUp/ModDown via ApproxSwitchCRTBasis),
+// so a mismatched engine must still support keygen, encode, encrypt, decrypt and decode.
 OpenFheEngine::OpenFheEngine(bool reducedNoise) : Engine(reducedNoise) {
-	if (reducedNoise != LinkedOpenFheReducedNoise()) {
-		throw std::runtime_error("cpu backend cannot honour reducedNoise=" + std::string(reducedNoise ? "true" : "false") +
+}
+
+void OpenFheEngine::requireLinkedVariant(std::string_view op) const {
+	if (reducedNoise() != LinkedOpenFheReducedNoise()) {
+		throw std::runtime_error("cpu " + std::string(op) + " cannot honour reducedNoise=" + (reducedNoise() ? "true" : "false") +
 		  ": the linked openfhe was built with WITH_REDUCED_NOISE=" + (LinkedOpenFheReducedNoise() ? "ON" : "OFF"));
 	}
 }
@@ -220,6 +226,8 @@ void OpenFheEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scal
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2) {
+	// EvalMult(ct,ct) relinearizes via KeySwitchCore (ApproxSwitchCRTBasis + ApproxModDown).
+	requireLinkedVariant("evalMult");
 	auto& context = hostContext(ctx);
 	auto& ct1Impl = hostCt(ct1);
 	auto& ct2Impl = hostCt(ct2);
@@ -257,6 +265,8 @@ void OpenFheEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext
 }
 
 void OpenFheEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Ciphertext<DCRTPoly>& ct2) {
+	// EvalMultMutableInPlace relinearizes the same way as evalMult(ct,ct).
+	requireLinkedVariant("evalMultInPlace");
 	auto& context = hostContext(ctx);
 	ct1->EnsureLazyHostCopy();
 	ct2->EnsureLazyHostCopy();
@@ -274,12 +284,16 @@ Ciphertext<DCRTPoly> OpenFheEngine::evalMultNoRelin(CryptoContextImpl<DCRTPoly>&
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::relinearize(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	// Relinearize's KeySwitchCore key-switches per digit; refused whenever it could key-switch, even on an already-degree-1 ciphertext.
+	requireLinkedVariant("relinearize");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->Relinearize(ctImpl));
 }
 
 void OpenFheEngine::relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	// Same as relinearize; refused whenever it could key-switch, even on an already-degree-1 ciphertext.
+	requireLinkedVariant("relinearizeInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -288,12 +302,16 @@ void OpenFheEngine::relinearizeInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphert
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
+	// EvalSquare relinearizes via KeySwitchCore, same as evalMult(ct,ct).
+	requireLinkedVariant("evalSquare");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->EvalSquare(ctImpl));
 }
 
 void OpenFheEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) {
+	// Same as evalSquare.
+	requireLinkedVariant("evalSquareInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -302,12 +320,16 @@ void OpenFheEngine::evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalRotate(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	// EvalRotate's EvalAutomorphismCore ApproxModDowns for HYBRID key switching.
+	requireLinkedVariant("evalRotate");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	return wrapHostCt(ctx, context->EvalRotate(ctImpl, index));
 }
 
 void OpenFheEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+	// Same as evalRotate.
+	requireLinkedVariant("evalRotateInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	setHostCt(ciphertext, context->EvalRotate(ctImpl, index));
@@ -316,6 +338,8 @@ void OpenFheEngine::evalRotateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const uint32_t m, const std::shared_ptr<void>& precomp) {
+	// EvalAutomorphismCore ApproxModDowns for HYBRID; refused whenever it could key-switch, even at index 0 (OpenFHE's own no-op).
+	requireLinkedVariant("evalFastRotation");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(precomp);
@@ -324,6 +348,8 @@ OpenFheEngine::evalFastRotation(CryptoContextImpl<DCRTPoly>& ctx, const Cipherte
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalFastRotationExt(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, const int32_t index, const std::shared_ptr<void>& digits, bool addFirst) {
+	// Operates on digits built by evalFastRotationPrecompute's ApproxSwitchCRTBasis step; guarded for the same reason even though EvalFastKeySwitchCoreExt itself has no ModDown.
+	requireLinkedVariant("evalFastRotationExt");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPoly>>(digits);
@@ -335,6 +361,8 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotation(CryptoContextI
   const std::vector<int32_t>& indices,
   const uint32_t m,
   const std::shared_ptr<void>& precomp) {
+	// Same as the single-index overload; refused whenever it could key-switch, even at index 0.
+	requireLinkedVariant("evalFastRotation");
 	std::vector<Ciphertext<DCRTPoly>> results;
 
 	auto& context = hostContext(ctx);
@@ -352,6 +380,8 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotationExt(CryptoConte
   const std::vector<int32_t>& indices,
   const std::shared_ptr<void>& digits,
   bool addFirst) {
+	// Same as the single-index overload.
+	requireLinkedVariant("evalFastRotationExt");
 	std::vector<Ciphertext<DCRTPoly>> results;
 
 	auto& context = hostContext(ctx);
@@ -365,12 +395,16 @@ std::vector<Ciphertext<DCRTPoly>> OpenFheEngine::evalFastRotationExt(CryptoConte
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) {
+	// Internally multiplies and relinearizes ciphertexts (Chebyshev evaluation).
+	requireLinkedVariant("evalChebyshevSeries");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return wrapHostCt(ctx, context->EvalChebyshevSeries(ctImpl, coeffs, a, b));
 }
 
 void OpenFheEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b) {
+	// Same as evalChebyshevSeries.
+	requireLinkedVariant("evalChebyshevSeriesInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -426,6 +460,8 @@ void OpenFheEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 }
 
 Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	// EvalPartialSumInPlace key-switches per rotation step (ApproxSwitchCRTBasis + ApproxModDown); refused whenever it could key-switch, even when slots<=1 (OpenFHE's own no-op).
+	requireLinkedVariant("accumulateSum");
 	auto& ctImpl = hostCt(ct);
 
 	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> result_ct = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(ctImpl);
@@ -436,6 +472,8 @@ Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& c
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
+	// Same as accumulateSum; refused whenever it could key-switch, even when slots<=1.
+	requireLinkedVariant("accumulateSumInPlace");
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
 
@@ -443,6 +481,8 @@ void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphe
 }
 
 void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
+	// Loops EvalRotate directly, same key switching as evalRotate; refused whenever it could key-switch, even when start>=slots.
+	requireLinkedVariant("accumulateSumInPlace");
 	auto& context = hostContext(ctx);
 	ct->EnsureLazyHostCopy();
 	auto& ctImpl = hostCt(ct);
@@ -456,14 +496,14 @@ void OpenFheEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphe
 	return;
 }
 
-BootstrapSetupPolicy OpenFheEngine::bootstrapSetupPolicy(bool /*precompute*/, bool /*btsfirstboot*/, int32_t modEvalLevels) const {
-	// Behaviour preserved verbatim from the previous CPU evalBootstrapSetup, which called the 6-arg
-	// EvalBootstrapSetup(levelBudget, dim1, slots, correctionFactor, /*precompute=*/true, modall).
-	// NOTE (pre-existing, flagged — not a behavior change in this refactor): in OpenFHE's single
-	// signature (..., precompute, BTSlotsEncoding, modevallevels=-1), that 6th `modall` argument lands
-	// in BTSlotsEncoding, NOT modevallevels — so the CPU "configure mod-eval levels" intent is not
-	// actually in effect (modevallevels stays -1). Reproduced exactly here; needs a separate decision.
-	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/modEvalLevels != 0, /*modEvalLevels=*/-1 };
+BootstrapSetupPolicy OpenFheEngine::bootstrapSetupPolicy(bool /*precompute*/, bool btsfirstboot, int32_t /*modEvalLevels*/) const {
+	// BTSlotsEncoding selects OpenFHE's bootstrap variant: false is the ModRaise-first circuit the
+	// CUDA and haze engines run, true is StC-first. It follows the caller's btsfirstboot, so the
+	// default setup refreshes to the same level on every backend. (This policy used to pass the
+	// mod-eval level count in that position, which is never 0, so the CPU engine always ran
+	// StC-first and landed levels away from the device backends.) modevallevels stays at OpenFHE's
+	// -1 default and the host precomputation is always built.
+	return BootstrapSetupPolicy{ /*precompute=*/true, /*btSlotsEncoding=*/btsfirstboot, /*modEvalLevels=*/-1 };
 }
 
 void OpenFheEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
@@ -492,12 +532,16 @@ void OpenFheEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const 
 
 Ciphertext<DCRTPoly>
 OpenFheEngine::evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
+	// EvalBootstrap's ModRaise/CoeffsToSlots/SlotsToCoeffs/relinearize pipeline key-switches throughout.
+	requireLinkedVariant("evalBootstrap");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	return wrapHostCt(ctx, context->EvalBootstrap(ctImpl, numIterations, precision));
 }
 
 void OpenFheEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
+	// Same as evalBootstrap.
+	requireLinkedVariant("evalBootstrapInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
 	ciphertext	  = wrapHostCt(ctx, context->EvalBootstrap(ctImpl, numIterations, precision));
@@ -720,6 +764,8 @@ void OpenFheEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx
   const std::vector<int>& indexes,
   int stride,
   int rowSize) {
+	// cpuConvolutionTransform rotates via EvalFastRotation/EvalRotate internally.
+	requireLinkedVariant("convolutionTransformInPlace");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	std::vector<lbcrypto::Plaintext> ptImpls;
@@ -739,6 +785,8 @@ void OpenFheEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPol
   int stride,
   int maskRotationStride,
   int rowSize) {
+	// Same as convolutionTransformInPlace (cpuConvolutionTransform rotates internally).
+	requireLinkedVariant("specialConvolutionTransformInPlace");
 	auto& context  = hostContext(ctx);
 	auto& ctImpl   = hostCt(ct);
 	auto& maskImpl = hostPt(mask);
@@ -760,7 +808,8 @@ void OpenFheEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRT
 }
 
 std::shared_ptr<void> OpenFheEngine::evalFastRotationPrecompute(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
-
+	// EvalKeySwitchPrecomputeCore calls ApproxSwitchCRTBasis directly (the ModUp digit decomposition).
+	requireLinkedVariant("evalFastRotationPrecompute");
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ct);
 	return context->EvalFastRotationPrecompute(ctImpl);

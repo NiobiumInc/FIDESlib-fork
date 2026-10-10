@@ -271,6 +271,29 @@ Tests: `ContextCacheBootConfig.SparseAndUniformDoNotAlias` (`test/ContextCacheTe
 `SparseSecretModEval.*` (`test/ApiTests.cpp`), `ApiParitySparseSecretBootstrapTest`
 (`test/ApiParityTest.cpp`, bit-level agreement with a sparse OpenFHE oracle at N=2^16).
 
+### R14. The CPU engine ran the StC-first bootstrap whatever the setup asked for
+Fork-only, introduced by `ba11c3e` (the Engine-abstraction refactor). `OpenFheEngine::bootstrapSetupPolicy`
+passed the mod-eval level count where OpenFHE's `EvalBootstrapSetup` takes `BTSlotsEncoding`. The
+count is never 0, so every CPU context set up the StC-first variant and ignored `btsfirstboot`. The
+CUDA and haze engines run ModRaise-first, which is also OpenFHE's default and what upstream
+FIDESlib's CPU path used. The two variants spend their levels differently: with depth 23, level
+budget {2,2} and 32 slots, an input at level 19 came back at level 15 on CPU and at level 17 on haze,
+whose circuit the CUDA engine shares. Every values-only test passed. The one symptom was
+`BootstrapToLevelTest.ReducedLevelMatchesBootstrapThenDrop` on the device backends: its target (the
+refresh level plus two) equalled its own input level, so the input itself met the request, and the
+test's level guard fired.
+
+**Resolution (`api/engine/cpu/OpenFheEngine.cpp`):** `BTSlotsEncoding` follows `btsfirstboot`, so the
+default setup is ModRaise-first on every backend. Run that way, the CPU engine lands on the same tower
+count as haze at every stage of the circuit. At these parameters, a CPU refresh now leaves two fewer
+levels than before, the same budget the device backends leave. `btsfirstboot = true` still selects
+StC-first on CPU.
+
+Tests: `BootstrapToLevelTest.RefreshLandsOnTheCpuEngineLevel` compares each device backend's refresh
+level with that of a CPU-engine context built from the same parameters.
+`ReducedLevelMatchesBootstrapThenDrop` now encrypts deep enough that its target sits below the input
+level, and asserts that precondition.
+
 ### O1. `EvalRotate` unification *(resolved — landed as `fideslib-ref-v1.5.1.2`)*
 The hoisted HYBRID formulation (already used by `EvalFastRotation`, added upstream for the GPU
 backend) is extended to `EvalRotate`/`EvalAtIndex`/`EvalAutomorphism`/`Conjugate`, making
