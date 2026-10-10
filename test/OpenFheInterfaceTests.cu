@@ -3838,10 +3838,12 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 	constexpr int kChain = 10;
 	auto cChain          = c1;
 	for (int j = 0; j < kChain; ++j) {
-		cChain               = cc->EvalBootstrap(cChain);
+		cChain              = cc->EvalBootstrap(cChain);
 		const size_t towers = cChain->GetElements()[0].GetNumOfElements();
+		// cc->LevelReduceInPlace drops towers only under FIXEDMANUAL (the automatic techniques drop them lazily), and
+		// the GPU's dropToLevel drops them under every technique, so drop them the way the GPU does.
 		if (towers > 3)
-			cc->LevelReduceInPlace(cChain, nullptr, towers - 3);
+			cc->GetScheme()->LevelReduceInternalInPlace(cChain, towers - 3);
 	}
 	std::cout << cChain->GetLevel() << "\n";
 	cc->Decrypt(keys.secretKey, cChain, &result);
@@ -3913,6 +3915,7 @@ static void SharedViewMatchesReducedSet(lbcrypto::CryptoContext<lbcrypto::DCRTPo
   const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
   FIDESlib::CKKS::Context& cc_,
   const int slots,
+  const std::vector<double>& x,
   const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& c1,
   const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& c2) {
 	constexpr double kViewTolerance = 1e-6;
@@ -3972,6 +3975,23 @@ static void SharedViewMatchesReducedSet(lbcrypto::CryptoContext<lbcrypto::DCRTPo
 		std::cout << "[shared-view] d=" << levelsToDrop << " level " << shared.getLevel() << " max |views - reencoded| " << maxDiff << std::endl;
 		EXPECT_LE(maxDiff, kViewTolerance);
 
+		// Each output against the true plaintext, again on the decrypted difference. The slots past x are zero.
+		std::vector<double> truth(slots, 0.0);
+		std::copy(x.begin(), x.end(), truth.begin());
+		auto truthPt = cc->MakeCKKSPackedPlaintext(truth, outA->GetNoiseScaleDeg(), outA->GetLevel(), nullptr, slots);
+		auto errVs   = [&](const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& out) {
+			  lbcrypto::Plaintext d;
+			  cc->Decrypt(keys.secretKey, cc->EvalSub(out, truthPt), &d);
+			  double m = 0.0;
+			  for (double v : d->GetRealPackedValue())
+				  m = std::max(m, std::abs(v));
+			  return m;
+		};
+		const double errReencoded = errVs(outA);
+		const double errShared    = errVs(outB);
+		std::cout << "[shared-view] d=" << levelsToDrop << " error against the plaintext: re-encoded " << errReencoded << ", views " << errShared
+				  << std::endl;
+
 		GPUcc.precom.boot.erase(std::pair<int, int>{ slots, levelsToDrop });
 	}
 }
@@ -4008,7 +4028,7 @@ TEST_P(OpenFHEBootstrapTest, SharedViewMatchesReducedSetSparse) {
 	kskEval.Initialize(rawKskEval);
 	cc_->AddEvalKey(std::move(kskEval));
 
-	SharedViewMatchesReducedSet(cc, keys, cc_, slots, c1, c2);
+	SharedViewMatchesReducedSet(cc, keys, cc_, slots, x1, c1, c2);
 	CudaCheckErrorMod;
 }
 
@@ -4053,7 +4073,7 @@ TEST_P(OpenFHEBootstrapTest, SharedViewMatchesReducedSetDense) {
 	kskEval.Initialize(rawKskEval);
 	GPUcc_.AddEvalKey(std::move(kskEval));
 
-	SharedViewMatchesReducedSet(cc, keys, cc_, slots, c1, c2);
+	SharedViewMatchesReducedSet(cc, keys, cc_, slots, x1, c1, c2);
 	CudaCheckErrorMod;
 }
 
