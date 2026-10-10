@@ -176,7 +176,13 @@ jobs:
       - name: Key the dependency cache
         id: key
         run: |
-          src=$(git submodule status --recursive | sed 's/^[ +-]//' | awk '{print $1, $2}' | sha256sum | cut -c1-16)
+          # The checkout's safe.directory entry is temporary, and git refuses a repository the
+          # container user does not own, so add it here. An empty state would hash to a
+          # constant and the cache would never follow a submodule bump, so it fails instead.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          state=$(git submodule status --recursive)
+          [ -n "$state" ] || { echo "::error::no submodule state to key the dependency cache on"; exit 1; }
+          src=$(printf '%s\n' "$state" | sed 's/^[ +-]//' | awk '{print $1, $2}' | sha256sum | cut -c1-16)
           echo "deps=release-deps-manylinux-$src-${{ hashFiles('deps/build.sh', 'deps/*.patch', 'packaging/build-release.sh') }}" >> "$GITHUB_OUTPUT"
 
       - name: Restore the dependency builds
