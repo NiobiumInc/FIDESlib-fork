@@ -2313,6 +2313,61 @@ INSTANTIATE_TEST_SUITE_P(OpenFHEInterfaceTests, OpenFHEInterfaceTest, testing::V
 class OpenFHEBootstrapTest : public GeneralParametrizedTest {
 };
 
+// Compares the GPU's result of a bootstrap (loaded into cGPU, a clone of OpenFHE's own result) with OpenFHE's result
+// of the same operation, cRef. refPlain and gpuPlain are their decryptions. `chained` is how many bootstraps the
+// result went through, so that a bound for one bootstrap can be scaled for a chain.
+//
+// The metadata must be equal. The values are compared on the DIFFERENCE of the two ciphertexts: decrypting adds
+// Gaussian noise to every result (OpenFHE's CKKSPackedEncoding::Decode), so two decryptions of one ciphertext differ
+// by about the precision of the bootstrap, and comparing decrypted values cannot see a smaller deviation. The
+// difference decrypts with the (much smaller) noise of the difference itself, so it measures how far the GPU result
+// really is from OpenFHE's.
+static void ExpectGpuMatchesOpenFHE(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& cRef,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& cGPU,
+  const lbcrypto::Plaintext& refPlain,
+  const lbcrypto::Plaintext& gpuPlain,
+  const int chained = 1) {
+	ASSERT_EQ(cGPU->GetLevel(), cRef->GetLevel());
+	ASSERT_EQ(cGPU->GetNoiseScaleDeg(), cRef->GetNoiseScaleDeg());
+	ASSERT_EQ(cGPU->GetScalingFactor(), cRef->GetScalingFactor());
+	ASSERT_EQ(cGPU->GetElements().at(0).GetNumOfElements(), cRef->GetElements().at(0).GetNumOfElements());
+
+	auto cDiff = cc->EvalSub(cRef, cGPU);
+	lbcrypto::Plaintext diff;
+	cc->Decrypt(keys.secretKey, cDiff, &diff);
+	double diffMax = 0.0;
+	for (double v : diff->GetRealPackedValue())
+		diffMax = std::max(diffMax, std::abs(v));
+
+	const auto scaling = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters())->GetScalingTechnique();
+	const double precision = refPlain->GetLogPrecision();
+	double bound;
+	switch (scaling) {
+		case lbcrypto::FIXEDMANUAL:
+			// Same operations in the same order: the results are equal up to the noise of decrypting a zero.
+			bound = 1e-12;
+			break;
+		case lbcrypto::FLEXIBLEAUTO:
+		case lbcrypto::FLEXIBLEAUTOEXT:
+			// Small rounding differences remain after the Chebyshev series.
+			bound = 1e-6;
+			break;
+		default:
+			// FIXEDAUTO: the GPU differs from OpenFHE by about 1e-4 after a bootstrap, the size of the bootstrap's own
+			// error against the true plaintext, which is the same for both (so this is not a precision loss; where the
+			// difference comes from is not yet known). The estimated precision moves from run to run, hence the same
+			// limit as the decrypted values below.
+			bound = std::pow(2.0, 4.0 - precision);
+	}
+	bound *= chained;
+	std::cout << "GPU - OpenFHE: max " << diffMax << " (limit " << bound << ")" << std::endl;
+	ASSERT_LE(diffMax, bound);
+
+	ASSERT_ERROR_OK(refPlain, gpuPlain);
+}
+
 /*
 TEST_P(OpenFHEBootstrapTest, ModRaise) {
 	for (auto& i : cached_cc) {
@@ -3429,20 +3484,20 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrap) {
 	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
 	// Encoding as plaintexts
 	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1, 1, raw_param.L - 1, nullptr, slots);
-	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x1, 1, 0, nullptr, slots);
 
 	std::cout << "Input x1: " << ptxt1 << std::endl;
 
 	// Encrypt the encoded vectors
 	auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
-	auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
 
-	// auto cAdd = cc->EvalBootstrap(c1);
-	auto cAdd = c1->Clone();
+	// The reference goes through the same operation as the GPU: OpenFHE's own bootstrap of the same ciphertext. A
+	// fresh copy of c1 has a precision of about 46 bits and none of the noise a bootstrap leaves, so no bootstrapped
+	// result can match it within the limit that precision gives.
+	auto cBoot = cc->EvalBootstrap(c1);
 
 	lbcrypto::Plaintext result;
-	std::cout << cAdd->GetLevel() << "\n";
-	cc->Decrypt(keys.secretKey, cAdd, &result);
+	std::cout << cBoot->GetLevel() << "\n";
+	cc->Decrypt(keys.secretKey, cBoot, &result);
 
 	std::cout << "Result " << result;
 
@@ -3487,7 +3542,8 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrap) {
 
 		FIDESlib::CKKS::RawCipherText raw_res1;
 		GPUct1.store(raw_res1);
-		auto cResGPU(c2);
+		// The GPU result goes into a clone of OpenFHE's result, so both carry the same parameters and metadata.
+		auto cResGPU = cBoot->Clone();
 
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		lbcrypto::Plaintext resultGPU;
@@ -3496,8 +3552,7 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrap) {
 		std::cout << "Result GPU " << resultGPU;
 
 		CudaCheckErrorMod;
-		ASSERT_ERROR_OK(result, resultGPU);
-		// ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectGpuMatchesOpenFHE(cc, keys, cBoot, cResGPU, result, resultGPU));
 
 		CudaCheckErrorMod;
 	}
@@ -3713,49 +3768,9 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapLT) {
 
 		CudaCheckErrorMod;
 
-		// The GPU bootstrap leaves the ciphertext where OpenFHE's does.
-		ASSERT_EQ(cResGPU->GetLevel(), cBoot->GetLevel());
-		ASSERT_EQ(cResGPU->GetNoiseScaleDeg(), cBoot->GetNoiseScaleDeg());
-		ASSERT_EQ(cResGPU->GetScalingFactor(), cBoot->GetScalingFactor());
-		ASSERT_EQ(cResGPU->GetElements().at(0).GetNumOfElements(), cBoot->GetElements().at(0).GetNumOfElements());
-
-		// Decrypting adds Gaussian noise to every result, so two decryptions of one ciphertext differ by about the
-		// precision of the bootstrap and comparing decrypted values cannot see a smaller deviation. The difference of
-		// the two ciphertexts decrypts with the (much smaller) noise of the difference itself, so it measures how far
-		// the GPU result really is from OpenFHE's.
-		auto cDiff = cc->EvalSub(cBoot, cResGPU);
-		lbcrypto::Plaintext diff;
-		cc->Decrypt(keys.secretKey, cDiff, &diff);
-		double diffMax = 0.0;
-		for (double v : diff->GetRealPackedValue())
-			diffMax = std::max(diffMax, std::abs(v));
-
-		const auto scaling = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters())->GetScalingTechnique();
-		const double precision = result->GetLogPrecision();
-		double bound;
-		switch (scaling) {
-			case lbcrypto::FIXEDMANUAL:
-				// Same operations in the same order: the results are equal up to the noise of decrypting a zero.
-				bound = 1e-12;
-				break;
-			case lbcrypto::FLEXIBLEAUTO:
-			case lbcrypto::FLEXIBLEAUTOEXT:
-				// Small rounding differences remain after the Chebyshev series.
-				bound = 1e-6;
-				break;
-			case lbcrypto::FIXEDAUTO:
-				// The GPU rescales the Chebyshev powers at a different point than OpenFHE does, so the results
-				// differ at the scale of the bootstrap's own noise. Their errors against the plaintext are of the same size.
-				// The estimated precision moves from run to run, hence the same limit as the decrypted values below.
-				bound = std::pow(2.0, 4.0 - precision);
-				break;
-			default:
-				bound = std::pow(2.0, 4.0 - precision);
-		}
-		std::cout << "GPU - OpenFHE: max " << diffMax << " (limit " << bound << ")" << std::endl;
-		ASSERT_LE(diffMax, bound);
-
-		ASSERT_ERROR_OK(result, resultGPU);
+		// The GPU bootstrap leaves the ciphertext where OpenFHE's does, and its values are as close to OpenFHE's as
+		// the scaling technique allows.
+		ASSERT_NO_FATAL_FAILURE(ExpectGpuMatchesOpenFHE(cc, keys, cBoot, cResGPU, result, resultGPU));
 
 		CudaCheckErrorMod;
 	}
@@ -3790,13 +3805,11 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 	int slots = GPUcc.N / 2;
 	// Encoding as plaintexts
 	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1, 1, GPUcc.L - 1, nullptr, slots);
-	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x1, 1, 0, nullptr, slots);
 
 	std::cout << "Input x1: " << ptxt1 << std::endl;
 
 	// Encrypt the encoded vectors
 	auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
-	auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
 
 	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 
@@ -3820,16 +3833,20 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 
 	FIDESlib::CKKS::AddBootstrapPrecomputation(cc, keys, slots, cc_);
 
-	if (1) {
-		auto cAdd = cc->EvalBootstrap(c1);
-
-		std::cout << cAdd->GetLevel() << "\n";
-		cc->Decrypt(keys.secretKey, cAdd, &result);
-
-		std::cout << "Result " << result;
-	} else {
-		std::cout << "Skipping CPU" << std::endl;
+	// OpenFHE runs the same chain as the GPU below: bootstrap, then keep three towers (level 2), kChain times. One
+	// bootstrap cannot be the reference for a chain of them: the error of every link adds to the result.
+	constexpr int kChain = 10;
+	auto cChain          = c1;
+	for (int j = 0; j < kChain; ++j) {
+		cChain               = cc->EvalBootstrap(cChain);
+		const size_t towers = cChain->GetElements()[0].GetNumOfElements();
+		if (towers > 3)
+			cc->LevelReduceInPlace(cChain, nullptr, towers - 3);
 	}
+	std::cout << cChain->GetLevel() << "\n";
+	cc->Decrypt(keys.secretKey, cChain, &result);
+
+	std::cout << "Result " << result;
 	///////////////////////////////////////////////////////////7777
 
 	FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
@@ -3852,7 +3869,7 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 		for (int i = 0; i < 3; ++i) {
 			GPUct1.copy(GPUct1_);
 
-			for (int j = 0; j < 10; ++j) {
+			for (int j = 0; j < kChain; ++j) {
 				CKKS::Ciphertext GPUct_aux(cc_);
 				GPUct_aux.copy(GPUct1);
 				cudaDeviceSynchronize();
@@ -3865,7 +3882,7 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 
 		FIDESlib::CKKS::RawCipherText raw_res1;
 		GPUct1.store(raw_res1);
-		auto cResGPU(c2);
+		auto cResGPU = cChain->Clone();
 
 		GetOpenFHECipherText(cResGPU, raw_res1);
 
@@ -3876,9 +3893,7 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 		std::cout << "Result GPU " << resultGPU;
 
 		CudaCheckErrorMod;
-		ASSERT_ERROR_OK(result, resultGPU);
-
-		// ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectGpuMatchesOpenFHE(cc, keys, cChain, cResGPU, result, resultGPU, kChain));
 
 		CudaCheckErrorMod;
 	}
@@ -3892,8 +3907,7 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 // Under the FIXED techniques Delta is one number, so the views hold exactly the re-encode's
 // integers, both folds are 1.0 and the two outputs must be BYTE-identical. Under FLEXIBLEAUTOEXT
 // the diagonals differ by rounding (round(a Delta_top) vs round(a Delta_reduced)) and the folds by
-// double rounding, so the two must decrypt to the same values far inside the bootstrap's own
-// error (kViewTolerance against the 1e-2-class error ASSERT_ERROR_OK allows the bootstrap itself).
+// double rounding, so the difference of the two outputs, decrypted, must stay below kViewTolerance.
 // Level, noise degree and scale must match exactly in both cases.
 static void SharedViewMatchesReducedSet(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
   const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
@@ -3947,15 +3961,14 @@ static void SharedViewMatchesReducedSet(lbcrypto::CryptoContext<lbcrypto::DCRTPo
 		auto outB = c2->Clone();
 		GetOpenFHECipherText(outA, rawA);
 		GetOpenFHECipherText(outB, rawB);
-		lbcrypto::Plaintext ptA, ptB;
-		cc->Decrypt(keys.secretKey, outA, &ptA);
-		cc->Decrypt(keys.secretKey, outB, &ptB);
-		const auto a = ptA->GetRealPackedValue();
-		const auto b = ptB->GetRealPackedValue();
-		ASSERT_EQ(a.size(), b.size());
+		// Compare on the difference of the ciphertexts. Decrypting adds Gaussian noise to every result (about the
+		// precision of the bootstrap), so two decryptions of the SAME ciphertext differ by far more than kViewTolerance.
+		auto outDiff = cc->EvalSub(outA, outB);
+		lbcrypto::Plaintext ptDiff;
+		cc->Decrypt(keys.secretKey, outDiff, &ptDiff);
 		double maxDiff = 0.0;
-		for (size_t i = 0; i < a.size(); ++i)
-			maxDiff = std::max(maxDiff, std::abs(a[i] - b[i]));
+		for (double v : ptDiff->GetRealPackedValue())
+			maxDiff = std::max(maxDiff, std::abs(v));
 		std::cout << "[shared-view] d=" << levelsToDrop << " level " << shared.getLevel() << " max |views - reencoded| " << maxDiff << std::endl;
 		EXPECT_LE(maxDiff, kViewTolerance);
 

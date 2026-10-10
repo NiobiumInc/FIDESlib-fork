@@ -18,34 +18,14 @@ OpenFHEBootstrapTests/OpenFHEBootstrapTest.LinearTransform/*
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/3
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/5
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/7
-# Dense bootstrap, the parameters that miss the bound by a small margin.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/0
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/2
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/4
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/5
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/6
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrapDense/7
 # Chebyshev evaluation with FIXEDAUTO scaling: error of 2.5e-7 where the other
 # parameters reach 5e-10. The GPU evaluation differs from OpenFHE's by about
 # 1e-4 after a full bootstrap, the same size as the bootstrap's own error
-# against the true plaintext, so this is a different evaluation order and not a
-# measured precision loss.
+# against the true plaintext, so it is not a measured precision loss; where the
+# difference comes from has not been found.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
 
 # Inherited from upstream: CPU and GPU results differ bit for bit.
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.MultAllLevels/1
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMult/1
 OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMultAllLevels/1
-
-# Brought in with Niobium's branches: they fail the same way on those branches
-# without the upstream merge.
-# Errors of 1.5e-5 to 5e-4 against the test's limit. These tests appear to
-# compare the GPU result against a fresh clone of the input (46 bits of
-# precision) while the GPU result went through a bootstrap, the reference
-# problem the OpenFHEBootstrapLT tests had before their reference became
-# EvalBootstrap; not yet confirmed for these.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.OpenFHEBootstrap/*
-# The 1e-6 tolerance is tighter than the bootstrap's own precision here
-# (observed 2e-5 to 5e-3).
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.SharedViewMatchesReducedSetSparse/*
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.SharedViewMatchesReducedSetDense/*
