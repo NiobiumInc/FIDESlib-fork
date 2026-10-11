@@ -5,16 +5,4 @@
 # A pull request that fixes one of these deletes its line in the same pull
 # request. One gtest filter pattern per line.
 
-# Each test below was run alone, one process per test, and fails alone too.
-# (Run together in one process, a failure in a fixture's SetUp could leave
-# OpenFHE's process-wide parameter estimate set and make later contexts fail
-# with "EstimateLogP() failure"; that is not the reason for any line here.)
-
-# Inherited from upstream (they fail on the base commit 0ec4055):
-# GPU bootstrap precision.
-# Chebyshev evaluation with FIXEDAUTO scaling: error of 2.5e-7 where the other
-# parameters reach 5e-10. The GPU evaluation differs from OpenFHE's by about
-# 1e-4 after a full bootstrap, the same size as the bootstrap's own error
-# against the true plaintext, so it is not a measured precision loss; where the
-# difference comes from has not been found.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
+# No test is listed at the moment.

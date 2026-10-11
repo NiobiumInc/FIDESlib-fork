@@ -81,6 +81,12 @@ constexpr double kAccumulateTolerance = 1e-9;
 // operations, so the results are not identical ciphertexts. The values are up to about 6.
 constexpr double kCoeffsToSlotsTolerance = 1e-12;
 
+// The modular reduction is a Chebyshev series and double-angle iterations, which square the relative error of the
+// series at each step. Under FIXEDMANUAL and FIXEDAUTO the results of the GPU and OpenFHE are the same ciphertext
+// and the difference is the rounding of its decryption. Under FLEXIBLEAUTOEXT they differ by about 4e-12 (at most
+// 7e-12 in 40 runs) for a result of about 0.15; where that difference comes from has not been looked for.
+constexpr double kApproxModEvalFlexibleTolerance = 5e-11;
+
 class OpenFHEInterfaceTest : public GeneralParametrizedTest {
 };
 
@@ -1841,6 +1847,225 @@ TEST_P(OpenFHEInterfaceTest, MultMixedDepth) {
 	}
 }
 
+// The true values of the four operands of the mixed-depth tests, for x1 and x2: a fresh x2, x1 * x2, x1 * x2 * x2 and
+// the same rescaled.
+static std::vector<std::vector<double>> MixedDepthOperandValues(const std::vector<double>& x1, const std::vector<double>& x2) {
+	std::vector<std::vector<double>> v(4, std::vector<double>(x1.size()));
+	for (size_t i = 0; i < x1.size(); ++i) {
+		v[0][i] = x2[i];
+		v[1][i] = x1[i] * x2[i];
+		v[2][i] = x1[i] * x2[i] * x2[i];
+		v[3][i] = v[2][i];
+	}
+	return v;
+}
+
+// Compares the GPU's result of one operation of the mixed-depth tests with OpenFHE's. Where OpenFHE's own result is
+// the true one, the residues must be identical. OpenFHE's adjustment of two depth-1 operands (or a depth-1 and a
+// depth-2 one that has to be level-reduced by more than one level) uses the table of depth-2 scaling factors, which
+// under FIXEDAUTO holds the factor itself, and returns the value divided by the scaling factor; no result of the GPU
+// can match that, and it must be the true value instead.
+static void ExpectMixedDepthResult(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ref,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& gpu,
+  const std::vector<double>& truth) {
+	constexpr double kValid = 1e-3;
+	const double refError   = ErrorAgainstPlaintext(cc, keys, ref, truth, ref->GetSlots());
+	if (refError < kValid) {
+		EXPECT_NO_FATAL_FAILURE([&] { ASSERT_EQ_CIPHERTEXT(ref, gpu); }());
+	} else {
+		const double gpuError = ErrorAgainstPlaintext(cc, keys, gpu, truth, gpu->GetSlots());
+		std::cout << "OpenFHE's result is " << refError << " from the true value here; the GPU's is " << gpuError << " from it" << std::endl;
+		EXPECT_LT(gpuError, kValid);
+	}
+}
+
+// A sum and a difference of ciphertexts at different depths and levels, in both orders. The operands are a fresh
+// ciphertext (depth 1), the product of two (depth 2, not rescaled), that product multiplied again (depth 2, one level
+// lower) and that one rescaled (depth 1, two levels lower than the fresh one). Under the automatic techniques OpenFHE
+// adjusts the operands with AdjustLevelsAndDepthInPlace before it adds or subtracts them, and the residues of the GPU
+// result must be the same. FIXEDMANUAL does not mix depths here, because it rescales after every product.
+TEST_P(OpenFHEInterfaceTest, AddSubMixedDepth) {
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	std::vector<double> x2 = { 4.0, 2.0, 1.3333333333, 1.0, 0.5, 0.3333333333, 0.25, 0.2 };
+	std::vector<double> x3 = { 0.0 };
+	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
+	lbcrypto::Plaintext ptxt3 = cc->MakeCKKSPackedPlaintext(x3);
+	auto c1					  = cc->Encrypt(keys.publicKey, ptxt1);
+	auto c2					  = cc->Encrypt(keys.publicKey, ptxt2);
+	auto c3					  = cc->Encrypt(keys.publicKey, ptxt3);
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context& cc_        = GPUcc;
+	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
+	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
+		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
+
+	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
+	FIDESlib::CKKS::Ciphertext GPUct1(cc_, raw1);
+	FIDESlib::CKKS::Ciphertext GPUct2(cc_, raw2);
+	FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
+	FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+	kskEval.Initialize(rawKskEval);
+	cc_->AddEvalKey(std::move(kskEval));
+
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> cpu;
+	std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> gpu;
+	std::vector<std::string> names = { "depth 1", "depth 2", "depth 2, one level lower", "depth 1, two levels lower" };
+	auto addGpu					   = [&](const FIDESlib::CKKS::Ciphertext& src) {
+		   gpu.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(cc_));
+		   gpu.back()->copy(src);
+	};
+	const auto values = MixedDepthOperandValues(x1, x2);
+	cpu.push_back(c2);
+	addGpu(GPUct2);
+	auto deep = cc->EvalMult(c1, c2);
+	cpu.push_back(deep);
+	FIDESlib::CKKS::Ciphertext GPUdeep(cc_);
+	GPUdeep.copy(GPUct1);
+	GPUdeep.mult(GPUct2, false);
+	addGpu(GPUdeep);
+	auto deeper = cc->EvalMult(deep, c2);
+	cpu.push_back(deeper);
+	FIDESlib::CKKS::Ciphertext GPUdeeper(cc_);
+	GPUdeeper.copy(GPUdeep);
+	GPUdeeper.mult(GPUct2, false);
+	addGpu(GPUdeeper);
+	auto settled = deeper->Clone();
+	cc->GetScheme()->ModReduceInternalInPlace(settled, lbcrypto::BASE_NUM_LEVELS_TO_DROP);
+	cpu.push_back(settled);
+	FIDESlib::CKKS::Ciphertext GPUsettled(cc_);
+	GPUsettled.copy(GPUdeeper);
+	GPUsettled.rescale();
+	addGpu(GPUsettled);
+
+	for (size_t a = 0; a < cpu.size(); ++a) {
+		for (size_t b = 0; b < cpu.size(); ++b) {
+			if (a == b)
+				continue;
+			for (const bool subtract : { false, true }) {
+				SCOPED_TRACE(std::string(subtract ? "subtract " : "add ") + names[a] + " and " + names[b]);
+				auto ref = subtract ? cc->EvalSub(cpu[a], cpu[b]) : cc->EvalAdd(cpu[a], cpu[b]);
+
+				FIDESlib::CKKS::Ciphertext GPUres(cc_);
+				GPUres.copy(*gpu[a]);
+				if (subtract)
+					GPUres.sub(*gpu[b]);
+				else
+					GPUres.add(*gpu[b]);
+
+				FIDESlib::CKKS::RawCipherText raw_res;
+				GPUres.store(raw_res);
+				auto cResGPU = c3->Clone();
+				GetOpenFHECipherText(cResGPU, raw_res);
+				std::vector<double> truth(x1.size());
+				for (size_t i = 0; i < truth.size(); ++i)
+					truth[i] = subtract ? values[a][i] - values[b][i] : values[a][i] + values[b][i];
+				ExpectMixedDepthResult(cc, keys, ref, cResGPU, truth);
+			}
+		}
+	}
+}
+
+// A product of ciphertexts at every pair of depths and levels, in both orders. The operands are a fresh ciphertext
+// (depth 1), the product of two (depth 2, not rescaled), that product multiplied again (depth 2, one level lower) and
+// that one rescaled (depth 1, two levels lower than the fresh one). Under the automatic techniques OpenFHE adjusts the
+// operands with AdjustLevelsAndDepthInPlace and rescales them before it multiplies, and the residues of the GPU result
+// must be the same. FIXEDMANUAL does not mix depths here, because it rescales after every product.
+TEST_P(OpenFHEInterfaceTest, MultEveryDepthPair) {
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	std::vector<double> x2 = { 4.0, 2.0, 1.3333333333, 1.0, 0.5, 0.3333333333, 0.25, 0.2 };
+	std::vector<double> x3 = { 0.0 };
+	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
+	lbcrypto::Plaintext ptxt3 = cc->MakeCKKSPackedPlaintext(x3);
+	auto c1					  = cc->Encrypt(keys.publicKey, ptxt1);
+	auto c2					  = cc->Encrypt(keys.publicKey, ptxt2);
+	auto c3					  = cc->Encrypt(keys.publicKey, ptxt3);
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context& cc_        = GPUcc;
+	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
+	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
+		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
+
+	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
+	FIDESlib::CKKS::Ciphertext GPUct1(cc_, raw1);
+	FIDESlib::CKKS::Ciphertext GPUct2(cc_, raw2);
+	FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
+	FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+	kskEval.Initialize(rawKskEval);
+	cc_->AddEvalKey(std::move(kskEval));
+
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> cpu;
+	std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> gpu;
+	std::vector<std::string> names = { "depth 1", "depth 2", "depth 2, one level lower", "depth 1, two levels lower" };
+	auto addGpu					   = [&](const FIDESlib::CKKS::Ciphertext& src) {
+		   gpu.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(cc_));
+		   gpu.back()->copy(src);
+	};
+	const auto values = MixedDepthOperandValues(x1, x2);
+	cpu.push_back(c2);
+	addGpu(GPUct2);
+	auto deep = cc->EvalMult(c1, c2);
+	cpu.push_back(deep);
+	FIDESlib::CKKS::Ciphertext GPUdeep(cc_);
+	GPUdeep.copy(GPUct1);
+	GPUdeep.mult(GPUct2, false);
+	addGpu(GPUdeep);
+	auto deeper = cc->EvalMult(deep, c2);
+	cpu.push_back(deeper);
+	FIDESlib::CKKS::Ciphertext GPUdeeper(cc_);
+	GPUdeeper.copy(GPUdeep);
+	GPUdeeper.mult(GPUct2, false);
+	addGpu(GPUdeeper);
+	auto settled = deeper->Clone();
+	cc->GetScheme()->ModReduceInternalInPlace(settled, lbcrypto::BASE_NUM_LEVELS_TO_DROP);
+	cpu.push_back(settled);
+	FIDESlib::CKKS::Ciphertext GPUsettled(cc_);
+	GPUsettled.copy(GPUdeeper);
+	GPUsettled.rescale();
+	addGpu(GPUsettled);
+
+	for (size_t a = 0; a < cpu.size(); ++a) {
+		for (size_t b = 0; b < cpu.size(); ++b) {
+			if (a == b)
+				continue;
+			SCOPED_TRACE(names[a] + " times " + names[b]);
+			auto ref = cc->EvalMult(cpu[a], cpu[b]);
+
+			FIDESlib::CKKS::Ciphertext GPUres(cc_);
+			GPUres.copy(*gpu[a]);
+			GPUres.mult(*gpu[b], false);
+
+			FIDESlib::CKKS::RawCipherText raw_res;
+			GPUres.store(raw_res);
+			auto cResGPU = c3->Clone();
+			GetOpenFHECipherText(cResGPU, raw_res);
+			std::vector<double> truth(x1.size());
+			for (size_t i = 0; i < truth.size(); ++i)
+				truth[i] = values[a][i] * values[b][i];
+			ExpectMixedDepthResult(cc, keys, ref, cResGPU, truth);
+		}
+	}
+}
+
 TEST_P(OpenFHEInterfaceTest, RotateAllLevels) {
 	// Enable the features that you wish to use
 	cc->Enable(lbcrypto::PKE);
@@ -3020,12 +3245,16 @@ TEST_P(OpenFHEBootstrapTest, ApproxModEvalSparse) {
 
 				auto cResGPU = c2->Clone();
 				GetOpenFHECipherText(cResGPU, raw_res1);
-				lbcrypto::Plaintext resultGPU;
-				cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-				std::cout << "Result GPU after ApproxModEval" << resultGPU;
 				CudaCheckErrorMod;
-				ASSERT_ERROR_OK(result, resultGPU);
-				// ASSERT_EQ_CIPHERTEXT(ctxtEnc, cResGPU);
+				ASSERT_EQ(cResGPU->GetLevel(), ctxtEnc->GetLevel());
+				ASSERT_EQ(cResGPU->GetNoiseScaleDeg(), ctxtEnc->GetNoiseScaleDeg());
+				ASSERT_EQ(cResGPU->GetScalingFactor(), ctxtEnc->GetScalingFactor());
+				const auto technique = cryptoParams->GetScalingTechnique();
+				const bool flexible	 = technique == lbcrypto::FLEXIBLEAUTO || technique == lbcrypto::FLEXIBLEAUTOEXT;
+				ASSERT_NO_FATAL_FAILURE(
+				  ExpectDecryptedDifferenceBelow(cc, keys, ctxtEnc, cResGPU, flexible ? kApproxModEvalFlexibleTolerance : kIdenticalCiphertextTolerance));
+				if (!flexible)
+					ASSERT_EQ_CIPHERTEXT(ctxtEnc, cResGPU);
 			}
 
 			CudaCheckErrorMod;
