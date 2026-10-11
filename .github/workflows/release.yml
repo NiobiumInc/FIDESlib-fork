@@ -14,8 +14,12 @@
 # are set, which is how the hardware legs are exercised on an FPGA host instead.
 #
 # Pull requests and pushes to nb_main that touch the paths below build and consume the
-# packages. Publishing is manual for now: run this workflow with `publish` on, and it
-# releases the packages tagged v<date>-<sha7> at the commit it ran on.
+# packages; they never publish. A nightly run publishes nb_main at most once a day, and
+# only when something new reached the packages since the last release (see the version
+# job). Running this workflow by hand with `publish` on releases at once. Either way the
+# release is tagged v<date>-<sha7> at the commit it ran on. Before a release builds
+# anything, it runs the CPU and GPU test workflows (ci.yml, gpu-tests.yml) on that same
+# commit, every test in them, and nothing is built unless both pass.
 #
 # Every job writes what it did to the run's summary, and the final `report` job adds one
 # table of all of them, so a failure shows where to look without opening each log.
@@ -44,6 +48,13 @@ on:
       - 'deps/**'
       - 'packaging/**'
       - '.github/workflows/release.yml'
+  # Nightly, at midnight US Pacific time. Cron runs in UTC with no daylight saving time,
+  # so both candidate hours trigger: 07:00 UTC is midnight in daylight time, 08:00 UTC in
+  # standard time. The version job stops the one that comes before midnight in
+  # America/Los_Angeles, and its one-release-a-day check stops the other one after a
+  # release.
+  schedule:
+    - cron: '0 7,8 * * *'
   workflow_dispatch:
     inputs:
       publish:
@@ -66,10 +77,14 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       matrix: ${{ steps.v.outputs.matrix }}
+      run: ${{ steps.new.outputs.run }}
+      reason: ${{ steps.new.outputs.reason }}
     steps:
       - id: v
         env:
@@ -97,8 +112,86 @@ jobs:
             echo "matrix={\"include\":$(jq -c . <<< "$legs")}"
           } >> "$GITHUB_OUTPUT"
 
-  build:
+      # The nightly runs at midnight US Pacific time (see the schedule trigger) and
+      # publishes only what is new: nothing when a release with today's date
+      # already exists (a manual one, say), and nothing when no file the packages are built
+      # from changed since the last release. Those are the paths that trigger a package
+      # build on a push, plus src/ when the CUDA packages are built, since only they
+      # compile it. Every other event builds as before.
+      - id: new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ steps.v.outputs.version }}
+          RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
+        run: |
+          run=true
+          reason=""
+          # Before midnight in US Pacific time the Pacific date is still the day before; a
+          # trigger GitHub runs late still counts, and the date check below stops a second one.
+          if [ "$EVENT" = schedule ] && [ "$(TZ=America/Los_Angeles date +%F)" != "$(date -u +%F)" ]; then
+            run=false
+            reason="it is not midnight in US Pacific time yet; the next trigger is"
+          elif [ "$EVENT" = schedule ]; then
+            if gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
+              grep -q "^v$VERSION-"; then
+              run=false
+              reason="a release for $VERSION already exists"
+            else
+              last=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --exclude-drafts --exclude-pre-releases \
+                --json tagName --jq '.[0].tagName // empty')
+              if [ -n "$last" ]; then
+                paths='^(CMakeLists\.txt|cmake/|api/|deps/|packaging/|\.github/workflows/release\.yml)'
+                if [ "${RELEASE_CUDA:-true}" != false ]; then
+                  paths='^(CMakeLists\.txt|cmake/|api/|deps/|packaging/|src/|\.github/workflows/release\.yml)'
+                fi
+                # The compare API lists at most 300 files; a list that long counts as changed.
+                files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$last...$GITHUB_SHA" --jq '.files[].filename')
+                if [ "$(printf '%s\n' "$files" | grep -c .)" -lt 300 ] && ! printf '%s\n' "$files" | grep -qE "$paths"; then
+                  run=false
+                  reason="nothing the packages are built from changed since $last"
+                fi
+              fi
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          if [ "$run" = false ]; then
+            echo "**Nothing to publish.** ${reason^}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # The whole CPU and GPU test workflows on the commit about to be released, every test in
+  # them: the nightly and every manual run, with publish on or off, so a manual run without
+  # publish rehearses the whole path. Pushes and pull requests get these checks from the two
+  # workflows directly, so here they skip them.
+  cpu-tests:
     needs: version
+    if: >-
+      needs.version.outputs.run == 'true' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+
+  gpu-tests:
+    needs: version
+    if: >-
+      needs.version.outputs.run == 'true' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/gpu-tests.yml
+
+  build:
+    needs: [version, cpu-tests, gpu-tests]
+    # Nothing is built for a release whose tests did not pass. Skipped tests are the pushes
+    # and pull requests, tested by their own runs of the two workflows.
+    if: >-
+      !cancelled() && needs.version.outputs.run == 'true' &&
+      contains(fromJSON('["success", "skipped"]'), needs.cpu-tests.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.gpu-tests.result)
     name: build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) and ships gcc-toolset-14 -- the
@@ -343,9 +436,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   release:
-    needs: [build, consume, version]
-    # Manual for now: pushes to nb_main and pull requests never publish.
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [cpu-tests, gpu-tests, build, consume, version]
+    # The nightly, when the version job found something new, or a manual run with publish
+    # on. Pushes to nb_main and pull requests never publish.
+    if: >-
+      needs.version.outputs.run == 'true' &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -427,7 +523,7 @@ jobs:
   # the CUDA packages were built, whether the run published, and the packages it built.
   # It runs even when a build or a consumer failed, which is when it matters most.
   report:
-    needs: [version, build, consume, release]
+    needs: [version, cpu-tests, gpu-tests, build, consume, release]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
@@ -446,6 +542,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_CUDA: ${{ vars.FIDESLIB_RELEASE_CUDA }}
           RELEASE_RESULT: ${{ needs.release.result }}
+          CPU_TESTS: ${{ needs.cpu-tests.result }}
+          GPU_TESTS: ${{ needs.gpu-tests.result }}
+          NOTHING_NEW: ${{ needs.version.outputs.reason }}
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -465,7 +564,17 @@ jobs:
             fi
             case "$RELEASE_RESULT" in
               success) echo "- Published: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" ;;
-              skipped) echo "- Not published: publishing is manual (run this workflow with publish on)." ;;
+              skipped)
+                if [ -n "$NOTHING_NEW" ]; then
+                  echo "- Not published: $NOTHING_NEW."
+                elif { [ "$CPU_TESTS" != success ] && [ "$CPU_TESTS" != skipped ]; } ||
+                  { [ "$GPU_TESTS" != success ] && [ "$GPU_TESTS" != skipped ]; }; then
+                  echo "- Not published: the tests did not pass on this commit (CPU: $CPU_TESTS, GPU: $GPU_TESTS), so nothing was built."
+                elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+                  echo "- Not published: run with publish off."
+                else
+                  echo "- Not published: pushes and pull requests never publish; the nightly does."
+                fi ;;
               *) echo "- Publishing: $(mark "$RELEASE_RESULT") $RELEASE_RESULT" ;;
             esac
             echo

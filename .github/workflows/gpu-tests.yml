@@ -23,6 +23,13 @@ on:
         description: Also run the known failures, as a report that never fails the check
         type: boolean
         default: false
+  # The release workflow runs the whole suite on the commit it is about to release.
+  workflow_call:
+    inputs:
+      known_failures:
+        description: Also run the known failures, as a report that never fails the check
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +37,9 @@ permissions:
 concurrency:
   # Each push to nb_main gets its own run. Cancelling one for the next would
   # leave a merge that changed code untested when the next merge changes none.
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # In a run called from the release workflow, github.workflow names the caller: the gpu-
+  # prefix keeps that run out of the release's own concurrency group.
+  group: gpu-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
