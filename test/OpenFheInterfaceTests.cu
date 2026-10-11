@@ -77,6 +77,10 @@ constexpr double kIdenticalCiphertextTolerance = 1e-12;
 // The GPU accumulates in a different order than OpenFHE's chain of rotations, so the two results are not identical.
 constexpr double kAccumulateTolerance = 1e-9;
 
+// The GPU's coefficients-to-slots runs the same transform as OpenFHE's in a different order of floating-point
+// operations, so the results are not identical ciphertexts. The values are up to about 6.
+constexpr double kCoeffsToSlotsTolerance = 1e-12;
+
 class OpenFHEInterfaceTest : public GeneralParametrizedTest {
 };
 
@@ -3189,7 +3193,7 @@ TEST_P(OpenFHEBootstrapTest, CoeffsToSlots) {
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 		CudaCheckErrorMod;
-		ASSERT_ERROR_OK(result, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, raised, cResGPU, kIdenticalCiphertextTolerance));
 		ASSERT_EQ_CIPHERTEXT(raised, cResGPU);
 	}
 	/*
@@ -3250,6 +3254,12 @@ TEST_P(OpenFHEBootstrapTest, CoeffsToSlots) {
 
 		CudaCheckErrorMod;
 		FIDESlib::CKKS::EvalCoeffsToSlots(GPUct1, slots, false);
+		// The reference above was rescaled by RescaleInPlace, which only acts under FIXEDMANUAL (the automatic
+		// techniques rescale on their own). The GPU's transform leaves the rescale to its caller, as Bootstrap
+		// does, so do it here: compared unrescaled, the two results differ by the ratio of the rescaling prime to
+		// the scaling factor, about 1e-11 of the value, which is not an error of either.
+		if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
+			GPUct1.rescale();
 
 		CudaCheckErrorMod;
 		{
@@ -3264,11 +3274,11 @@ TEST_P(OpenFHEBootstrapTest, CoeffsToSlots) {
 				cc->EvalAddInPlace(cResGPU, conj);
 			}
 
-			lbcrypto::Plaintext resultGPU;
-			cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-			std::cout << "Result GPU after LT" << resultGPU;
 			CudaCheckErrorMod;
-			ASSERT_ERROR_OK(result, resultGPU);
+			ASSERT_EQ(cResGPU->GetLevel(), ctxtEnc->GetLevel());
+			ASSERT_EQ(cResGPU->GetNoiseScaleDeg(), ctxtEnc->GetNoiseScaleDeg());
+			ASSERT_EQ(cResGPU->GetScalingFactor(), ctxtEnc->GetScalingFactor());
+			ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, ctxtEnc, cResGPU, kCoeffsToSlotsTolerance));
 		}
 
 		CudaCheckErrorMod;
