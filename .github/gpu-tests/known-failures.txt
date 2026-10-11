@@ -12,8 +12,6 @@
 
 # Inherited from upstream (they fail on the base commit 0ec4055):
 # GPU bootstrap precision.
-# Linear transform: error of about 2.6 against OpenFHE.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.LinearTransform/*
 # Coefficients to slots, parameters 3, 5 and 7: error of about 5e-11.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/3
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/5

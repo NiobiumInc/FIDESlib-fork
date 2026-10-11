@@ -3022,7 +3022,7 @@ TEST_P(OpenFHEBootstrapTest, LinearTransform) {
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 		CudaCheckErrorMod;
-		ASSERT_ERROR_OK(result, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, raised, cResGPU, kIdenticalCiphertextTolerance));
 		ASSERT_EQ_CIPHERTEXT(raised, cResGPU);
 	}
 	/*
@@ -3104,11 +3104,14 @@ TEST_P(OpenFHEBootstrapTest, LinearTransform) {
 				cc->ModReduceInPlace(ctxtEnc);
 			}
 */
-			lbcrypto::Plaintext resultGPU;
-			cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-			std::cout << "Result GPU after LT" << resultGPU;
-			CudaCheckErrorMod;
-			ASSERT_ERROR_OK(result, resultGPU);
+			// The GPU's transform leaves the ciphertext at twice the slot count: its plaintexts are encoded
+			// for 2 * slots, as the bootstrap's conjugate step needs, and a product takes the larger slot count
+			// of its operands. OpenFHE's keeps the input's. The residues are the same, but decoding them at a
+			// different slot count gives different numbers, so give the result back the slot count of the
+			// input, as Bootstrap does when it finishes.
+			ASSERT_EQ(cResGPU->GetSlots(), 2 * static_cast<uint32_t>(slots));
+			cResGPU->SetSlots(ctxtEnc->GetSlots());
+			ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, ctxtEnc, cResGPU, kIdenticalCiphertextTolerance));
 			ASSERT_EQ_CIPHERTEXT(ctxtEnc, cResGPU);
 		}
 
