@@ -28,6 +28,55 @@
 #include "CKKS/openfhe-interface/ParameterSwitch.cuh"
 
 namespace FIDESlib::Testing {
+
+// Maximum of |decrypted values| of a ciphertext. Used on a DIFFERENCE of two ciphertexts, or of a ciphertext and the
+// true plaintext, where decrypting adds only the (tiny) noise of the difference itself.
+static double MaxDecrypted(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct) {
+	lbcrypto::Plaintext pt;
+	cc->Decrypt(keys.secretKey, ct, &pt);
+	double m = 0.0;
+	for (double v : pt->GetRealPackedValue())
+		m = std::max(m, std::abs(v));
+	return m;
+}
+
+// Error of a ciphertext against the true plaintext x (the slots past x are zero), measured on the decrypted
+// difference.
+static double ErrorAgainstPlaintext(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct,
+  const std::vector<double>& x,
+  const int slots) {
+	std::vector<double> truth(slots, 0.0);
+	std::copy(x.begin(), x.end(), truth.begin());
+	auto truthPt = cc->MakeCKKSPackedPlaintext(truth, ct->GetNoiseScaleDeg(), ct->GetLevel(), nullptr, slots);
+	return MaxDecrypted(cc, keys, cc->EvalSub(ct, truthPt));
+}
+
+// Two ciphertexts of ONE operation, OpenFHE's and the GPU's, compared on the decrypted difference. Decrypting adds
+// Gaussian noise to every result (OpenFHE's CKKSPackedEncoding::Decode) whose size follows the precision OpenFHE
+// estimates for it in that run, and OpenFHE seeds its generator randomly on every run. Two decryptions of the same
+// result therefore differ by that noise, which is a different amount every run, and a comparison of decrypted values
+// can fail on a correct result. The difference of the ciphertexts decrypts with only the noise of the difference.
+static void ExpectDecryptedDifferenceBelow(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& cRef,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& cGPU,
+  const double bound) {
+	const double diffMax = MaxDecrypted(cc, keys, cc->EvalSub(cRef, cGPU));
+	std::cout << "GPU - OpenFHE: max " << diffMax << " (limit " << bound << ")" << std::endl;
+	ASSERT_LE(diffMax, bound);
+}
+
+// For results the tests have already asserted to be identical ciphertexts: the difference is a zero ciphertext and
+// decrypts to the rounding of that.
+constexpr double kIdenticalCiphertextTolerance = 1e-12;
+
+// The GPU accumulates in a different order than OpenFHE's chain of rotations, so the two results are not identical.
+constexpr double kAccumulateTolerance = 1e-9;
+
 class OpenFHEInterfaceTest : public GeneralParametrizedTest {
 };
 
@@ -1321,7 +1370,7 @@ TEST_P(OpenFHEInterfaceTest, Rotate) {
 	ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
 
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-	ASSERT_ERROR_OK(result, resultGPU)
+	ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cAdd, cResGPU, kIdenticalCiphertextTolerance));
 
 	std::cout << "Result GPU " << resultGPU;
 
@@ -1391,7 +1440,7 @@ TEST_P(OpenFHEInterfaceTest, Conjugate) {
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
 
-		ASSERT_ERROR_OK(result, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, conj, cResGPU, kIdenticalCiphertextTolerance));
 
 		CudaCheckErrorMod;
 	}
@@ -1499,7 +1548,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r1, &result);
-	ASSERT_ERROR_OK(resultGPU, result)
+	ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r1, cResGPU, kIdenticalCiphertextTolerance));
 
 	GPUr2.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
@@ -1507,7 +1556,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r2, &result);
-	ASSERT_ERROR_OK(resultGPU, result)
+	ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r2, cResGPU, kIdenticalCiphertextTolerance));
 
 	GPUr3.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
@@ -1515,7 +1564,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r3, &result);
-	ASSERT_ERROR_OK(resultGPU, result)
+	ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r3, cResGPU, kIdenticalCiphertextTolerance));
 
 	GPUr4.store(raw_res1);
 	GetOpenFHECipherText(cResGPU, raw_res1);
@@ -1523,7 +1572,7 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotate) {
 	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 	std::cout << "Result GPU " << resultGPU;
 	cc->Decrypt(keys.secretKey, cpu_r4, &result);
-	ASSERT_ERROR_OK(resultGPU, result)
+	ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r4, cResGPU, kIdenticalCiphertextTolerance));
 
 	CudaCheckErrorMod;
 }
@@ -1763,7 +1812,7 @@ TEST_P(OpenFHEInterfaceTest, RotateAllLevels) {
 		ASSERT_EQ_CIPHERTEXT(cAdd, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 
-		ASSERT_ERROR_OK(result, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cAdd, cResGPU, kIdenticalCiphertextTolerance));
 
 		std::cout << "Result GPU " << resultGPU;
 	}
@@ -1927,28 +1976,28 @@ TEST_P(OpenFHEInterfaceTest, HoistedRotateAllLevels) {
 
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
-		ASSERT_ERROR_OK(result1, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r1, cResGPU, kIdenticalCiphertextTolerance));
 
 		GPUr2.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		ASSERT_EQ_CIPHERTEXT(cpu_r2, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
-		ASSERT_ERROR_OK(result2, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r2, cResGPU, kIdenticalCiphertextTolerance));
 
 		GPUr3.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		ASSERT_EQ_CIPHERTEXT(cpu_r3, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
-		ASSERT_ERROR_OK(result3, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r3, cResGPU, kIdenticalCiphertextTolerance));
 
 		GPUr4.store(raw_res1);
 		GetOpenFHECipherText(cResGPU, raw_res1);
 		ASSERT_EQ_CIPHERTEXT(cpu_r4, cResGPU);
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
-		ASSERT_ERROR_OK(result4, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r4, cResGPU, kIdenticalCiphertextTolerance));
 
 		CudaCheckErrorMod;
 	}
@@ -2022,7 +2071,7 @@ TEST_P(OpenFHEInterfaceTest, AccumAllLevels) {
 
 		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
 		std::cout << "Result GPU " << resultGPU;
-		ASSERT_ERROR_OK(result1, resultGPU);
+		ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, cpu_r1, cResGPU, kAccumulateTolerance));
 
 		CudaCheckErrorMod;
 	}
@@ -2312,32 +2361,6 @@ INSTANTIATE_TEST_SUITE_P(OpenFHEInterfaceTests, OpenFHEInterfaceTest, testing::V
 
 class OpenFHEBootstrapTest : public GeneralParametrizedTest {
 };
-
-// Maximum of |decrypted values| of a ciphertext. Used on a DIFFERENCE of two ciphertexts, or of a ciphertext and the
-// true plaintext, where decrypting adds only the (tiny) noise of the difference itself.
-static double MaxDecrypted(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
-  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
-  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct) {
-	lbcrypto::Plaintext pt;
-	cc->Decrypt(keys.secretKey, ct, &pt);
-	double m = 0.0;
-	for (double v : pt->GetRealPackedValue())
-		m = std::max(m, std::abs(v));
-	return m;
-}
-
-// Error of a ciphertext against the true plaintext x (the slots past x are zero), measured on the decrypted
-// difference.
-static double ErrorAgainstPlaintext(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
-  const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
-  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct,
-  const std::vector<double>& x,
-  const int slots) {
-	std::vector<double> truth(slots, 0.0);
-	std::copy(x.begin(), x.end(), truth.begin());
-	auto truthPt = cc->MakeCKKSPackedPlaintext(truth, ct->GetNoiseScaleDeg(), ct->GetLevel(), nullptr, slots);
-	return MaxDecrypted(cc, keys, cc->EvalSub(ct, truthPt));
-}
 
 // Compares the GPU's result of a bootstrap (loaded into cGPU, a clone of OpenFHE's own result) with OpenFHE's result
 // of the same operation, cRef. refPlain and gpuPlain are their decryptions, x the plaintext that was bootstrapped.
