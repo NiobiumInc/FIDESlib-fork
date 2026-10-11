@@ -100,6 +100,9 @@ class DeviceEncodeTest : public testing::Test {
 		params.SetBatchSize(kSlots);
 		params.SetRingDim(kRingDim);
 		params.SetScalingTechnique(fideslib::FLEXIBLEAUTO);
+		// Ring dimension 8192 at this depth is below the 128-bit security table, so OpenFHE's default
+		// level rejects it. The test checks encoding, not security.
+		params.SetSecurityLevel(fideslib::HEStd_NotSet);
 		params.SetBackend(fideslib::Backend::CUDA);
 		params.SetReducedNoise(fideslib::LinkedOpenFheReducedNoise()); // matches the oracle's variant
 
