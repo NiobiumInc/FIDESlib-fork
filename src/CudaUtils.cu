@@ -1611,6 +1611,14 @@ namespace {
 /// @brief One device's free lists for ONE stream. Never destroyed: streams come from a
 /// process-lifetime pool (initPool below), and tearing an event down at exit runs straight into the
 /// cudaErrorCudartUnloading problem this file already documents.
+///
+/// CONTRACT for callers of GPUmalloc / GPUfree while the per-stream pool is on: a stream handed to
+/// the pool must stay valid until the process exits. The registry is keyed by the stream handle and
+/// never removes an entry, so destroying a stream leaves its entry, and the free blocks on it, in
+/// place; a later handoff then records the handoff event on the destroyed handle. The library meets
+/// this because every stream it uses comes from initPool and is only borrowed by Stream objects.
+/// Code that creates and destroys its own streams (tests included) must create them once and keep
+/// them, or not use the pool with them.
 struct StreamPool {
 	std::mutex lock;						  ///< Guards `by_size` and `ev`'s creation.
 	cudaStream_t stream = nullptr;

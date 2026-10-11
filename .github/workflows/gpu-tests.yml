@@ -244,6 +244,22 @@ jobs:
             --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
             --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
 
+      # The pool stress suite again with the per-stream device memory pool, which is opt-in
+      # (FIDESLIB_POOL_PER_STREAM=1, read once at the first allocation) and so never runs in the
+      # passes above. The suite's tests share one process, three times over, with no retry: a
+      # failure that depends on what an earlier test left in the pool shows only that way. It runs
+      # even when an earlier pass failed, so every result is reported.
+      - name: Test the per-stream memory pool
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_POOL_PER_STREAM: '1'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pool-per-stream \
+            --only 'PoolStressTest.*' \
+            --title 'GPU test suite, per-stream memory pool' --repeat 3 --retries 0
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
