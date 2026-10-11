@@ -736,14 +736,14 @@ class Ciphertext {
 	bool adjustBeforeMult(const Ciphertext& b);
 
 	/**
-	 * @brief FIXEDAUTO only: the operand adjustment OpenFHE makes for a depth-2 and a depth-1
-	 *        ciphertext when the depth-2 one has no more limbs than the other, which
-	 *        adjustBeforeMult() does not make.
+	 * @brief FIXEDAUTO only: the operand adjustment OpenFHE makes before a ciphertext product when
+	 *        the operands differ in depth or level (AdjustLevelsAndDepthToOneInPlace).
 	 *
-	 * OpenFHE raises the depth-1 operand to depth 2 with a product by 1.0, level-reduces it onto the
-	 * depth-2 operand if it has more limbs, and rescales both (AdjustLevelsAndDepthInPlace).
-	 * adjustBeforeMult() rescales the depth-2 operand and multiplies by the other as it is, which is
-	 * equally valid but about 1e-11 of the result less exact and differs in the residues.
+	 * Both operands are brought to one level and one depth, changing whichever has to change, and
+	 * both are rescaled when that depth is 2. adjustBeforeMult() rescales the depth-2 operand first
+	 * and adjusts the other afterwards, which is equally valid but about 1e-11 of the result less
+	 * exact, differs in the residues, and for FIXEDAUTO's constant scaling factors is not the order
+	 * the rest of the evaluation assumes.
 	 *
 	 * @param b The other multiplicand.
 	 * @param b_ Receives the adjusted copy of `b` when the case applies.

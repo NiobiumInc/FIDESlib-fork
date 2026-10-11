@@ -622,30 +622,21 @@ void Ciphertext::foldKeySwitched(RNSPoly& d2, const KeySwitchingKey& kskEval, co
 }
 
 bool Ciphertext::raiseAndRescaleForMult(const Ciphertext& b, Ciphertext& b_) {
-	if (cc.rescaleTechnique != FIXEDAUTO || this == &b || NoiseLevel == b.NoiseLevel || NoiseLevel > 2 || b.NoiseLevel > 2 || c0.isModUp() || c1.isModUp() ||
-	  b.c0.isModUp() || b.c1.isModUp() || c2.has_value() || b.c2.has_value())
+	if (cc.rescaleTechnique != FIXEDAUTO || this == &b || (NoiseLevel == b.NoiseLevel && getLevel() == b.getLevel()) || NoiseLevel > 2 || b.NoiseLevel > 2 ||
+	  c0.isModUp() || c1.isModUp() || b.c0.isModUp() || b.c1.isModUp() || c2.has_value() || b.c2.has_value())
 		return false;
 	assert(keyID == b.keyID);
-	// The depth-2 operand and the depth-1 operand. When the depth-2 operand has MORE limbs than the
-	// other, OpenFHE rescales it on its own and this case does not apply.
-	const bool this_is_deep	  = NoiseLevel == 2;
-	const Ciphertext& deep	  = this_is_deep ? *this : b;
-	const int deep_level	  = deep.getLevel();
-	const double deep_factor  = deep.NoiseFactor;
-	const Ciphertext& shallow = this_is_deep ? b : *this;
-	if (deep_level > shallow.getLevel())
-		return false;
-
+	// OpenFHE's AdjustLevelsAndDepthToOneInPlace: bring both operands to one level and one depth
+	// (AdjustLevelsAndDepthInPlace changes whichever operand has to change), then rescale both when
+	// that depth is 2. adjustForAddOrSub changes *this when it can and says so, and the other operand
+	// otherwise.
 	b_.copy(b);
-	Ciphertext& raised = this_is_deep ? b_ : *this;
-	raised.multScalar(1.0, false);
-	if (raised.getLevel() > deep_level) {
-		// OpenFHE's level reduction after the raise, and it sets the scaling factor to the deep operand's.
-		raised.dropToLevel(deep_level, true);
-		raised.NoiseFactor = deep_factor;
-	}
-	this->rescale();
-	b_.rescale();
+	if (!this->adjustForAddOrSub(b_))
+		b_.adjustForAddOrSub(*this);
+	if (NoiseLevel == 2)
+		this->rescale();
+	if (b_.NoiseLevel == 2)
+		b_.rescale();
 	return true;
 }
 
@@ -672,7 +663,7 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 	CKKS::SetCurrentContext(cc_);
 	requireDegree1("mult");
 	b.requireDegree1("mult (second operand)");
-	if (cc.rescaleTechnique == FIXEDAUTO && NoiseLevel != b.NoiseLevel) {
+	if (cc.rescaleTechnique == FIXEDAUTO && (NoiseLevel != b.NoiseLevel || getLevel() != b.getLevel())) {
 		Ciphertext b_(cc_);
 		if (raiseAndRescaleForMult(b, b_)) {
 			mult(b_, rescale, moddown);
@@ -882,7 +873,7 @@ void Ciphertext::multNoRelin(const Ciphertext& b) {
 	CKKS::SetCurrentContext(cc_);
 	requireDegree1("multNoRelin");
 	b.requireDegree1("multNoRelin (second operand)");
-	if (cc.rescaleTechnique == FIXEDAUTO && NoiseLevel != b.NoiseLevel) {
+	if (cc.rescaleTechnique == FIXEDAUTO && (NoiseLevel != b.NoiseLevel || getLevel() != b.getLevel())) {
 		Ciphertext b_(cc_);
 		if (raiseAndRescaleForMult(b, b_)) {
 			multNoRelin(b_);
@@ -1924,11 +1915,18 @@ void Ciphertext::sub(const Ciphertext& ciphertext, const Ciphertext& ciphertext1
 }
 
 bool Ciphertext::adjustScaleAndLevel(const int scaleDegree, const int level, const double scaling_factor) {
-	assert(scaleDegree == 2 ? std::abs(cc.param.ScalingFactorReal[level - 1] * cc.param.ModReduceFactor[level] - cc.param.ScalingFactorRealBig[level]) /
-		(cc.param.ScalingFactorReal[level - 1] * cc.param.ModReduceFactor[level] + cc.param.ScalingFactorRealBig[level]) <
+	// The scaling factor of a depth-2 ciphertext at a level. OpenFHE's table holds the square of the level's factor
+	// under the FLEXIBLE techniques, but under FIXEDAUTO it holds the factor itself (every level has the same one),
+	// which makes the adjustment factors below come out as 1/factor and the adjusted operand as its value divided by
+	// the scaling factor. The square is what the formulas mean.
+	auto bigFactor = [&](size_t i) {
+		return cc.rescaleTechnique == FIXEDAUTO ? cc.param.ScalingFactorReal[i] * cc.param.ScalingFactorReal[i] : cc.param.ScalingFactorRealBig[i];
+	};
+	assert(scaleDegree == 2 ? std::abs(cc.param.ScalingFactorReal[level - 1] * cc.param.ModReduceFactor[level] - bigFactor(level)) /
+		(cc.param.ScalingFactorReal[level - 1] * cc.param.ModReduceFactor[level] + bigFactor(level)) <
 		1e-11 :
 		true);
-	assert(scaleDegree < 3 ? scaling_factor == (scaleDegree == 1 ? cc.param.ScalingFactorReal[level] : (cc.param.ScalingFactorRealBig[level])) : true);
+	assert(scaleDegree < 3 ? scaling_factor == (scaleDegree == 1 ? cc.param.ScalingFactorReal[level] : (bigFactor(level))) : true);
 
 	uint32_t c1lvl   = getLevel();
 	uint32_t c2lvl   = level;
@@ -1948,7 +1946,7 @@ bool Ciphertext::adjustScaleAndLevel(const int scaleDegree, const int level, con
 				double scf  = cc.param.ScalingFactorReal[c1lvl]; // cryptoParams->GetScalingFactorReal(c1lvl);
 				double q1   = cc.param.ModReduceFactor[c1lvl];   // cryptoParams->GetModReduceFactor(sizeQl1 - 1);
 				multScalarNoPrecheck(scf2 / scf1 * q1 / scf);
-				NoiseFactor = cc.param.ScalingFactorRealBig[getLevel() - 1] * cc.param.ModReduceFactor[getLevel()];
+				NoiseFactor = bigFactor(getLevel() - 1) * cc.param.ModReduceFactor[getLevel()];
 				rescale();
 				if (getLevel() > static_cast<int32_t>(c2lvl)) {
 					this->dropToLevel(c2lvl, true);
@@ -1959,17 +1957,17 @@ bool Ciphertext::adjustScaleAndLevel(const int scaleDegree, const int level, con
 					rescale();
 				} else {
 					double scf1 = NoiseFactor;
-					double scf2 = cc.param.ScalingFactorRealBig[c2lvl + 1]; // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
+					double scf2 = bigFactor(c2lvl + 1); // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
 					double scf  = cc.param.ScalingFactorReal[c1lvl];        // cryptoParams->GetScalingFactorReal(c1lvl);
 					double q1   = cc.param.ModReduceFactor[sizeQl1 - 1];    // cryptoParams->GetModReduceFactor(sizeQl1 - 1);
 					multScalarNoPrecheck(scf2 / scf1 * q1 / scf);
-					NoiseFactor = cc.param.ScalingFactorRealBig[this->getLevel() - 1] * cc.param.ModReduceFactor[c1lvl];
+					NoiseFactor = bigFactor(this->getLevel() - 1) * cc.param.ModReduceFactor[c1lvl];
 					rescale();
 					if (getLevel() - 1 > static_cast<int32_t>(c2lvl)) {
 						this->dropToLevel(c2lvl + 1, true);
 						// LevelReduceInternalInPlace(ciphertext1, c2lvl - c1lvl - 2);
 					}
-					NoiseFactor = cc.param.ScalingFactorRealBig[this->getLevel()];
+					NoiseFactor = bigFactor(this->getLevel());
 					// NoiseFactor *= scf2 / scf1 * q1 / scf;
 					rescale();
 					// assert(std::abs((NoiseFactor * scf2 / scf1 * q1 / scf - scaling_factor) / scaling_factor) < 0.001);
@@ -1989,7 +1987,7 @@ bool Ciphertext::adjustScaleAndLevel(const int scaleDegree, const int level, con
 				NoiseFactor = scf2;
 			} else {
 				double scf1 = NoiseFactor;
-				double scf2 = cc.param.ScalingFactorRealBig[c2lvl + 1]; // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
+				double scf2 = bigFactor(c2lvl + 1); // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
 				double scf  = cc.param.ScalingFactorReal[c1lvl];        // cryptoParams->GetScalingFactorReal(c1lvl);
 				multScalarNoPrecheck(scf2 / scf1 / scf);
 				if (c1lvl - 1 > c2lvl) {
@@ -2002,7 +2000,7 @@ bool Ciphertext::adjustScaleAndLevel(const int scaleDegree, const int level, con
 				NoiseFactor = scaling_factor;
 			}
 		}
-		assert(scaleDegree < 3 ? this->NoiseFactor == (NoiseLevel == 1 ? cc.param.ScalingFactorReal[level] : (cc.param.ScalingFactorRealBig[level])) : true);
+		assert(scaleDegree < 3 ? this->NoiseFactor == (NoiseLevel == 1 ? cc.param.ScalingFactorReal[level] : (bigFactor(level))) : true);
 		return true;
 	} else if (c1lvl < c2lvl) {
 		return false;
@@ -2028,7 +2026,7 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 			return true;
 	} else
 	*/
-	if (cc.rescaleTechnique == FIXEDMANUAL || cc.rescaleTechnique == FIXEDAUTO) {
+	if (cc.rescaleTechnique == FIXEDMANUAL) {
 		if (getLevel() - NoiseLevel > b.getLevel() - b.NoiseLevel) {
 			if (b.NoiseLevel == 1 && NoiseLevel == 2) {
 				rescale();
@@ -2044,7 +2042,7 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 		} else {
 			return true;
 		}
-	} else if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
+	} else if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
 		return adjustScaleAndLevel(b.NoiseLevel, b.getLevel(), b.NoiseFactor);
 	}
 	assert("This never happens" == nullptr);

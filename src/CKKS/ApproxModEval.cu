@@ -729,10 +729,17 @@ const std::vector<double>& coefficients, double a, double b) const {
 		}
 	} else {
 		// Settle every power to noise degree 1 here, as upstream does, so the weighted sums
-		// and the T2 chain all read one-tower-shallower operands.
-		for (size_t i = 1; i <= k; i++) {
-			if (T[i - 1]->NoiseLevel == 2)
-				T[i - 1]->rescale();
+		// and the doubling chain of powers all read one-tower-shallower operands. Not under FIXEDAUTO: the
+		// OpenFHE in this tree leaves the powers at depth 2 and adjusts them to T[k-1] below.
+		// Settling them first evaluates in another order and leaves depth-1 operands at
+		// different levels, which gave wrong values once the operand adjustment followed
+		// OpenFHE's for FIXEDAUTO (its scaling factors are constant, so that adjustment is
+		// only meaningful between operands of depth 2).
+		if (cc.rescaleTechnique != CKKS::FIXEDAUTO) {
+			for (size_t i = 1; i <= k; i++) {
+				if (T[i - 1]->NoiseLevel == 2)
+					T[i - 1]->rescale();
+			}
 		}
 		// FIDESlib bit-compat: mirror OpenFHE AdjustLevelsAndDepthInPlace(T[i-1], T[k-1]).
 		for (size_t i = 1; i < k; i++) {
