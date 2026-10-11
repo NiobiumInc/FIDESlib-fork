@@ -1757,6 +1757,86 @@ TEST_P(OpenFHEInterfaceTest, MultAllLevels) {
 	}
 }
 
+// A product of ciphertexts at different depths, in both orders: a ciphertext that has just been multiplied (depth 2,
+// not rescaled) and a fresh one (depth 1), with the depth-2 operand at the fresh one's level and one level below it.
+// Under the automatic techniques OpenFHE raises the shallower operand, level-reduces it if it has more limbs, and
+// rescales both, and the residues of the GPU result must be the same. FIXEDMANUAL never mixes depths here, because it
+// rescales after every product.
+TEST_P(OpenFHEInterfaceTest, MultMixedDepth) {
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	std::vector<double> x2 = { 4.0, 2.0, 1.3333333333, 1.0, 0.5, 0.3333333333, 0.25, 0.2 };
+	std::vector<double> x3 = { 0.0 };
+	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
+	lbcrypto::Plaintext ptxt3 = cc->MakeCKKSPackedPlaintext(x3);
+	auto c1					  = cc->Encrypt(keys.publicKey, ptxt1);
+	auto c2					  = cc->Encrypt(keys.publicKey, ptxt2);
+	auto c3					  = cc->Encrypt(keys.publicKey, ptxt3);
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context& cc_        = GPUcc;
+	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
+	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
+		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
+
+	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
+	FIDESlib::CKKS::Ciphertext GPUct1(cc_, raw1);
+	FIDESlib::CKKS::Ciphertext GPUct2(cc_, raw2);
+	FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
+	FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+	kskEval.Initialize(rawKskEval);
+	cc_->AddEvalKey(std::move(kskEval));
+
+	// The depth-2 operands: the product of the two fresh ciphertexts, not rescaled, and the product of that with a
+	// fresh ciphertext, one level lower.
+	auto cDeep = cc->EvalMult(c1, c2);
+	FIDESlib::CKKS::Ciphertext GPUdeep(cc_);
+	GPUdeep.copy(GPUct1);
+	GPUdeep.mult(GPUct2, false);
+	ASSERT_EQ(cDeep->GetNoiseScaleDeg(), 2u);
+	ASSERT_EQ(GPUdeep.NoiseLevel, 2);
+	auto cDeeper = cc->EvalMult(cDeep, c2);
+	FIDESlib::CKKS::Ciphertext GPUdeeper(cc_);
+	GPUdeeper.copy(GPUdeep);
+	GPUdeeper.mult(GPUct2, false);
+	ASSERT_EQ(cDeeper->GetNoiseScaleDeg(), 2u);
+	ASSERT_EQ(GPUdeeper.NoiseLevel, 2);
+	ASSERT_LT(GPUdeeper.getLevel(), GPUdeep.getLevel());
+
+	for (const bool lower : { false, true }) {
+		const auto& cDeepest				   = lower ? cDeeper : cDeep;
+		const FIDESlib::CKKS::Ciphertext& GPUd = lower ? GPUdeeper : GPUdeep;
+		for (const bool deepFirst : { true, false }) {
+			SCOPED_TRACE(std::string(lower ? "depth 2 one level lower" : "depth 2 at the fresh level") + (deepFirst ? ", depth 2 first" : ", depth 1 first"));
+			auto cpu = deepFirst ? cc->EvalMult(cDeepest, c2) : cc->EvalMult(c2, cDeepest);
+
+			FIDESlib::CKKS::Ciphertext GPUres(cc_);
+			FIDESlib::CKKS::Ciphertext GPUother(cc_);
+			if (deepFirst) {
+				GPUres.copy(GPUd);
+				GPUother.copy(GPUct2);
+			} else {
+				GPUres.copy(GPUct2);
+				GPUother.copy(GPUd);
+			}
+			GPUres.mult(GPUother, false);
+
+			FIDESlib::CKKS::RawCipherText raw_res;
+			GPUres.store(raw_res);
+			auto cResGPU = c3->Clone();
+			GetOpenFHECipherText(cResGPU, raw_res);
+			ASSERT_EQ_CIPHERTEXT(cpu, cResGPU);
+		}
+	}
+}
+
 TEST_P(OpenFHEInterfaceTest, RotateAllLevels) {
 	// Enable the features that you wish to use
 	cc->Enable(lbcrypto::PKE);
