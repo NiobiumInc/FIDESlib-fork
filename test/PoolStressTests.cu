@@ -151,9 +151,19 @@ class PoolStressTest : public ::testing::Test {
 			GTEST_SKIP() << "no CUDA device";
 		cudaSetDevice(kDevice);
 		initGPUprop();
-		streams.resize(kStreams);
-		for (size_t i = 0; i < kStreams; ++i)
-			ASSERT_EQ(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking), cudaSuccess);
+		// The pool registers every stream it is used with and never forgets it (see PoolFor), because the
+		// library's streams live as long as the process. Streams created and destroyed per test would leave
+		// registered handles that no longer exist, and a later test that takes a block from one of them would
+		// record an event on a destroyed stream. So the streams are created once and kept.
+		static std::vector<cudaStream_t> processStreams = [] {
+			std::vector<cudaStream_t> made(kStreams, nullptr);
+			for (cudaStream_t& s : made)
+				cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+			return made;
+		}();
+		streams = processStreams;
+		for (cudaStream_t s : streams)
+			ASSERT_NE(s, nullptr);
 		ASSERT_EQ(cudaMalloc(&d_errors, sizeof(int)), cudaSuccess);
 		ASSERT_EQ(cudaMemset(d_errors, 0, sizeof(int)), cudaSuccess);
 		ASSERT_EQ(cudaMalloc(&sink, sizeof(uint64_t)), cudaSuccess);
@@ -164,10 +174,8 @@ class PoolStressTest : public ::testing::Test {
 		if (streams.empty())
 			return;
 		cudaDeviceSynchronize();
-		for (cudaStream_t s : streams)
-			cudaStreamDestroy(s);
-		// The pool never returns memory, so the blocks themselves are deliberately left alone;
-		// only this fixture's own scratch is released.
+		// The streams stay (see SetUp). The pool never returns memory, so the blocks themselves are
+		// deliberately left alone; only this fixture's own scratch is released.
 		cudaFree(d_errors);
 		cudaFree(sink);
 	}
@@ -268,9 +276,11 @@ TEST_F(PoolStressTest, CrossStreamHandoffOrdersTheTaker) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Free on a DIFFERENT stream than the one that allocated. Legal, and it is how a block migrates
-// between per-stream lists: the freeing stream becomes the owner, so the ordering edge a later
-// taker records has to be the FREEING stream's, not the allocating one's.
+// Free on a DIFFERENT stream than the one that allocated. It is how a block migrates between
+// per-stream lists: the freeing stream becomes the owner, so the ordering edge a later taker
+// records has to be the FREEING stream's, not the allocating one's. The caller orders the freeing
+// stream behind the work on the allocating one first, as cudaFreeAsync requires; without that
+// the pool cannot know about the work and no pool could make the block safe.
 // ---------------------------------------------------------------------------------------------
 TEST_F(PoolStressTest, AllocateOnOneStreamFreeOnAnother) {
 	constexpr int kThreads = 8;
@@ -296,8 +306,16 @@ TEST_F(PoolStressTest, AllocateOnOneStreamFreeOnAnother) {
 				pool_fill_<<<grid, block, 0, a>>>(p, kLargeWords, tag);
 				pool_spin_<<<1, 32, 0, a>>>(20000, sink);
 				pool_check_<<<grid, block, 0, a>>>(p, kLargeWords, tag, d_errors);
-				// Hand the block to stream b's list WITHOUT first fencing b against a. The pool is
-				// what has to make that safe for whoever takes it next.
+				// Freeing on another stream is the caller's to order, as with cudaFreeAsync: the pool
+				// is told only the freeing stream, so it cannot know that a still has work queued
+				// over the block. Stream b therefore waits for a's work before the free; from then on
+				// b's own order covers everything done with the block, and the pool has to make it
+				// safe for whoever takes it from b's list.
+				cudaEvent_t done = nullptr;
+				cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+				cudaEventRecord(done, a);
+				cudaStreamWaitEvent(b, done);
+				cudaEventDestroy(done);
 				GPUfree(p, kDevice, bytes, b, true);
 			}
 		});

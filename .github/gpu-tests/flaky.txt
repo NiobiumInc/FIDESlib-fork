@@ -1,8 +1,3 @@
 # Tests whose result changes from run to run. The check skips them; every run
 # also runs them as a report that never fails the check.
-# One gtest filter pattern per line.
-# Brought in with Niobium's branches. A stress test for blocks freed on a
-# different stream than they were used on: on the CI GPU it failed all three
-# attempts in two of three runs, with and without the upstream merge, and
-# passed in the other.
-PoolStressTest.AllocateOnOneStreamFreeOnAnother
+# One gtest filter pattern per line. None at the moment.
