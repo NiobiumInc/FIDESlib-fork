@@ -12,10 +12,6 @@
 
 # Inherited from upstream (they fail on the base commit 0ec4055):
 # GPU bootstrap precision.
-# Coefficients to slots, parameters 3, 5 and 7: error of about 5e-11.
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/3
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/5
-OpenFHEBootstrapTests/OpenFHEBootstrapTest.CoeffsToSlots/7
 # Chebyshev evaluation with FIXEDAUTO scaling: error of 2.5e-7 where the other
 # parameters reach 5e-10. The GPU evaluation differs from OpenFHE's by about
 # 1e-4 after a full bootstrap, the same size as the bootstrap's own error
