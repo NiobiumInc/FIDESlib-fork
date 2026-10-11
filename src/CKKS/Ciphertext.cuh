@@ -736,6 +736,23 @@ class Ciphertext {
 	bool adjustBeforeMult(const Ciphertext& b);
 
 	/**
+	 * @brief FIXEDAUTO only: the operand adjustment OpenFHE makes for a depth-2 and a depth-1
+	 *        ciphertext when the depth-2 one has no more limbs than the other, which
+	 *        adjustBeforeMult() does not make.
+	 *
+	 * OpenFHE raises the depth-1 operand to depth 2 with a product by 1.0, level-reduces it onto the
+	 * depth-2 operand if it has more limbs, and rescales both (AdjustLevelsAndDepthInPlace).
+	 * adjustBeforeMult() rescales the depth-2 operand and multiplies by the other as it is, which is
+	 * equally valid but about 1e-11 of the result less exact and differs in the residues.
+	 *
+	 * @param b The other multiplicand.
+	 * @param b_ Receives the adjusted copy of `b` when the case applies.
+	 * @return `true` when the case applied: *this is adjusted and rescaled, `b_` holds the adjusted
+	 *         `b`, and the caller multiplies by `b_`. `false` when nothing was changed.
+	 */
+	bool raiseAndRescaleForMult(const Ciphertext& b, Ciphertext& b_);
+
+	/**
 	 * @brief The key-switch-and-fold tail shared by mult() and relinearize().
 	 *
 	 * Key-switches the degree-2 component held in `d2` with `kskEval` and folds both halves back

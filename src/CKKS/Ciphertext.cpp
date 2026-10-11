@@ -491,6 +491,9 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 	constexpr bool PRINT = false;
 
 	if (!ignore_scale) {
+		// Only where adjustPlaintextToCiphertext raises the plaintext without touching the ciphertext
+		// (its first FIXEDAUTO case): the plaintext has at least the ciphertext's limbs.
+		const bool raise_plaintext = cc.rescaleTechnique == FIXEDAUTO && NoiseLevel == 2 && b.NoiseLevel < 2 && b.c0.getLevel() >= getLevel();
 		if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
 
 			if (c0.isModUp() || c1.isModUp() || b.c0.isModUp() || (c2.has_value() && c2->isModUp())) {
@@ -501,7 +504,12 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 
 			if constexpr (PRINT)
 				std::cout << "multPt: Rescale input ciphertext" << std::endl;
-			if (NoiseLevel == 2)
+			// Under FIXEDAUTO a depth-2 ciphertext meeting a depth-1 plaintext is not rescaled on its own:
+			// OpenFHE's AdjustLevelsAndDepthInPlace raises the plaintext to depth 2 (a product with 1.0)
+			// and rescales both. The adjust step below does that, so leave the ciphertext for it. Rescaling
+			// the ciphertext first and multiplying by the plaintext as it is gives an equally valid result
+			// that is off by the ratio of the rescaling prime to the scaling factor, about 1e-11 of the value.
+			if (NoiseLevel == 2 && !raise_plaintext)
 				this->rescale();
 		}
 
@@ -513,7 +521,8 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 				assert(NoiseLevel == 1);
 			}
 
-			if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel == 2 /*!hasSameScalingFactor(b)*/) {
+			if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel == 2 /*!hasSameScalingFactor(b)*/ ||
+			  raise_plaintext) {
 				Plaintext b_(cc_);
 				if constexpr (PRINT)
 					std::cout << "multPt: adjust input plaintext" << std::endl;
@@ -612,6 +621,34 @@ void Ciphertext::foldKeySwitched(RNSPoly& d2, const KeySwitchingKey& kskEval, co
 	c1.add(d2);
 }
 
+bool Ciphertext::raiseAndRescaleForMult(const Ciphertext& b, Ciphertext& b_) {
+	if (cc.rescaleTechnique != FIXEDAUTO || this == &b || NoiseLevel == b.NoiseLevel || NoiseLevel > 2 || b.NoiseLevel > 2 || c0.isModUp() || c1.isModUp() ||
+	  b.c0.isModUp() || b.c1.isModUp() || c2.has_value() || b.c2.has_value())
+		return false;
+	assert(keyID == b.keyID);
+	// The depth-2 operand and the depth-1 operand. When the depth-2 operand has MORE limbs than the
+	// other, OpenFHE rescales it on its own and this case does not apply.
+	const bool this_is_deep	  = NoiseLevel == 2;
+	const Ciphertext& deep	  = this_is_deep ? *this : b;
+	const int deep_level	  = deep.getLevel();
+	const double deep_factor  = deep.NoiseFactor;
+	const Ciphertext& shallow = this_is_deep ? b : *this;
+	if (deep_level > shallow.getLevel())
+		return false;
+
+	b_.copy(b);
+	Ciphertext& raised = this_is_deep ? b_ : *this;
+	raised.multScalar(1.0, false);
+	if (raised.getLevel() > deep_level) {
+		// OpenFHE's level reduction after the raise, and it sets the scaling factor to the deep operand's.
+		raised.dropToLevel(deep_level, true);
+		raised.NoiseFactor = deep_factor;
+	}
+	this->rescale();
+	b_.rescale();
+	return true;
+}
+
 bool Ciphertext::adjustBeforeMult(const Ciphertext& b) {
 	assert(keyID == b.keyID);
 	if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
@@ -635,6 +672,13 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 	CKKS::SetCurrentContext(cc_);
 	requireDegree1("mult");
 	b.requireDegree1("mult (second operand)");
+	if (cc.rescaleTechnique == FIXEDAUTO && NoiseLevel != b.NoiseLevel) {
+		Ciphertext b_(cc_);
+		if (raiseAndRescaleForMult(b, b_)) {
+			mult(b_, rescale, moddown);
+			return;
+		}
+	}
 	if (!adjustBeforeMult(b)) {
 		Ciphertext b_(cc_);
 		b_.copy(b);
@@ -838,6 +882,13 @@ void Ciphertext::multNoRelin(const Ciphertext& b) {
 	CKKS::SetCurrentContext(cc_);
 	requireDegree1("multNoRelin");
 	b.requireDegree1("multNoRelin (second operand)");
+	if (cc.rescaleTechnique == FIXEDAUTO && NoiseLevel != b.NoiseLevel) {
+		Ciphertext b_(cc_);
+		if (raiseAndRescaleForMult(b, b_)) {
+			multNoRelin(b_);
+			return;
+		}
+	}
 	if (!adjustBeforeMult(b)) {
 		Ciphertext b_(cc_);
 		b_.copy(b);

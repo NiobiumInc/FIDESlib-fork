@@ -18,8 +18,3 @@
 # against the true plaintext, so it is not a measured precision loss; where the
 # difference comes from has not been found.
 OpenFHEBootstrapTests/OpenFHEBootstrapTest.ApproxModEvalSparse/1
-
-# Inherited from upstream: CPU and GPU results differ bit for bit.
-OpenFHEInterfaceTests/OpenFHEInterfaceTest.MultAllLevels/1
-OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMult/1
-OpenFHEInterfaceTests/OpenFHEInterfaceTest.ExtractContextShowPtMultAllLevels/1
