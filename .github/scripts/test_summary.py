@@ -41,19 +41,18 @@ def read(files):
     return total, failed, skipped, disabled, reasons
 
 
-ICON_OK, ICON_WARN, ICON_BAD = "✅", "⚠️", "❌"
-
-
-def bar(part, whole, width=10):
-    """A text bar for part/whole, so a row shows how much of its suite ran at a glance."""
-    if whole == 0:
-        return "▱" * width
-    filled = round(width * part / whole)
-    return "▰" * filled + "▱" * (width - filled)
-
-
 def percent(part, whole):
     return f"{100 * part / whole:.0f}%" if whole else "-"
+
+
+def status(found, failed, skipped, disabled):
+    if not found:
+        return "No result file"
+    if failed:
+        return "Failed"
+    if skipped or disabled:
+        return "Passed, with tests not executed"
+    return "Passed"
 
 
 def main():
@@ -62,7 +61,7 @@ def main():
     parser.add_argument("--row", action="append", default=[], metavar="LABEL=GLOB")
     args = parser.parse_args()
 
-    rows = []  # (label, found, total, ran, passed, failed, skipped, disabled, reasons)
+    rows = []  # (label, found, total, executed, passed, failed, skipped, disabled, reasons)
     missing = 0
     for row in args.row:
         label, _, pattern = row.partition("=")
@@ -72,40 +71,26 @@ def main():
             missing += 1
             continue
         total, failed, skipped, disabled, reasons = read(files)
-        ran = total - skipped - disabled
-        rows.append((label, True, total, ran, ran - failed, failed, skipped, disabled, reasons))
+        executed = total - skipped - disabled
+        rows.append((label, True, total, executed, executed - failed, failed, skipped, disabled, reasons))
 
-    ran = sum(r[3] for r in rows)
-    passed = sum(r[4] for r in rows)
-    failed = sum(r[5] for r in rows)
-    skipped = sum(r[6] for r in rows)
-    disabled = sum(r[7] for r in rows)
-    if missing or failed:
-        headline = f"{ICON_BAD} {failed} failed" if failed else f"{ICON_BAD} {missing} without a result file"
-    elif skipped or disabled:
-        headline = f"{ICON_WARN} {skipped} skipped" + (f", {disabled} disabled" if disabled else "")
-    else:
-        headline = f"{ICON_OK} all passed"
-
-    lines = [f"## {args.title}", "", f"**{headline}** · {passed:,} passed of {ran:,} run", "",
-             "| | Run | Tests | Ran | Passed | Failed | Skipped | Disabled |", "|:-:|---|---:|---|---:|---:|---:|---:|"]
-    for label, found, total, r_ran, r_passed, r_failed, r_skipped, r_disabled, _ in rows:
+    lines = [f"### {args.title}", "",
+             "| Run | Status | Tests | Executed | Passed | Failed | Skipped | Disabled |", "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for label, found, total, executed, passed, failed, skipped, disabled, _ in rows:
         if not found:
-            lines.append(f"| {ICON_BAD} | {label} | no result file | | | | | |")
+            lines.append(f"| {label} | {status(False, 0, 0, 0)} | | | | | | |")
             continue
-        icon = ICON_BAD if r_failed else (ICON_WARN if r_skipped or r_disabled else ICON_OK)
-        lines.append(f"| {icon} | {label} | {total:,} | `{bar(r_ran, total)}` {r_ran:,} ({percent(r_ran, total)}) | {r_passed:,} | {r_failed or '0'} | {r_skipped or '0'} | {r_disabled or '0'} |")
+        lines.append(f"| {label} | {status(True, failed, skipped, disabled)} | {total:,} | {executed:,} ({percent(executed, total)}) | {passed:,} | {failed} | {skipped} | {disabled} |")
     if len(rows) > 1:
-        total_all = sum(r[2] for r in rows)
-        lines.append(f"| | **Total** | **{total_all:,}** | **{ran:,}** | **{passed:,}** | **{failed}** | **{skipped}** | **{disabled}** |")
+        t = [sum(r[k] for r in rows) for k in range(2, 8)]
+        lines.append(f"| **Total** | | **{t[0]:,}** | **{t[1]:,} ({percent(t[1], t[0])})** | **{t[2]:,}** | **{t[3]}** | **{t[4]}** | **{t[5]}** |")
 
-    for label, found, _, _, _, _, r_skipped, _, reasons in rows:
-        if not found or not reasons:
-            continue
-        lines += ["", f"<details><summary>⏭️ <b>{r_skipped} skipped in {label}</b>: why</summary>", "", "| Reason | Tests |", "|---|---:|"]
-        for reason, names in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
-            lines.append(f"| {reason.replace('|', '/')} | {len(names)} |")
-        lines += ["", "</details>"]
+    skipped_rows = [(label, reasons) for label, found, _, _, _, _, _, _, reasons in rows if found and reasons]
+    if skipped_rows:
+        lines += ["", "#### Tests not executed, by reason", "", "| Run | Reason | Tests |", "|---|---|---:|"]
+        for label, reasons in skipped_rows:
+            for reason, names in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
+                lines.append(f"| {label} | {reason.replace('|', '/')} | {len(names)} |")
 
     text = "\n".join(lines) + "\n"
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

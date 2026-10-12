@@ -60,7 +60,7 @@ jobs:
         run: |
           if [ "$EVENT" != pull_request ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            printf '## 🔎 Do the tests run?\n\n✅ **Yes:** %s event, not a pull request, so everything is tested.\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
+            printf '### Test selection\n\n| Item | Value |\n|---|---|\n| Decision | Tests executed |\n| Reason | %s event, not a pull request |\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" \
@@ -270,7 +270,7 @@ jobs:
 
       - name: Summarize
         run: |
-          python3 -I .github/scripts/test_summary.py --title "🧪 Tests without a GPU" \
+          python3 -I .github/scripts/test_summary.py --title "Test results: CPU and haze backends" \
             --row "CPU backend, development build=results/cpu-dev-test-results/*.xml" \
             --row "CPU backend, release build=results/cpu-test-results-*/*.xml" \
             --row "haze backend, release build=results/haze-test-results-*/*.xml"

@@ -87,7 +87,7 @@ jobs:
               limit=300 ;;
             *)
               echo "run=true" >> "$GITHUB_OUTPUT"
-              printf '## 🔎 Do the tests run?\n\n✅ **Yes:** %s event.\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
+              printf '### Test selection\n\n| Item | Value |\n|---|---|\n| Decision | Tests executed |\n| Reason | %s event |\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
               exit 0 ;;
           esac
           python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt --file-limit "$limit" \
@@ -275,7 +275,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: build
         run: |
-          python3 -I ../.github/scripts/test_summary.py --title "⚡ GPU tests, totals" \
+          python3 -I ../.github/scripts/test_summary.py --title "Test results: GPU backend, totals" \
             --row "Default suite=gpu-results/gate.xml" \
             --row "Concurrent operations, one process per test=gpu-results/concurrent/gate/*.xml" \
             --row "Concurrent lanes together=gpu-results/concurrent-one-process/gate.xml" \
