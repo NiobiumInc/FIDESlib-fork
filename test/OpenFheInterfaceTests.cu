@@ -81,12 +81,6 @@ constexpr double kAccumulateTolerance = 1e-9;
 // operations, so the results are not identical ciphertexts. The values are up to about 6.
 constexpr double kCoeffsToSlotsTolerance = 1e-12;
 
-// The modular reduction is a Chebyshev series and double-angle iterations, which square the relative error of the
-// series at each step. Under FIXEDMANUAL and FIXEDAUTO the results of the GPU and OpenFHE are the same ciphertext
-// and the difference is the rounding of its decryption. Under FLEXIBLEAUTOEXT they differ by about 4e-12 (at most
-// 7e-12 in 40 runs) for a result of about 0.15; where that difference comes from has not been looked for.
-constexpr double kApproxModEvalFlexibleTolerance = 5e-11;
-
 class OpenFHEInterfaceTest : public GeneralParametrizedTest {
 };
 
@@ -3249,12 +3243,10 @@ TEST_P(OpenFHEBootstrapTest, ApproxModEvalSparse) {
 				ASSERT_EQ(cResGPU->GetLevel(), ctxtEnc->GetLevel());
 				ASSERT_EQ(cResGPU->GetNoiseScaleDeg(), ctxtEnc->GetNoiseScaleDeg());
 				ASSERT_EQ(cResGPU->GetScalingFactor(), ctxtEnc->GetScalingFactor());
-				const auto technique = cryptoParams->GetScalingTechnique();
-				const bool flexible	 = technique == lbcrypto::FLEXIBLEAUTO || technique == lbcrypto::FLEXIBLEAUTOEXT;
-				ASSERT_NO_FATAL_FAILURE(
-				  ExpectDecryptedDifferenceBelow(cc, keys, ctxtEnc, cResGPU, flexible ? kApproxModEvalFlexibleTolerance : kIdenticalCiphertextTolerance));
-				if (!flexible)
-					ASSERT_EQ_CIPHERTEXT(ctxtEnc, cResGPU);
+				// The same ciphertext as OpenFHE's: a Chebyshev series and double-angle iterations, which square the
+				// relative error at each step, would show any difference at all.
+				ASSERT_NO_FATAL_FAILURE(ExpectDecryptedDifferenceBelow(cc, keys, ctxtEnc, cResGPU, kIdenticalCiphertextTolerance));
+				ASSERT_EQ_CIPHERTEXT(ctxtEnc, cResGPU);
 			}
 
 			CudaCheckErrorMod;
