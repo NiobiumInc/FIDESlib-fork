@@ -530,10 +530,6 @@ TEST_F(CKKSTest, SetLevel) {
 // ---- 7. Advanced operations ----
 
 TEST_F(CKKSTest, EvalChebyshevSeries) {
-	// The GPU Chebyshev domain-map fix is deliberately off this branch (lives on
-	// chebyshev-domain-map-fix); the device path is off by ~1 on non-[-1,1] intervals.
-	if (TestUseCuda())
-		GTEST_SKIP() << "GPU Chebyshev domain-map fix deferred (branch chebyshev-domain-map-fix)";
 	// Approximate the identity f(x)=x on [0,1] with degree-5 Chebyshev.
 	std::function<double(double)> f = [](double x) { return x; };
 	auto coeffs						= CryptoContextImpl<DCRTPoly>::GetChebyshevCoefficients(f, 0.0, 1.0, 5);
@@ -556,8 +552,6 @@ TEST_F(CKKSTest, EvalChebyshevSeries) {
 // state is process-global (only one may be loaded at a time), so both contexts here are
 // built and torn down explicitly, oracle first.
 TEST(ChebyshevFixedManual, HazeMatchesOpenFheOracle) {
-	if (TestUseCuda())
-		GTEST_SKIP() << "GPU Chebyshev domain-map fix deferred (branch chebyshev-domain-map-fix)";
 	if (GetTestBackend() != TestBackend::HAZE)
 		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=haze";
 
@@ -646,8 +640,6 @@ struct ChebyshevManualCase {
 class ChebyshevFixedManualCoworker : public ::testing::TestWithParam<ChebyshevManualCase> {};
 
 TEST_P(ChebyshevFixedManualCoworker, MatchesClosedForm) {
-	if (TestUseCuda())
-		GTEST_SKIP() << "GPU Chebyshev domain-map fix deferred (branch chebyshev-domain-map-fix)";
 	if (GetTestBackend() != TestBackend::HAZE)
 		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=haze";
 	const auto& tc = GetParam();
@@ -917,10 +909,6 @@ TEST_F(CKKSTest, Rescale) {
 }
 
 TEST_F(CKKSTest, EvalChebyshevSeriesInPlace) {
-	// GPU Chebyshev domain-map fix deferred to branch chebyshev-domain-map-fix (off by ~1 on
-	// non-[-1,1] intervals); CPU (OpenFHE) is correct, so this still runs there.
-	if (TestUseCuda())
-		GTEST_SKIP() << "GPU Chebyshev domain-map fix deferred (branch chebyshev-domain-map-fix)";
 	std::function<double(double)> f = [](double x) { return x; };
 	auto coeffs						= CryptoContextImpl<DCRTPoly>::GetChebyshevCoefficients(f, 0.0, 1.0, 5);
 	std::vector<double> input(kSlots);
