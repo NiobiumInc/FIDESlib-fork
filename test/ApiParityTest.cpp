@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <openfhe.h>
 
+#include <algorithm>
 #include <any>
 #include <cmath>
 #include <string>
@@ -1442,3 +1443,282 @@ TEST_F(ApiParitySparseSecretBootstrapTest, EvalBootstrap) {
 	auto oracle = LbCc(cc)->EvalBootstrap(lbCt);
 	ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-2);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Parity per scaling technique.
+//
+// The same operations as above, on a small context, for each scaling technique, compared bit for
+// bit with OpenFHE. (They replace OpenFheCompatTests, which compared the CPU engine with itself
+// since the Engine refactor.) Every result is declared as an output before any readback, because
+// a record/replay backend runs its one program at the first readback.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+const char* TechniqueName(ScalingTechnique t) {
+	switch (t) {
+	case FIXEDMANUAL: return "FIXEDMANUAL";
+	case FIXEDAUTO: return "FIXEDAUTO";
+	case FLEXIBLEAUTO: return "FLEXIBLEAUTO";
+	case FLEXIBLEAUTOEXT: return "FLEXIBLEAUTOEXT";
+	default: return "OTHER";
+	}
+}
+
+class ApiParityTechniqueTest : public ::testing::TestWithParam<ScalingTechnique> {
+  protected:
+	static constexpr uint32_t kRingDim = 1u << 13;
+	static constexpr uint32_t kSlots   = 8;
+
+	CryptoContext<DCRTPoly> cc;
+	KeyPair<DCRTPoly> keys;
+	const std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	const std::vector<double> x2 = { 5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25 };
+
+	bool Manual() const { return GetParam() == FIXEDMANUAL; }
+
+	void SetUp() override {
+		if (GetTestBackend() == TestBackend::CPU)
+			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
+							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
+	}
+
+	// A context of `depth` levels with the multiplication key and the given rotation keys.
+	void MakeContext(uint32_t depth, const std::vector<int32_t>& rotations = {}) {
+		CCParams<CryptoContextCKKSRNS> params;
+		params.SetMultiplicativeDepth(depth);
+		params.SetScalingModSize(50);
+		params.SetBatchSize(kSlots);
+		params.SetRingDim(kRingDim);
+		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetSecretKeyDist(UNIFORM_TERNARY);
+		params.SetScalingTechnique(GetParam());
+		ConfigureTestEngine(params);
+		cc = GenCryptoContext(params);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		if (!rotations.empty())
+			cc->EvalRotateKeyGen(keys.secretKey, rotations);
+		cc->LoadContext(keys.publicKey);
+	}
+
+	Ciphertext<DCRTPoly> Encrypt(const std::vector<double>& v) {
+		auto p = cc->MakeCKKSPackedPlaintext(v);
+		return cc->Encrypt(p, keys.publicKey);
+	}
+
+	// The decrypted values of the two results agree to a relative 1e-6 of the largest slot. Checked
+	// before the exact comparison, so a failure of that one says whether the results are still the
+	// same numbers.
+	void ExpectCloseValues(const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& got, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle) {
+		auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(keys.secretKey->pimpl);
+		lbcrypto::Plaintext pg, po;
+		LbCc(cc)->Decrypt(skImpl, got, &pg);
+		LbCc(cc)->Decrypt(skImpl, oracle, &po);
+		pg->SetLength(kSlots);
+		po->SetLength(kSlots);
+		const auto vg = pg->GetRealPackedValue();
+		const auto vo = po->GetRealPackedValue();
+		double scale = 0;
+		for (double v : vo)
+			scale = std::max(scale, std::abs(v));
+		for (size_t i = 0; i < kSlots; ++i)
+			EXPECT_NEAR(vg[i], vo[i], 1e-6 * std::max(scale, 1.0)) << "values differ at slot " << i;
+	}
+
+	// The device result against the OpenFHE oracle, exactly. A failure names the case and the
+	// test goes on to the next one. `exactOnHaze` is false for the operations on which the haze
+	// backend gives the same numbers as OpenFHE but not the same ciphertext (a different level or
+	// noise degree of the result, or a different order of the additions): there the decrypted
+	// values are compared, and the CUDA backend is still held to the exact result.
+	void ExpectIdentical(const char* what, Ciphertext<DCRTPoly>& device, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle, bool exactOnHaze = true) {
+		SCOPED_TRACE(std::string(TechniqueName(GetParam())) + " " + what);
+		auto got = HostCt(cc, device);
+		ExpectCloseValues(got, oracle);
+		if (GetTestBackend() == TestBackend::HAZE && !exactOnHaze)
+			return;
+		ASSERT_EQ_CIPHERTEXT(oracle, got);
+	}
+
+	// Same, for results that may differ in metadata (the Rescale family): every limb must match.
+	void ExpectSameLimbs(const char* what, Ciphertext<DCRTPoly>& device, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle) {
+		SCOPED_TRACE(std::string(TechniqueName(GetParam())) + " " + what);
+		auto got = HostCt(cc, device);
+		ASSERT_EQ_CIPHERTEXT_LIMBS(oracle, got);
+	}
+};
+
+std::string TechniqueParamName(const ::testing::TestParamInfo<ScalingTechnique>& info) {
+	return TechniqueName(info.param);
+}
+
+} // namespace
+
+TEST_P(ApiParityTechniqueTest, Arithmetic) {
+	MakeContext(4);
+	auto c1 = Encrypt(x1), c2 = Encrypt(x2);
+	auto l1 = LbCt(c1), l2 = LbCt(c2);
+	auto& lb = LbCc(cc);
+
+	struct Case {
+		const char* name;
+		Ciphertext<DCRTPoly> device;
+		lbcrypto::Ciphertext<lbcrypto::DCRTPoly> oracle;
+	};
+	std::vector<Case> cases;
+	auto add = [&](const char* name, Ciphertext<DCRTPoly> d, lbcrypto::Ciphertext<lbcrypto::DCRTPoly> o) {
+		cc->MarkOutput(d);
+		cases.push_back({ name, d, o });
+	};
+	add("add", cc->EvalAdd(c1, c2), lb->EvalAdd(l1, l2));
+	add("add scalar", cc->EvalAdd(c1, 0.5), lb->EvalAdd(l1, 0.5));
+	add("sub", cc->EvalSub(c1, c2), lb->EvalSub(l1, l2));
+	add("sub scalar", cc->EvalSub(c1, 0.25), lb->EvalSub(l1, 0.25));
+	add("negate", cc->EvalNegate(c1), lb->EvalNegate(l1));
+	add("mult", cc->EvalMult(c1, c2), lb->EvalMult(l1, l2));
+	add("mult scalar", cc->EvalMult(c1, 1.5), lb->EvalMult(l1, 1.5));
+	add("square", cc->EvalSquare(c1), lb->EvalSquare(l1));
+	if (Manual()) {
+		// Under FIXEDMANUAL the product has to be rescaled by hand.
+		auto prod = cc->EvalMult(c1, c2);
+		auto resc = cc->Rescale(prod);
+		cc->MarkOutput(resc);
+		cases.push_back({ "rescale after mult", resc, lb->Rescale(lb->EvalMult(l1, l2)) });
+	}
+	for (auto& c : cases) {
+		if (std::string(c.name) == "rescale after mult")
+			ExpectSameLimbs(c.name, c.device, c.oracle);
+		else
+			ExpectIdentical(c.name, c.device, c.oracle);
+	}
+}
+
+TEST_P(ApiParityTechniqueTest, ArithmeticWithPlaintext) {
+	MakeContext(4);
+	auto c1	 = Encrypt(x1);
+	auto l1	 = LbCt(c1);
+	auto pt2 = cc->MakeCKKSPackedPlaintext(x2);
+	auto lp2 = LbPt(pt2);
+	auto& lb = LbCc(cc);
+
+	auto dAdd = cc->EvalAdd(c1, pt2), dSub = cc->EvalSub(c1, pt2), dMult = cc->EvalMult(c1, pt2);
+	cc->MarkOutput(dAdd);
+	cc->MarkOutput(dSub);
+	cc->MarkOutput(dMult);
+	ExpectIdentical("add plaintext", dAdd, lb->EvalAdd(l1, lp2));
+	ExpectIdentical("sub plaintext", dSub, lb->EvalSub(l1, lp2));
+	ExpectIdentical("mult plaintext", dMult, lb->EvalMult(l1, lp2));
+}
+
+// Operands at mixed noise degrees and level gaps (including degree 2 against degree 2 with a gap of
+// two). Under FIXEDMANUAL operands of different degrees cannot be combined, so it has no case here.
+TEST_P(ApiParityTechniqueTest, OperandAdjustment) {
+	if (Manual())
+		GTEST_SKIP() << "FIXEDMANUAL does not adjust operands: a degree or level mismatch is the caller's to resolve";
+	MakeContext(6);
+	auto c1 = Encrypt(x1);
+	auto l1 = LbCt(c1);
+	auto& lb = LbCc(cc);
+
+	auto chain = [&](auto&& mult, auto&& add, auto&& sub, auto&& square, auto& first) {
+		auto c2 = mult(first, first); // degree 2 at the top level
+		auto c3 = mult(c2, c2);		  // degree 2, one level down
+		auto c4 = mult(c3, c3);		  // degree 2, two levels down
+		return std::vector<decltype(c2)>{ c2, c3, c4, add(first, c3), add(c2, c4), sub(c4, c2), mult(first, c4), mult(c2, c3), square(first) };
+	};
+	auto device = chain([&](auto& a, auto& b) { return cc->EvalMult(a, b); }, [&](auto& a, auto& b) { return cc->EvalAdd(a, b); },
+	  [&](auto& a, auto& b) { return cc->EvalSub(a, b); }, [&](auto& a) { return cc->EvalSquare(a); }, c1);
+	auto oracle = chain([&](auto& a, auto& b) { return lb->EvalMult(a, b); }, [&](auto& a, auto& b) { return lb->EvalAdd(a, b); },
+	  [&](auto& a, auto& b) { return lb->EvalSub(a, b); }, [&](auto& a) { return lb->EvalSquare(a); }, l1);
+	ASSERT_EQ(device.size(), oracle.size());
+	for (auto& d : device)
+		cc->MarkOutput(d);
+	static const char* names[] = { "c2", "c3", "c4", "c1+c3 (degree 1 against 2, gap 1)", "c2+c4 (gap 2)", "c4-c2 (gap 2, reversed)",
+		"c1*c4 (degree 1 against 2, gap 2)", "c2*c3 (gap 1)", "square c1" };
+	for (size_t i = 0; i < device.size(); ++i)
+		ExpectIdentical(names[i], device[i], oracle[i], /*exactOnHaze=*/false);
+}
+
+TEST_P(ApiParityTechniqueTest, ChebyshevSeries) {
+	MakeContext(10);
+	// Degree 12: the Paterson-Stockmeyer path.
+	std::vector<double> coeffs = { 0.15, 0.05, 0.2, -0.03, 0.11, 0.007, -0.05, 0.021, 0.09, -0.012, 0.033, 0.004, -0.026 };
+	auto c1	= Encrypt({ 0.03, 0.06, 0.09, 0.12, 0.25, 0.37, 0.5, 0.62 });
+	auto l1	= LbCt(c1);
+	auto res = cc->EvalChebyshevSeries(c1, coeffs, -1.0, 1.0);
+	cc->MarkOutput(res);
+	auto oracle = LbCc(cc)->EvalChebyshevSeries(l1, coeffs, -1.0, 1.0);
+	ExpectIdentical("chebyshev series", res, oracle, /*exactOnHaze=*/false);
+}
+
+TEST_P(ApiParityTechniqueTest, Rotation) {
+	MakeContext(2, { 1, -2 });
+	auto c1 = Encrypt(x1);
+	auto l1 = LbCt(c1);
+	auto res = cc->EvalRotate(c1, 1);
+	cc->MarkOutput(res);
+	ExpectIdentical("rotate 1", res, LbCc(cc)->EvalRotate(l1, 1));
+}
+
+TEST_P(ApiParityTechniqueTest, FastRotation) {
+	MakeContext(2, { 1, -2 });
+	auto c1 = Encrypt(x1);
+	auto l1 = LbCt(c1);
+	const uint32_t m = 2 * cc->GetRingDimension();
+	auto res = cc->EvalFastRotation(c1, 1, m, cc->EvalFastRotationPrecompute(c1));
+	cc->MarkOutput(res);
+	auto& lb = LbCc(cc);
+	ExpectIdentical("fast rotation 1", res, lb->EvalFastRotation(l1, 1, m, lb->EvalFastRotationPrecompute(l1)));
+}
+
+// Several indices at once: the device shares the digits across them (hoisting).
+TEST_P(ApiParityTechniqueTest, FastRotationHoisted) {
+	MakeContext(2, { 1, -2 });
+	auto c1 = Encrypt(x1);
+	auto l1 = LbCt(c1);
+	const uint32_t m = 2 * cc->GetRingDimension();
+	const std::vector<int32_t> indices = { 1, -2 };
+	auto res = cc->EvalFastRotation(c1, indices, m, cc->EvalFastRotationPrecompute(c1));
+	ASSERT_EQ(res.size(), indices.size());
+	for (auto& r : res)
+		cc->MarkOutput(r);
+	auto& lb  = LbCc(cc);
+	auto pre	  = lb->EvalFastRotationPrecompute(l1);
+	for (size_t i = 0; i < indices.size(); ++i)
+		ExpectIdentical(("fast rotation " + std::to_string(indices[i])).c_str(), res[i], lb->EvalFastRotation(l1, indices[i], m, pre));
+}
+
+TEST_P(ApiParityTechniqueTest, AccumulateSum) {
+	// The fold's rotation indices: {i * radix^level : i in [1, radix)} for 8 slots and stride 1.
+	std::vector<int32_t> indices;
+	for (uint32_t s = 1; s < kSlots; s *= PARTIAL_SUM_RADIX)
+		for (uint32_t idx = s; idx < kSlots && idx < PARTIAL_SUM_RADIX * s; idx += s)
+			indices.push_back(static_cast<int32_t>(idx));
+	MakeContext(2, indices);
+	auto c1 = Encrypt(x1);
+	auto l1 = LbCt(c1);
+	auto res = cc->AccumulateSum(c1, kSlots, 1);
+	cc->MarkOutput(res);
+	auto oracle = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(*l1);
+	lbcrypto::FHECKKSRNS::EvalPartialSumInPlace(oracle, 1, kSlots, PARTIAL_SUM_RADIX);
+	ExpectIdentical("accumulate sum", res, oracle, /*exactOnHaze=*/false);
+}
+
+TEST_P(ApiParityTechniqueTest, AddMany) {
+	MakeContext(2);
+	std::vector<Ciphertext<DCRTPoly>> cts;
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> lbs;
+	for (int i = 0; i < 4; ++i) {
+		cts.push_back(Encrypt(x1));
+		lbs.push_back(LbCt(cts.back()));
+	}
+	auto res = cc->EvalAddMany(cts);
+	cc->MarkOutput(res);
+	ExpectIdentical("add many", res, LbCc(cc)->EvalAddMany(lbs));
+}
+
+INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
