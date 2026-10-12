@@ -512,40 +512,42 @@ jobs:
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          mark() { case "$1" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹️";; skipped) echo "⏭️";; *) echo "❔";; esac; }
+          mark() { case "$1" in success) echo "Succeeded";; failure) echo "Failed";; cancelled) echo "Cancelled";; skipped) echo "Skipped";; *) echo "$1";; esac; }
           mins() { [ -n "$1" ] && [ -n "$2" ] && echo "$(( ($(date -d "$2" +%s) - $(date -d "$1" +%s) + 59) / 60 )) min" || echo "—"; }
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
             --jq '.jobs[] | select(.name != "report") | [.name, (.conclusion // .status), (.started_at // ""), (.completed_at // ""), .html_url] | @tsv' \
             > jobs.tsv
           {
-            echo "## Release run $VERSION"
+            echo "### Release run $VERSION"
             echo
-            echo "- Commit: \`$GITHUB_SHA\` ($GITHUB_EVENT_NAME on \`$GITHUB_REF_NAME\`)"
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`$GITHUB_SHA\` ($GITHUB_EVENT_NAME on \`$GITHUB_REF_NAME\`) |"
             if [ "${RELEASE_CUDA:-true}" = false ]; then
-              echo "- CUDA packages: left out (repository variable FIDESLIB_RELEASE_CUDA is false)"
+              echo "| CUDA packages | Left out (repository variable FIDESLIB_RELEASE_CUDA is false) |"
             else
-              echo "- CUDA packages: built"
+              echo "| CUDA packages | Built |"
             fi
             case "$RELEASE_RESULT" in
-              success) echo "- Published: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" ;;
+              success) echo "| Publication | Published: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) |" ;;
               skipped)
                 if [ -n "$NOTHING_NEW" ]; then
-                  echo "- Not published: $NOTHING_NEW."
+                  echo "| Publication | Not published: $NOTHING_NEW |"
                 elif { [ "$CPU_TESTS" != success ] && [ "$CPU_TESTS" != skipped ]; } ||
                   { [ "$GPU_TESTS" != success ] && [ "$GPU_TESTS" != skipped ]; }; then
-                  echo "- Not published: the tests did not pass on this commit (CPU: $CPU_TESTS, GPU: $GPU_TESTS), so nothing was built."
+                  echo "| Publication | Not published: the tests did not pass on this commit (CPU: $CPU_TESTS, GPU: $GPU_TESTS), so nothing was built |"
                 elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-                  echo "- Not published: run with publish off."
+                  echo "| Publication | Not published: run with publish off |"
                 else
-                  echo "- Not published: pushes and pull requests never publish; the nightly does."
+                  echo "| Publication | Not published: pushes and pull requests never publish; the nightly does |"
                 fi ;;
-              *) echo "- Publishing: $(mark "$RELEASE_RESULT") $RELEASE_RESULT" ;;
+              *) echo "| Publication | $(mark "$RELEASE_RESULT") |" ;;
             esac
             echo
             echo "| Job | Result | Duration |"
             echo "|---|---|---:|"
             while IFS=$'\t' read -r name result started completed url; do
-              echo "| [$name]($url) | $(mark "$result") $result | $(mins "$started" "$completed") |"
+              echo "| [$name]($url) | $(mark "$result") | $(mins "$started" "$completed") |"
             done < jobs.tsv
             if ls dist/*.tar.gz >/dev/null 2>&1; then
               echo

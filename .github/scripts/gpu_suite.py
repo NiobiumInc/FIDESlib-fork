@@ -290,17 +290,18 @@ def main():
     known_pass = (report_only(args.binary, known, os.path.join(args.out, "known-failures.xml"), args.isolate)
                   if args.known_failures else None)
 
-    lines = [f"## {args.title}", ""]
+    lines = [f"### {args.title}", ""]
     if exit_status == 0:
-        lines.append(f"**Check: passed.** No test outside the lists failed all {args.retries + 1} attempt(s).")
+        result = f"Passed. No test outside the lists failed all {args.retries + 1} attempt(s)."
     elif pending:
-        lines.append(f"**Check: failed.** {len(pending)} test(s) failed all {args.retries + 1} attempt(s).")
+        result = f"Failed. {len(pending)} test(s) failed all {args.retries + 1} attempt(s)."
     else:
-        lines.append("**Check: failed.** The suite did not finish; see the job log.")
+        result = "Failed. The suite did not finish; see the job log."
+    lines += ["| Item | Value |", "|---|---|", f"| Check | {result} |"]
     if args.isolate:
-        lines += ["", "Each test ran in a process of its own."]
+        lines.append("| Execution | Each test ran in a process of its own |")
     if args.repeat > 1:
-        lines += ["", f"The tests ran {args.repeat} times over in one process; a failure in any repetition counts."]
+        lines.append(f"| Repetitions | The tests ran {args.repeat} times over in one process; a failure in any repetition counts |")
     lines += ["", "| Pass | Tests | Passed | Failed | Skipped | Disabled |", "|---|---:|---:|---:|---:|---:|"]
     lines.append(count_row("Check", gate, gate_status))
     for label, results, status in retry_rows:
@@ -311,13 +312,13 @@ def main():
         lines.append(count_row("Known failures (report only)", known_pass[1], known_pass[0]))
 
     if failed:
-        lines += ["", "### Check failures", "", "| Test | Attempts | Message |", "|---|---|---|"]
+        lines += ["", "#### Check failures", "", "| Test | Attempts | Message |", "|---|---|---|"]
         for name in failed:
             outcomes = ", ".join(["failed"] + attempts.get(name, []))
             lines.append(f"| `{name}` | {outcomes} | {last_message[name]} |")
 
-    # Tests that call GTEST_SKIP count as passing; list them with their reasons
-    # so a skip that hides a known bug stays visible.
+    # The tests that skipped themselves are listed with their reasons in the test totals table
+    # (test_summary.py), so they are counted here without a section of their own.
     self_skipped = {}
     for name, (status, reason) in (gate or {}).items():
         if status == "skipped":
@@ -325,11 +326,6 @@ def main():
     if self_skipped:
         total = sum(len(names) for names in self_skipped.values())
         print(f"::notice::{total} tests skipped themselves and count as passing. See the job summary.")
-        lines += ["", "### Skipped by the tests themselves", "",
-                  "The check counts these as passing. Each reason is the test's own GTEST_SKIP message.", "",
-                  "| Reason | Tests |", "|---|---|"]
-        for reason, names in sorted(self_skipped.items(), key=lambda item: -len(item[1])):
-            lines.append(f"| {reason} | " + ", ".join(f"`{n}`" for n in sorted(names)) + " |")
 
     # Tests disabled in the source never run; list them so one that hides a
     # known bug stays visible.
@@ -337,14 +333,14 @@ def main():
                       if status == "disabled")
     if disabled:
         print(f"::notice::{len(disabled)} tests are disabled in the source and did not run. See the job summary.")
-        lines += ["", "### Disabled in the source", "",
+        lines += ["", "#### Disabled in the source", "",
                   "Their names start with `DISABLED_`, so gtest lists them without running them.", "",
                   "| Test | Location |", "|---|---|"]
         lines += [f"| `{name}` | {where} |" for name, where in disabled]
 
     if flaky_pass and flaky_pass[1] is not None:
         flaky_failed = [(n, m) for n, (s, m) in flaky_pass[1].items() if s == "failed"]
-        lines += ["", "### Flaky tests (report only)", ""]
+        lines += ["", "#### Flaky tests (report only)", ""]
         if flaky_failed:
             lines += ["| Test | Message |", "|---|---|"]
             lines += [f"| `{n}` | {m} |" for n, m in flaky_failed]
@@ -354,7 +350,7 @@ def main():
             lines.append(f"All {len(flaky_pass[1])} passed in this run.")
 
     if known_pass and known_pass[1] is not None:
-        lines += ["", "### Known failures (report only)", "",
+        lines += ["", "#### Known failures (report only)", "",
                   "| Test | Result | Message |", "|---|---|---|"]
         for name, (status, message) in sorted(known_pass[1].items()):
             lines.append(f"| `{name}` | {status} | {message} |")
@@ -366,7 +362,7 @@ def main():
         not_run.append(f"- Known failures: {len(known)} patterns in `known-failures.txt`. "
                        "Run the workflow by hand with **known_failures** to include them.")
     if not_run:
-        lines += ["", "### Not run in this job", ""] + not_run
+        lines += ["", "#### Not run in this job", ""] + not_run
 
     text = "\n".join(lines) + "\n"
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
