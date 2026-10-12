@@ -1,7 +1,7 @@
 // API test suite for fideslib — drives the public CryptoContextImpl api and verifies
 // results by decryption against expected values, so it is meaningful on either backend.
 // Default backend is CPU; set FIDESLIB_TEST_BACKEND=cuda on a CUDA build to exercise the
-// CUDA engine end-to-end (see TestUseCuda below).
+// CUDA engine end-to-end.
 // CPU-only build:  cmake -B build-cpu -DFIDESLIB_ENABLE_CUDA=OFF && cmake --build build-cpu --target fideslib-cpu-test
 // Run:    ./build-cpu/fideslib-cpu-test [--gtest_filter=-*Bootstrap*]
 
@@ -34,9 +34,6 @@ using FIDESlib::Testing::ConfigureTestEngine;
 using FIDESlib::Testing::GetTestBackend;
 using FIDESlib::Testing::TestBackend;
 
-static bool TestUseCuda() {
-	return GetTestBackend() == TestBackend::CUDA;
-}
 // Any device backend (CUDA or haze): gates SetBackend + LoadContext in the fixtures.
 static bool TestUseDevice() {
 	return GetTestBackend() != TestBackend::CPU;
@@ -1111,16 +1108,11 @@ class CKKSBootstrapTest : public ::testing::Test {
 		cc->Enable(FHE);
 		keys = cc->KeyGen();
 		cc->EvalMultKeyGen(keys.secretKey);
-		// FIXEDAUTO EvalBootstrapSetup({1,1}) segfaults on GPU (pre-existing on main, tracked
-		// separately); the tests below skip on GPU, so set up bootstrap only on the CPU backend.
-		// Under haze the setup runs (the segfault is CUDA-specific).
-		if (!TestUseCuda()) {
-			// levelBudget {2,2}, dim1 {0,0}, derived correction factor — OpenFHEBootstrap's
-			// EvalBootstrapSetup({ 2, 2 }, { 0, 0 }, slots) verbatim.
-			cc->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0);
-			cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
-		}
-		if (GetTestBackend() == TestBackend::HAZE)
+		// levelBudget {2,2}, dim1 {0,0}, derived correction factor — OpenFHEBootstrap's
+		// EvalBootstrapSetup({ 2, 2 }, { 0, 0 }, slots) verbatim.
+		cc->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0);
+		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
+		if (TestUseDevice())
 			cc->LoadContext(keys.publicKey);
 	}
 };
@@ -1128,8 +1120,6 @@ class CKKSBootstrapTest : public ::testing::Test {
 // ---- 8. Bootstrap ----
 
 TEST_F(CKKSBootstrapTest, Bootstrap) {
-	if (TestUseCuda())
-		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	// Encrypt DEPLETED so EvalBootstrap runs the real pipeline. A full-level input gains no levels,
 	// so bootstrap returns a clone of the input unchanged (HazeBootstrap.cpp:1237, mirroring OpenFHE
 	// ckksrns-fhe.cpp:835) — which still decrypts to v1 and passes: a false pass. kMaxBootLevel is
@@ -1145,8 +1135,6 @@ TEST_F(CKKSBootstrapTest, Bootstrap) {
 }
 
 TEST_F(CKKSBootstrapTest, BootstrapInPlace) {
-	if (TestUseCuda())
-		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	// Depleted input, same reason as CKKSBootstrapTest.Bootstrap above.
 	auto pt = cc->MakeCKKSPackedPlaintext(v1, 1, kMaxBootLevel, nullptr, kSlots);
 	auto ct = cc->Encrypt(pt, keys.publicKey);
@@ -1159,8 +1147,6 @@ TEST_F(CKKSBootstrapTest, BootstrapInPlace) {
 // ---- 9. GetPreScaleFactor (FIXEDAUTO) ----
 
 TEST_F(CKKSBootstrapTest, GetPreScaleFactorFIXEDAUTO) {
-	if (TestUseCuda())
-		GTEST_SKIP() << "FIXEDAUTO bootstrap setup segfaults on GPU (pre-existing on main, tracked separately)";
 	// EvalBootstrapSetup sets m_correctionFactor; without it the result underflows.
 	double r = cc->GetPreScaleFactor(kSlots);
 	EXPECT_TRUE(std::isfinite(r)) << "result is not finite: " << r;
