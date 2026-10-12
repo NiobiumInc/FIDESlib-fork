@@ -21,6 +21,7 @@
 #include "PreparedLinearTransform.hpp"
 #include "PublicKey.hpp"
 #include "Serialize.hpp"
+#include "cryptocontext-fwd.h"
 #include "key/evalkey-fwd.h"
 
 namespace fideslib {
@@ -113,7 +114,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// (CryptoContext.cpp:32-34), so there is no fideslib-typed key-map wrapper to return here
 	// (precedent: Ciphertext::GetElements() also returns a raw lbcrypto type). An unknown keyTag
 	// throws, matching OpenFHE's own behavior. The returned references are invalidated by this
-	// context's destructor, which calls ClearEvalMultKeys/ClearEvalAutomorphismKeys.
+	// context's destruction, if it is the last context over its OpenFHE context (keys are cleared then).
 	static const std::vector<lbcrypto::EvalKey<lbcrypto::DCRTPoly>>& GetEvalMultKeyVector(const std::string& keyTag);
 	static std::map<uint32_t, lbcrypto::EvalKey<lbcrypto::DCRTPoly>>& GetEvalAutomorphismKeyMap(const std::string& keyTag);
 	/// @brief Vector-index -> automorphism-index mapping (lbcrypto passthrough), keyed on this
@@ -623,6 +624,16 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	/// @brief Canonical host value (lbcrypto::CryptoContext); the backend-neutral context.
 	std::any host;
+	/// @brief Set `host` and register this facade as one of the users of that OpenFHE context.
+	///
+	/// OpenFHE keeps every evaluation key in process-wide maps. Those keys are cleared when the
+	/// last facade context over the same OpenFHE context goes away, and not before: destroying
+	/// one context (or the moved-from temporary a factory function builds) leaves the keys of
+	/// every other live context alone. Code that sets `host` has to go through this call.
+	void BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc);
+	/// @brief Keeps the OpenFHE evaluation keys alive while any facade context uses them; see
+	/// BindHostContext. Null on a moved-from context, so the husk of a move releases nothing.
+	std::shared_ptr<void> hostKeys_;
 	/// @brief Backend engine this context dispatches operations to (CPU or CUDA). Owns all backend state.
 	std::unique_ptr<Engine> engine_;
 	/// @brief Whether plaintexts should be automatically loaded to the device upon encryption.

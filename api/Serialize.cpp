@@ -138,7 +138,7 @@ bool DeserializeFromFile(const std::string& filename, fideslib::CryptoContext<fi
 	}
 
 	CryptoContextImpl<DCRTPoly> gpu_context;
-	gpu_context.host				 = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(context);
+	gpu_context.BindHostContext(context);
 	gpu_context.multiplicative_depth = context->GetCryptoParameters()->GetElementParams()->GetParams().size() - 1;
 	auto ptr						 = std::make_shared<CryptoContextImpl<DCRTPoly>>(std::move(gpu_context));
 	ptr->self_reference				 = std::weak_ptr<CryptoContextImpl<DCRTPoly>>(ptr);
