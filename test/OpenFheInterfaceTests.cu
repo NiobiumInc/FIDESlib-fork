@@ -2675,9 +2675,9 @@ class OpenFHEBootstrapTest : public GeneralParametrizedTest {
 // difference decrypts with the (much smaller) noise of the difference itself, so it measures how far the GPU result
 // really is from OpenFHE's.
 //
-// Where the two sides do the same operations in the same order (FIXEDMANUAL) the difference is zero up to rounding.
-// Elsewhere a bootstrap amplifies any rounding-level difference to the size of its own error, so the difference is
-// of that size and the check that matters is that the GPU result is as close to the true plaintext as OpenFHE's.
+// The two sides do the same operations in the same order under every technique, so the difference is zero up to
+// rounding. Any difference larger than that is a real one: a bootstrap amplifies a rounding-level difference to the size
+// of its own error, and a check on decrypted values could not see it.
 static void ExpectGpuMatchesOpenFHE(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
   const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys,
   const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& cRef,
@@ -2703,21 +2703,10 @@ static void ExpectGpuMatchesOpenFHE(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&
 
 	const double diffMax = MaxDecrypted(cc, keys, cc->EvalSub(cRef, cGPU));
 
-	const double precision = refPlain->GetLogPrecision();
-	double bound;
-	if (scaling == lbcrypto::FIXEDMANUAL) {
-		// Same operations in the same order: the results are equal up to the noise of decrypting a zero.
-		bound = 1e-12 * chained;
-	} else if ((scaling == lbcrypto::FLEXIBLEAUTO || scaling == lbcrypto::FLEXIBLEAUTOEXT) && chained == 1) {
-		// Small rounding differences remain after the Chebyshev series.
-		bound = 1e-6;
-	} else {
-		// FIXEDAUTO: the GPU differs from OpenFHE by about 1e-4 after a bootstrap, the size of the bootstrap's own
-		// error against the true plaintext, which is the same for both (so this is not a precision loss; where the
-		// difference comes from is not yet known). A chain of bootstraps under the FLEXIBLE techniques ends the same
-		// way. The estimated precision moves from run to run, hence the same limit as the decrypted values below.
-		bound = std::pow(2.0, 4.0 - precision) * chained;
-	}
+	// The GPU follows OpenFHE's evaluation operation by operation under every technique, so the difference is the noise
+	// of decrypting a zero, and it adds up over a chain. Measured in 6 runs of every parameter set: below 2e-15 for one
+	// bootstrap, below 8e-14 for the chain of ten.
+	const double bound = 1e-12 * chained;
 	std::cout << "GPU - OpenFHE: max " << diffMax << " (limit " << bound << ")" << std::endl;
 	ASSERT_LE(diffMax, bound);
 
@@ -4251,7 +4240,10 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapDense) {
 				cudaDeviceSynchronize();
 				FIDESlib::CKKS::Bootstrap(GPUct_aux, slots, false);
 				cudaDeviceSynchronize();
-				GPUct_aux.dropToLevel(2);
+				// Drop the towers and nothing else, as the reference does (LevelReduceInternalInPlace). dropToLevel without
+				// the second argument also corrects the scale under the FLEXIBLE techniques: the ciphertext then differs
+				// from the reference's by about 2e-10, which the next bootstrap amplifies to 2e-3.
+				GPUct_aux.dropToLevel(2, true);
 				GPUct1.copy(GPUct_aux);
 			}
 		}
