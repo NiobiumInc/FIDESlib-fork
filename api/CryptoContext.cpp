@@ -70,12 +70,15 @@ std::map<const void*, std::weak_ptr<void>>& HostKeysRegistry() {
 	return r;
 }
 
-std::shared_ptr<void> AcquireHostKeys(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc) {
+// `first` is set when no other facade context was using `cc`.
+std::shared_ptr<void> AcquireHostKeys(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, bool& first) {
 	std::lock_guard<std::mutex> guard(HostKeysLock());
 	auto& slot = HostKeysRegistry()[cc.get()];
 	if (auto live = slot.lock()) {
+		first = false;
 		return live;
 	}
+	first = true;
 	// The pointee is a throwaway; the deleter is the point. It holds `cc` so the context outlives
 	// its own cleanup, and it takes the lock again so that a context bound to the same OpenFHE
 	// context in the meantime (a new entry in the registry) keeps its keys.
@@ -99,9 +102,11 @@ std::shared_ptr<void> AcquireHostKeys(const lbcrypto::CryptoContext<lbcrypto::DC
 
 } // namespace
 
-void CryptoContextImpl<DCRTPoly>::BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc) {
-	host	  = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
-	hostKeys_ = AcquireHostKeys(cc);
+bool CryptoContextImpl<DCRTPoly>::BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc) {
+	bool first = false;
+	host	   = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
+	hostKeys_  = AcquireHostKeys(cc, first);
+	return first;
 }
 
 CryptoContextImpl<DCRTPoly>::~CryptoContextImpl() {

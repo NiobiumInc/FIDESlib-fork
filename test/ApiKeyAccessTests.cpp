@@ -299,3 +299,49 @@ TEST(ContextLifetimeTest, SerializedEvalMultKeyDeserializesIntoAnotherContext) {
 	// The original context multiplies again with the deserialized key.
 	ExpectKeysWork(a);
 }
+
+// A bootstrap-ready context keeps working when another context with the same parameters is created.
+TEST(ContextLifetimeTest, BootstrapSurvivesASecondContextWithTheSameParameters) {
+	if (TestUseDevice())
+		GTEST_SKIP() << "the second context would be a second loaded device context";
+	auto make = [](KeyPair<DCRTPoly>& keys, bool bootstrap) {
+		CCParams<CryptoContextCKKSRNS> params;
+		params.SetMultiplicativeDepth(23);
+		params.SetScalingModSize(59);
+		params.SetFirstModSize(60);
+		params.SetBatchSize(8);
+		params.SetRingDim(1u << 16);
+		params.SetScalingTechnique(FLEXIBLEAUTO);
+		params.SetKeySwitchTechnique(HYBRID);
+		params.SetNumLargeDigits(3);
+		params.SetSecretKeyDist(UNIFORM_TERNARY);
+		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetReducedNoise(LinkedOpenFheReducedNoise());
+		auto cc = GenCryptoContext(params);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		cc->Enable(FHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		if (bootstrap) {
+			cc->EvalBootstrapSetup({ 2, 2 }, { 0, 0 }, 32, 0);
+			cc->EvalBootstrapKeyGen(keys.secretKey, 32);
+		}
+		return cc;
+	};
+	KeyPair<DCRTPoly> ka, kb;
+	auto a = make(ka, true);
+	auto b = make(kb, false); // same parameters: the same OpenFHE context as `a`
+	auto pt = a->MakeCKKSPackedPlaintext(std::vector<double>{ 0.1, 0.2, 0.3, 0.4 }, 1, 21, nullptr, 32);
+	auto ct = a->Encrypt(pt, ka.publicKey);
+	Ciphertext<DCRTPoly> out;
+	ASSERT_NO_THROW(out = a->EvalBootstrap(ct));
+	Plaintext res;
+	a->Decrypt(out, ka.secretKey, &res);
+	res->SetLength(4);
+	const auto v = res->GetRealPackedValue();
+	EXPECT_NEAR(v[0], 0.1, 1e-2);
+	EXPECT_NEAR(v[3], 0.4, 1e-2);
+}

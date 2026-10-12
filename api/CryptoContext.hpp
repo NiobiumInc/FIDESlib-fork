@@ -630,7 +630,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// last facade context over the same OpenFHE context goes away, and not before: destroying
 	/// one context (or the moved-from temporary a factory function builds) leaves the keys of
 	/// every other live context alone. Code that sets `host` has to go through this call.
-	void BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc);
+	/// @return true if no other facade context was using @p cc, so its state is not shared with
+	/// a live context (OpenFHE hands the same context out again for equal parameters).
+	bool BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc);
 	/// @brief Keeps the OpenFHE evaluation keys alive while any facade context uses them; see
 	/// BindHostContext. Null on a moved-from context, so the husk of a move releases nothing.
 	std::shared_ptr<void> hostKeys_;

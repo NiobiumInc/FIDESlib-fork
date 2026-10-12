@@ -20,11 +20,11 @@ CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params)
 	auto& impl_params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(params.host);
 	auto cc			  = lbcrypto::GenCryptoContext(impl_params);
 
-	if (std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE))
-		std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.clear();
-
 	CryptoContextImpl<DCRTPoly> context;
-	context.BindHostContext(cc);
+	// OpenFHE hands out the same context for equal parameters. The bootstrap precomputations left
+	// on it by an earlier, destroyed context are cleared; those a live context built on it are not.
+	if (context.BindHostContext(cc) && std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE))
+		std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.clear();
 	context.engine_				  = MakeEngine(params.backend, *params.reducedNoise);
 	context.auto_load_plaintexts  = params.plaintextAutoload;
 	context.auto_load_ciphertexts = params.ciphertextAutoload;
