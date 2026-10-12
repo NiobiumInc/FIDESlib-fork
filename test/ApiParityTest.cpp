@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <any>
 #include <cmath>
+#include <cstdio>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -136,6 +138,75 @@ static void ExpectSlotsNear(CryptoContext<DCRTPoly>& cc,
 	auto vo = porc->GetRealPackedValue();
 	for (size_t i = 0; i < slots; ++i)
 		EXPECT_NEAR(vg[i], vo[i], tol) << "slot " << i;
+}
+
+// The largest difference between the real slots of two ciphertexts, and the largest distance of each
+// from the plaintext they were meant to hold; printed so the log shows how far the device is from
+// the host bootstrap next to how far either is from the right answer.
+static void ReportBootstrapDifference(const char* label,
+  CryptoContext<DCRTPoly>& cc,
+  const PrivateKey<DCRTPoly>& sk,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& got,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle,
+  const std::vector<double>& expected) {
+	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+	lbcrypto::Plaintext pg, po;
+	LbCc(cc)->Decrypt(skImpl, got, &pg);
+	LbCc(cc)->Decrypt(skImpl, oracle, &po);
+	pg->SetLength(expected.size());
+	po->SetLength(expected.size());
+	const auto vg = pg->GetRealPackedValue();
+	const auto vo = po->GetRealPackedValue();
+	double apart = 0, errGot = 0, errOracle = 0;
+	for (size_t i = 0; i < expected.size(); ++i) {
+		apart	  = std::max(apart, std::abs(vg[i] - vo[i]));
+		errGot	  = std::max(errGot, std::abs(vg[i] - expected[i]));
+		errOracle = std::max(errOracle, std::abs(vo[i] - expected[i]));
+	}
+	char line[256];
+	std::snprintf(line, sizeof line, "[parity] %s: apart %.3e, device from plaintext %.3e, host from plaintext %.3e\n", label, apart, errGot, errOracle);
+	std::cout << line;
+}
+
+// A bootstrap is not deterministic: two bootstraps of copies of the same ciphertext, on OpenFHE
+// alone or on the device, differ from each other by about as much as either differs from the
+// plaintext. Comparing the device with one host run therefore compares two noise samples. What the
+// device must show is that its error from the plaintext is of the size OpenFHE's own errors are, so
+// the host bootstrap is run several times and the device must stay within a factor of the worst of
+// them (no bound is fixed by hand: it follows the parameters).
+static constexpr size_t kHostBootstrapRuns	   = 5;
+static constexpr double kDeviceErrorFactor	   = 3.0;
+
+static double MaxErrorFromPlaintext(CryptoContext<DCRTPoly>& cc,
+  const PrivateKey<DCRTPoly>& sk,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct,
+  const std::vector<double>& expected) {
+	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+	lbcrypto::Plaintext pt;
+	LbCc(cc)->Decrypt(skImpl, ct, &pt);
+	pt->SetLength(expected.size());
+	const auto v = pt->GetRealPackedValue();
+	double worst = 0;
+	for (size_t i = 0; i < expected.size(); ++i)
+		worst = std::max(worst, std::abs(v[i] - expected[i]));
+	return worst;
+}
+
+static void ExpectDeviceBootstrapAsAccurateAsHost(const char* label,
+  CryptoContext<DCRTPoly>& cc,
+  const PrivateKey<DCRTPoly>& sk,
+  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& device,
+  const std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>& hostRuns,
+  const std::vector<double>& expected) {
+	const double errDevice = MaxErrorFromPlaintext(cc, sk, device, expected);
+	double errHostWorst	   = 0;
+	for (const auto& h : hostRuns)
+		errHostWorst = std::max(errHostWorst, MaxErrorFromPlaintext(cc, sk, h, expected));
+	char line[256];
+	std::snprintf(line, sizeof line, "[parity] %s: device error from the plaintext %.3e, worst of %zu host bootstraps %.3e\n", label, errDevice, hostRuns.size(), errHostWorst);
+	std::cout << line;
+	EXPECT_LE(errDevice, kDeviceErrorFactor * errHostWorst + 1e-12)
+	  << "the device bootstrap is further from the plaintext than " << kDeviceErrorFactor << " times the worst of " << hostRuns.size() << " OpenFHE bootstraps";
 }
 
 // Same parameters as the api correctness fixture (ApiTests.cpp): depth 5, ringDim 65536, 8 slots,
@@ -1181,6 +1252,7 @@ TEST_P(ApiParityBootstrapTest, EvalBootstrap) {
 												 << "} and depth " << depth() << ": it returned the input unchanged, so this test exercised nothing";
 	auto got	   = HostCt(cc, refreshed);
 	auto oracle	   = LbCc(cc)->EvalBootstrap(lbCt);
+	ReportBootstrapDifference(("ApiParityBootstrapTest lvlb" + std::to_string(GetParam().at(0)) + "_" + std::to_string(GetParam().at(1))).c_str(), cc, keys.secretKey, got, oracle, v1);
 	ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-2);
 }
 
@@ -1206,8 +1278,9 @@ INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityBootstrapTest,
 // runs the real pipeline rather than early-returning unchanged (a false pass).
 //
 // Parametrized over (levelBudget, scalingTechnique): the haze bootstrap supports
-// FIXEDAUTO/FLEXIBLEAUTO/FLEXIBLEAUTOEXT (not FIXEDMANUAL). N=4096 fully-packed runs in-process on
-// the local FHETCH simulator (OOM is no longer a concern at this ring).
+// FIXEDAUTO/FLEXIBLEAUTO/FLEXIBLEAUTOEXT; the haze bootstrap does not support FIXEDMANUAL, so that case
+// runs on CUDA only. N=4096 fully-packed runs in-process on the local FHETCH simulator (OOM is no
+// longer a concern at this ring) and on CUDA.
 struct FullPackParam {
 	std::vector<uint32_t> levelBudget;
 	ScalingTechnique scalingTech;
@@ -1233,9 +1306,6 @@ class ApiParityFullPackBootstrapTest : public ::testing::TestWithParam<FullPackP
 			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE). Set "
 							"FIDESLIB_FULLPACK_RUN_CPU=1 to run the OpenFHE-oracle isolation path (setup/keygen "
 							"+ bootstrap on pure OpenFHE, no haze) for parameter diagnosis.";
-		if (TestUseCuda())
-			GTEST_SKIP() << "fully-packed parity is validated on haze; run with FIDESLIB_TEST_BACKEND=haze.";
-
 		const FullPackParam& p = GetParam();
 
 		if (const char* r = std::getenv("FIDESLIB_FULLPACK_RING")) {
@@ -1371,7 +1441,8 @@ INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityFullPackBootstrapTest,
 	FullPackParam{ { 3, 3 }, FLEXIBLEAUTO, "FLEXIBLEAUTO" },
 	FullPackParam{ { 3, 3 }, FLEXIBLEAUTOEXT, "FLEXIBLEAUTOEXT" },
 	FullPackParam{ { 4, 4 }, FIXEDAUTO, "FIXEDAUTO" },
-	FullPackParam{ { 4, 4 }, FLEXIBLEAUTO, "FLEXIBLEAUTO" }),
+	FullPackParam{ { 4, 4 }, FLEXIBLEAUTO, "FLEXIBLEAUTO" },
+	FullPackParam{ { 3, 3 }, FIXEDMANUAL, "FIXEDMANUAL" }),
   [](const ::testing::TestParamInfo<FullPackParam>& info) {
 	  return "lvlb" + std::to_string(info.param.levelBudget[0]) + "_" + std::to_string(info.param.levelBudget[1]) + "_" + info.param.techName;
   });
@@ -1441,6 +1512,7 @@ TEST_F(ApiParitySparseSecretBootstrapTest, EvalBootstrap) {
 	ASSERT_LT(refreshed->GetLevel(), levelBefore) << "bootstrap gained no levels: it returned the input unchanged, so this test exercised nothing";
 	auto got	= HostCt(cc, refreshed);
 	auto oracle = LbCc(cc)->EvalBootstrap(lbCt);
+	ReportBootstrapDifference("ApiParitySparseSecretBootstrapTest", cc, keys.secretKey, got, oracle, v1);
 	ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-2);
 }
 
@@ -1722,3 +1794,108 @@ TEST_P(ApiParityTechniqueTest, AddMany) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
+
+// ---------------------------------------------------------------------------------------------
+// Bootstrap parity across scaling techniques, key distributions, level budgets and slot counts.
+//
+// The shapes the old compat suite covered (they replace its bootstrap tests): a sparse and a
+// 64-slot bootstrap, a {1,1} budget (the linear-transform branch), FIXEDMANUAL, FIXEDAUTO,
+// FLEXIBLEAUTO and FLEXIBLEAUTOEXT, sparse-ternary and sparse-encapsulated secrets. A toy ring
+// (N = 4096) and depth 25 keep each case cheap. The input is depleted to the deepest level the host
+// bootstrap accepts, so that the refresh does real work. The refresh is judged by its distance from the
+// plaintext against that of repeated OpenFHE bootstraps (see ExpectDeviceBootstrapAsAccurateAsHost).
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+struct BootstrapShape {
+	const char* name;
+	ScalingTechnique technique;
+	SecretKeyDist dist;
+	std::vector<uint32_t> levelBudget;
+	uint32_t slots;
+	uint32_t correctionFactor;
+};
+
+class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapShape> {
+  protected:
+	static constexpr uint32_t kDepth	 = 25;
+	static constexpr uint32_t kScaleMod	 = 50;
+	static constexpr uint32_t kRingDim	 = 1u << 12;
+
+	CryptoContext<DCRTPoly> cc;
+	KeyPair<DCRTPoly> keys;
+
+	void SetUp() override {
+		const BootstrapShape& p = GetParam();
+		if (GetTestBackend() == TestBackend::CPU)
+			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
+							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
+		if (GetTestBackend() == TestBackend::HAZE) {
+			if (p.technique == FIXEDMANUAL)
+				GTEST_SKIP() << "the haze bootstrap supports FIXEDAUTO, FLEXIBLEAUTO and FLEXIBLEAUTOEXT, not FIXEDMANUAL";
+			const char* tgt = std::getenv("FIDESLIB_HAZE_TARGET");
+			if (p.technique != FIXEDAUTO && (tgt == nullptr || tgt[0] == '\0' || std::string(tgt) == "local"))
+				GTEST_SKIP() << "the in-process replay bridge rejects FLEXIBLE scaling primes at rings below 2^16; "
+								"set FIDESLIB_HAZE_TARGET to a non-local target to run FLEXIBLE on haze";
+		}
+		CCParams<CryptoContextCKKSRNS> params;
+		params.SetSecretKeyDist(p.dist);
+		params.SetScalingTechnique(p.technique);
+		params.SetMultiplicativeDepth(kDepth);
+		params.SetScalingModSize(kScaleMod);
+		params.SetBatchSize(p.slots);
+		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetRingDim(kRingDim);
+		ConfigureTestEngine(params);
+		cc = GenCryptoContext(params);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		cc->Enable(FHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		cc->EvalBootstrapSetup(p.levelBudget, { 0, 0 }, p.slots, p.correctionFactor);
+		cc->EvalBootstrapKeyGen(keys.secretKey, p.slots);
+		cc->LoadContext(keys.publicKey);
+	}
+};
+
+std::string BootstrapShapeName(const ::testing::TestParamInfo<BootstrapShape>& info) {
+	return info.param.name;
+}
+
+} // namespace
+
+TEST_P(ApiParityBootstrapShapeTest, EvalBootstrap) {
+	const BootstrapShape& p = GetParam();
+	// The deepest level the host EvalBootstrap accepts: depth - (decode budget + 2), and one level
+	// less deep under FLEXIBLEAUTOEXT, whose extra tower the guard counts.
+	const uint32_t level = p.technique == FLEXIBLEAUTOEXT ? kDepth - 2 : kDepth - (p.levelBudget.at(1) + 2);
+	const std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	auto pt					  = cc->MakeCKKSPackedPlaintext(x, 1, level, nullptr, p.slots);
+	auto ct					  = cc->Encrypt(pt, keys.publicKey);
+	auto lbCt				  = LbCt(ct)->Clone();
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> hostRuns;
+	for (size_t i = 0; i < kHostBootstrapRuns; ++i)
+		hostRuns.push_back(LbCc(cc)->EvalBootstrap(lbCt->Clone()));
+	const size_t levelBefore  = ct->GetLevel();
+	auto refreshed			  = cc->EvalBootstrap(ct);
+	// A refresh that gained no levels returns its input, and the comparison would hold vacuously.
+	ASSERT_LT(refreshed->GetLevel(), levelBefore) << "the bootstrap gained no levels, so this test exercised nothing";
+	ExpectDeviceBootstrapAsAccurateAsHost(p.name, cc, keys.secretKey, HostCt(cc, refreshed), hostRuns, x);
+}
+
+INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
+  ::testing::Values(
+	BootstrapShape{ "Sparse_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "LinearTransform_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
+	BootstrapShape{ "Slots64_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 64, 0 },
+	BootstrapShape{ "Sparse_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
+	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 }),
+  BootstrapShapeName);
