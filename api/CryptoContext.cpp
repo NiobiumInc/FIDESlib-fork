@@ -57,14 +57,65 @@ static std::unordered_map<PKESchemeFeature, lbcrypto::PKESchemeFeature> PKESchem
 	{ PKESchemeFeature::SCHEMESWITCH, lbcrypto::SCHEMESWITCH },
 };
 
+namespace {
+
+// One entry per OpenFHE context that some facade context uses. The shared_ptr handed to each
+// user clears the context's evaluation keys when the last user releases it.
+std::mutex& HostKeysLock() {
+	static std::mutex m;
+	return m;
+}
+std::map<const void*, std::weak_ptr<void>>& HostKeysRegistry() {
+	static std::map<const void*, std::weak_ptr<void>> r;
+	return r;
+}
+
+// `first` is set when no other facade context was using `cc`.
+std::shared_ptr<void> AcquireHostKeys(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, bool& first) {
+	std::lock_guard<std::mutex> guard(HostKeysLock());
+	auto& slot = HostKeysRegistry()[cc.get()];
+	if (auto live = slot.lock()) {
+		first = false;
+		return live;
+	}
+	first = true;
+	// The pointee is a throwaway; the deleter is the point. It holds `cc` so the context outlives
+	// its own cleanup, and it takes the lock again so that a context bound to the same OpenFHE
+	// context in the meantime (a new entry in the registry) keeps its keys.
+	std::shared_ptr<void> token(new char(0), [cc](void* p) {
+		delete static_cast<char*>(p);
+		std::lock_guard<std::mutex> inner(HostKeysLock());
+		auto& reg = HostKeysRegistry();
+		auto it	  = reg.find(cc.get());
+		if (it != reg.end() && it->second.lock()) {
+			return;
+		}
+		if (it != reg.end()) {
+			reg.erase(it);
+		}
+		lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalMultKeys(cc);
+		lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalAutomorphismKeys(cc);
+	});
+	slot = token;
+	return token;
+}
+
+} // namespace
+
+bool CryptoContextImpl<DCRTPoly>::BindHostContext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc) {
+	bool first = false;
+	host	   = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
+	hostKeys_  = AcquireHostKeys(cc, first);
+	return first;
+}
+
 CryptoContextImpl<DCRTPoly>::~CryptoContextImpl() {
-	// Tear down backend state (e.g. GPU context) before clearing the OpenFHE eval keys.
+	// Tear down backend state (e.g. GPU context) before the OpenFHE eval keys can go: they are
+	// released with hostKeys_, after this body, and only if no other context uses them.
 	// engine_ is null on a moved-from context.
 	if (engine_) {
 		engine_->teardown();
 	}
-	lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalMultKeys();
-	lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalAutomorphismKeys();
 }
 
 // ---- Enable features ----

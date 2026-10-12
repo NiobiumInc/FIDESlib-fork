@@ -995,42 +995,6 @@ TEST_F(CKKSTest, SparseEncapsulatedContext) {
 
 // ---- 13. Serialization ----
 
-TEST_F(CKKSTest, SerializeDeserializeEvalMultKey) {
-	// Serialize the eval mult key (generated in SetUp) to a buffer.
-	std::ostringstream oss;
-	ASSERT_TRUE(CryptoContextImpl<DCRTPoly>::SerializeEvalMultKey(oss, SerType::BINARY));
-	EXPECT_GT(oss.str().size(), 0u);
-
-	// Create a second context with the same parameters but no mult key.
-	// Deserializing into it verifies the binary format is self-consistent.
-	CCParams<CryptoContextCKKSRNS> params;
-	params.SetMultiplicativeDepth(kDepth);
-	params.SetScalingModSize(50);
-	params.SetBatchSize(kSlots);
-	params.SetRingDim(kRingDim);
-	params.SetScalingTechnique(FIXEDAUTO);
-	params.SetSecurityLevel(HEStd_NotSet);
-	params.SetReducedNoise(LinkedOpenFheReducedNoise());
-	auto cc2 = GenCryptoContext(params);
-	cc2->Enable(PKE);
-	cc2->Enable(KEYSWITCH);
-	cc2->Enable(LEVELEDSHE);
-
-	std::istringstream iss(oss.str());
-	ASSERT_TRUE(cc2->DeserializeEvalMultKey(iss, SerType::BINARY));
-
-	// Confirm the original context can still multiply (its keys are still live).
-	std::vector<double> expected(v1.size());
-	for (size_t i = 0; i < v1.size(); ++i)
-		expected[i] = v1[i] * v2[i];
-	auto pt1 = cc->MakeCKKSPackedPlaintext(v1);
-	auto pt2 = cc->MakeCKKSPackedPlaintext(v2);
-	auto ct1 = cc->Encrypt(pt1, keys.publicKey);
-	auto ct2 = cc->Encrypt(pt2, keys.publicKey);
-	auto res = cc->EvalMult(ct1, ct2);
-	CheckPrecision(cc, res, keys.secretKey, expected, CKKS_PRECISION);
-}
-
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------------------
 // THE HOST SHADOW'S COPY-ON-WRITE, UNDER CONCURRENCY.

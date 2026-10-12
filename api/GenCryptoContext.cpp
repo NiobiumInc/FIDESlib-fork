@@ -20,11 +20,11 @@ CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params)
 	auto& impl_params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(params.host);
 	auto cc			  = lbcrypto::GenCryptoContext(impl_params);
 
-	if (std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE))
-		std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.clear();
-
 	CryptoContextImpl<DCRTPoly> context;
-	context.host				  = std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
+	// OpenFHE hands out the same context for equal parameters. The bootstrap precomputations left
+	// on it by an earlier, destroyed context are cleared; those a live context built on it are not.
+	if (context.BindHostContext(cc) && std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE))
+		std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.clear();
 	context.engine_				  = MakeEngine(params.backend, *params.reducedNoise);
 	context.auto_load_plaintexts  = params.plaintextAutoload;
 	context.auto_load_ciphertexts = params.ciphertextAutoload;
@@ -42,17 +42,11 @@ CryptoContext<DCRTPoly> ImportCryptoContext(const lbcrypto::CryptoContext<lbcryp
 	if (!cc) {
 		OPENFHE_THROW("ImportCryptoContext: null lbcrypto CryptoContext");
 	}
-	// Built IN PLACE, deliberately: ~CryptoContextImpl() calls ClearEvalMultKeys() /
-	// ClearEvalAutomorphismKeys() unconditionally -- the engine_ null-check guards only the
-	// teardown, not the clears. Constructing a stack object and moving it (the way
-	// GenCryptoContext does) therefore destroys a moved-from husk whose destructor WIPES
-	// OpenFHE's process-global key maps. GenCryptoContext survives that because callers
-	// register keys after it; an imported context is the opposite order -- a server has
-	// already called EvalMultKeyGen -- and the keys would be silently deleted, surfacing
-	// later as "Call EvalMultKeyGen() to have EvalMultKey available for ID [...]" for a tag
-	// that demonstrably IS registered.
+	// The keys the caller already generated (a server calls EvalMultKeyGen before it imports
+	// anything) stay registered: they are released with the last context over `cc`, and this one
+	// is such a context from here on.
 	auto ptr					= std::make_shared<CryptoContextImpl<DCRTPoly>>();
-	ptr->host					= std::make_any<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>>(cc);
+	ptr->BindHostContext(cc);
 	ptr->engine_				= MakeEngine(backend, reducedNoise);
 	ptr->auto_load_plaintexts	= false;
 	ptr->auto_load_ciphertexts	= true;

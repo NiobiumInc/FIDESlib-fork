@@ -8,6 +8,7 @@
 #include <any>
 #include <cstdlib>
 #include <gtest/gtest.h>
+#include <sstream>
 #include <openfhe.h>
 #include <string>
 #include <vector>
@@ -166,4 +167,181 @@ TEST_F(NoEvalMultKeyTest, RelinearizeInPlaceDegree1WithoutEvalMultKeyThrows) {
 	// haveRelinKey_ check above the degree branch in HazeEngine::relinearizeCore.
 	auto a = EncryptVec(cc, v1, keys.publicKey);
 	EXPECT_THROW(cc->RelinearizeInPlace(a), std::exception);
+}
+
+// ---------------------------------------------------------------------------
+// Context lifetime. OpenFHE keeps every evaluation key in process-wide maps, so the facade has
+// to say when a context's keys go away: when the last facade context over the same OpenFHE
+// context is destroyed, and not when another context is created or destroyed meanwhile.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct LiveContext {
+	CryptoContext<DCRTPoly> cc;
+	KeyPair<DCRTPoly> keys;
+};
+
+// A context with its multiplication and rotation keys. A different depth gives a different
+// OpenFHE context; the same depth gives the same one, which OpenFHE hands out again.
+// `onTestBackend` false builds the context on the CPU engine whatever backend the suite runs on:
+// the haze backend loads one context per process, so a second context next to a loaded one has
+// to be a CPU one. That is also the case this is about, a CPU reference next to a device context.
+LiveContext MakeLiveContext(uint32_t depth, bool onTestBackend = true) {
+	CCParams<CryptoContextCKKSRNS> params;
+	params.SetMultiplicativeDepth(depth);
+	params.SetScalingModSize(50);
+	params.SetBatchSize(8);
+	params.SetRingDim(1u << 13);
+	params.SetSecurityLevel(HEStd_NotSet);
+	params.SetScalingTechnique(FIXEDAUTO);
+	if (onTestBackend)
+		ConfigureTestEngine(params);
+	else
+		params.SetReducedNoise(LinkedOpenFheReducedNoise());
+	LiveContext c;
+	c.cc = GenCryptoContext(params);
+	c.cc->Enable(PKE);
+	c.cc->Enable(KEYSWITCH);
+	c.cc->Enable(LEVELEDSHE);
+	c.keys = c.cc->KeyGen();
+	c.cc->EvalMultKeyGen(c.keys.secretKey);
+	c.cc->EvalRotateKeyGen(c.keys.secretKey, { 1, 2 });
+	if (onTestBackend && TestUseDevice())
+		c.cc->LoadContext(c.keys.publicKey);
+	return c;
+}
+
+// The context still multiplies (relinearization key) and rotates (rotation key).
+void ExpectKeysWork(LiveContext& c) {
+	const std::vector<double> v = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+	auto ct	  = EncryptVec(c.cc, v, c.keys.publicKey);
+	auto sq	  = c.cc->EvalMult(ct, ct);
+	auto rot	  = c.cc->EvalRotate(ct, 1);
+	// The haze backend needs a result declared as an output before it is decrypted; elsewhere this does nothing.
+	c.cc->MarkOutput(sq);
+	c.cc->MarkOutput(rot);
+	Plaintext sqPt, rotPt;
+	c.cc->Decrypt(sq, c.keys.secretKey, &sqPt);
+	c.cc->Decrypt(rot, c.keys.secretKey, &rotPt);
+	sqPt->SetLength(8);
+	rotPt->SetLength(8);
+	const auto sqv	= sqPt->GetRealPackedValue();
+	const auto rotv = rotPt->GetRealPackedValue();
+	for (size_t i = 0; i < v.size(); ++i) {
+		EXPECT_NEAR(sqv[i], v[i] * v[i], 1e-3) << "slot " << i;
+		EXPECT_NEAR(rotv[i], v[(i + 1) % v.size()], 1e-3) << "slot " << i;
+	}
+}
+
+} // namespace
+
+TEST(ContextLifetimeTest, CreatingAContextWithOtherParametersKeepsTheFirstContextsKeys) {
+	auto a = MakeLiveContext(3);
+	auto b = MakeLiveContext(4, false);
+	ExpectKeysWork(a);
+	ExpectKeysWork(b);
+}
+
+TEST(ContextLifetimeTest, CreatingAContextWithTheSameParametersKeepsTheFirstContextsKeys) {
+	auto a = MakeLiveContext(3);
+	auto b = MakeLiveContext(3, false);
+	ExpectKeysWork(a);
+	ExpectKeysWork(b);
+}
+
+TEST(ContextLifetimeTest, DestroyingAContextKeepsTheKeysOfAnotherOverTheSameParameters) {
+	auto a = MakeLiveContext(3);
+	{
+		auto b = MakeLiveContext(3, false);
+		ExpectKeysWork(b);
+	}
+	ExpectKeysWork(a);
+}
+
+TEST(ContextLifetimeTest, DestroyingAContextKeepsTheKeysOfAnotherOverOtherParameters) {
+	auto a = MakeLiveContext(3);
+	{
+		auto b = MakeLiveContext(4, false);
+		ExpectKeysWork(b);
+	}
+	ExpectKeysWork(a);
+}
+
+TEST(ContextLifetimeTest, DestroyingTheLastContextClearsItsKeys) {
+	std::string tag;
+	{
+		auto a = MakeLiveContext(3);
+		tag	= std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(a.keys.publicKey->pimpl)->GetKeyTag();
+		ASSERT_FALSE(CryptoContextImpl<DCRTPoly>::GetEvalMultKeyVector(tag).empty());
+		ASSERT_NO_THROW(CryptoContextImpl<DCRTPoly>::GetEvalAutomorphismKeyMap(tag));
+	}
+	EXPECT_THROW(CryptoContextImpl<DCRTPoly>::GetEvalMultKeyVector(tag), std::exception);
+	EXPECT_THROW(CryptoContextImpl<DCRTPoly>::GetEvalAutomorphismKeyMap(tag), std::exception);
+}
+
+// The serialized multiplication key goes into a second context once the key is gone from this
+// process, as it would be in a fresh one. (OpenFHE refuses to insert a vector for a tag that
+// already has one.)
+TEST(ContextLifetimeTest, SerializedEvalMultKeyDeserializesIntoAnotherContext) {
+	auto a = MakeLiveContext(3);
+	const auto tag = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(a.keys.publicKey->pimpl)->GetKeyTag();
+	std::ostringstream oss;
+	ASSERT_TRUE(CryptoContextImpl<DCRTPoly>::SerializeEvalMultKey(oss, SerType::BINARY));
+	EXPECT_GT(oss.str().size(), 0u);
+
+	lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalMultKeys(tag);
+	ASSERT_THROW(CryptoContextImpl<DCRTPoly>::GetEvalMultKeyVector(tag), std::exception);
+
+	auto b = MakeLiveContext(3, false);
+	std::istringstream iss(oss.str());
+	ASSERT_TRUE(b.cc->DeserializeEvalMultKey(iss, SerType::BINARY));
+	EXPECT_FALSE(CryptoContextImpl<DCRTPoly>::GetEvalMultKeyVector(tag).empty());
+	// The original context multiplies again with the deserialized key.
+	ExpectKeysWork(a);
+}
+
+// A bootstrap-ready context keeps working when another context with the same parameters is created.
+TEST(ContextLifetimeTest, BootstrapSurvivesASecondContextWithTheSameParameters) {
+	if (TestUseDevice())
+		GTEST_SKIP() << "the second context would be a second loaded device context";
+	auto make = [](KeyPair<DCRTPoly>& keys, bool bootstrap) {
+		CCParams<CryptoContextCKKSRNS> params;
+		params.SetMultiplicativeDepth(23);
+		params.SetScalingModSize(59);
+		params.SetFirstModSize(60);
+		params.SetBatchSize(8);
+		params.SetRingDim(1u << 16);
+		params.SetScalingTechnique(FLEXIBLEAUTO);
+		params.SetKeySwitchTechnique(HYBRID);
+		params.SetNumLargeDigits(3);
+		params.SetSecretKeyDist(UNIFORM_TERNARY);
+		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetReducedNoise(LinkedOpenFheReducedNoise());
+		auto cc = GenCryptoContext(params);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		cc->Enable(FHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		if (bootstrap) {
+			cc->EvalBootstrapSetup({ 2, 2 }, { 0, 0 }, 32, 0);
+			cc->EvalBootstrapKeyGen(keys.secretKey, 32);
+		}
+		return cc;
+	};
+	KeyPair<DCRTPoly> ka, kb;
+	auto a = make(ka, true);
+	auto b = make(kb, false); // same parameters: the same OpenFHE context as `a`
+	auto pt = a->MakeCKKSPackedPlaintext(std::vector<double>{ 0.1, 0.2, 0.3, 0.4 }, 1, 21, nullptr, 32);
+	auto ct = a->Encrypt(pt, ka.publicKey);
+	Ciphertext<DCRTPoly> out;
+	ASSERT_NO_THROW(out = a->EvalBootstrap(ct));
+	Plaintext res;
+	a->Decrypt(out, ka.secretKey, &res);
+	res->SetLength(4);
+	const auto v = res->GetRealPackedValue();
+	EXPECT_NEAR(v[0], 0.1, 1e-2);
+	EXPECT_NEAR(v[3], 0.4, 1e-2);
 }
