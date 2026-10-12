@@ -99,10 +99,6 @@ def main():
         total_all = sum(r[2] for r in rows)
         lines.append(f"| | **Total** | **{total_all:,}** | **{ran:,}** | **{passed:,}** | **{failed}** | **{skipped}** | **{disabled}** |")
 
-    if ran + skipped + disabled:
-        slices = [(name, n) for name, n in (("Passed", passed), ("Failed", failed), ("Skipped", skipped), ("Disabled", disabled)) if n]
-        lines += ["", "```mermaid", "pie showData title Tests by outcome"] + [f'    "{name}" : {n}' for name, n in slices] + ["```"]
-
     for label, found, _, _, _, _, r_skipped, _, reasons in rows:
         if not found or not reasons:
             continue

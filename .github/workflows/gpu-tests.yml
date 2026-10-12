@@ -87,7 +87,7 @@ jobs:
               limit=300 ;;
             *)
               echo "run=true" >> "$GITHUB_OUTPUT"
-              echo "**Tests run:** $EVENT event." >> "$GITHUB_STEP_SUMMARY"
+              printf '## 🔎 Do the tests run?\n\n✅ **Yes:** %s event.\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
               exit 0 ;;
           esac
           python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt --file-limit "$limit" \

@@ -60,7 +60,7 @@ jobs:
         run: |
           if [ "$EVENT" != pull_request ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "**Tests run:** $EVENT event, not a pull request." >> "$GITHUB_STEP_SUMMARY"
+            printf '## 🔎 Do the tests run?\n\n✅ **Yes:** %s event, not a pull request, so everything is tested.\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" \
@@ -239,19 +239,6 @@ jobs:
           source /opt/rh/gcc-toolset-14/enable
           mkdir -p "$FIDESLIB_HAZE_RUNS_DIR"
           ./fideslib-cpu-test --gtest_output="xml:$RUNNER_TEMP/results.xml"
-
-      - name: Report
-        if: always()
-        run: |
-          {
-            echo "### ${{ matrix.backend }} tests, shard ${{ matrix.shard }} of ${{ matrix.shards }}"
-            if [ -f "$RUNNER_TEMP/results.xml" ]; then
-              head -2 "$RUNNER_TEMP/results.xml" | grep -o '<testsuites [^>]*' | grep -oE '(tests|failures|disabled|errors)="[0-9]+"' | tr '\n' ' '
-              echo
-            else
-              echo "No result file: the binary did not finish."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
