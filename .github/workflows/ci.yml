@@ -283,7 +283,7 @@ jobs:
 
       - name: Summarize
         run: |
-          python3 -I .github/scripts/test_summary.py --title "Tests without a GPU" \
+          python3 -I .github/scripts/test_summary.py --title "🧪 Tests without a GPU" \
             --row "CPU backend, development build=results/cpu-dev-test-results/*.xml" \
             --row "CPU backend, release build=results/cpu-test-results-*/*.xml" \
             --row "haze backend, release build=results/haze-test-results-*/*.xml"

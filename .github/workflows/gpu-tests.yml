@@ -275,7 +275,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: build
         run: |
-          python3 -I ../.github/scripts/test_summary.py --title "GPU tests, totals" \
+          python3 -I ../.github/scripts/test_summary.py --title "⚡ GPU tests, totals" \
             --row "Default suite=gpu-results/gate.xml" \
             --row "Concurrent operations, one process per test=gpu-results/concurrent/gate/*.xml" \
             --row "Concurrent lanes together=gpu-results/concurrent-one-process/gate.xml" \
