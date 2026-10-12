@@ -433,10 +433,21 @@ class Ciphertext {
 	 */
 	void growToLevel(int level);
 
-	/** @brief Drops the ciphertext to a lower level, discarding higher moduli.
-
-		@todo adjust the scale on FLEXIBLE modes
-	*/
+	/**
+	 * @brief Drops the ciphertext to a lower level, discarding higher moduli.
+	 *
+	 * Under the FLEXIBLE techniques this also adjusts the scale to the one of the target level (the
+	 * adjustment an operation between two levels makes, adjustScaleAndLevel), so the result has the scale
+	 * the level's table gives. OpenFHE's LevelReduceInPlace does neither under those techniques: it does
+	 * nothing, and the automatic techniques adjust when an operation needs it; its internal
+	 * LevelReduceInternalInPlace only removes the towers. The two results are equally accurate but differ by
+	 * the ratio of the scales, about 1e-10 of the value, and whatever follows amplifies that (a bootstrap by
+	 * about 1e7). To drop towers and nothing else, as the reference of a comparison with OpenFHE does, pass
+	 * `skip_adjust = true`. Under the FIXED techniques the scale does not change and both agree.
+	 *
+	 * @param level Level to drop to.
+	 * @param skip_adjust Drop the towers without adjusting the scale.
+	 */
 	void dropToLevel(int level, bool skip_adjust = false);
 
 	/**
