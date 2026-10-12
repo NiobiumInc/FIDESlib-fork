@@ -1834,11 +1834,12 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 		if (GetTestBackend() == TestBackend::HAZE) {
 			if (p.technique == FIXEDMANUAL)
 				GTEST_SKIP() << "the haze bootstrap supports FIXEDAUTO, FLEXIBLEAUTO and FLEXIBLEAUTOEXT, not FIXEDMANUAL";
-			const char* tgt = std::getenv("FIDESLIB_HAZE_TARGET");
-			if (p.technique != FIXEDAUTO && (tgt == nullptr || tgt[0] == '\0' || std::string(tgt) == "local"))
-				GTEST_SKIP() << "the in-process replay bridge rejects FLEXIBLE scaling primes at rings below 2^16; "
-								"set FIDESLIB_HAZE_TARGET to a non-local target to run FLEXIBLE on haze";
+			if (p.dist == SPARSE_ENCAPSULATED)
+				GTEST_SKIP() << "the haze bootstrap does not support SPARSE_ENCAPSULATED secrets: its output does not decrypt";
 		}
+		// The in-process replay bridge rejects FLEXIBLE scaling primes at rings below 2^16, so the
+		// FLEXIBLE techniques run on haze at that ring.
+		const uint32_t ringDim = (GetTestBackend() == TestBackend::HAZE && p.technique != FIXEDAUTO) ? (1u << 16) : kRingDim;
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetSecretKeyDist(p.dist);
 		params.SetScalingTechnique(p.technique);
@@ -1846,7 +1847,7 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 		params.SetScalingModSize(kScaleMod);
 		params.SetBatchSize(p.slots);
 		params.SetSecurityLevel(HEStd_NotSet);
-		params.SetRingDim(kRingDim);
+		params.SetRingDim(ringDim);
 		ConfigureTestEngine(params);
 		cc = GenCryptoContext(params);
 		cc->Enable(PKE);
