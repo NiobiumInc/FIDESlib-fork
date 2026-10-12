@@ -32,29 +32,29 @@ countermeasure), so decrypted values are compared within precision (`ASSERT_ERRO
 
 | Test | Status | Notes |
 |---|---|---|
-| `EvalFastRotation` | PASS | single-index hoisted rotation. **CUDA, 2026-09-18:** the GPU engine used to return `nullptr` from `EvalFastRotationPrecompute` and ignore the handle, so the single-index call fell through to `Ciphertext::rotate` and redid the ModUp per index — hoisting was a no-op on this backend while the CPU path really hoisted (values always agreed; only cost differed). `CudaEngine` now owns a real handle (the ModUp of the source `c1`, an `RNSPoly` of its own, not the context scratch) and `Ciphertext::rotate_precomputed` applies it per index — one index of `rotate_hoisted`. A handle used after its source descends a level THROWS (`std::invalid_argument`) rather than decompose a stale chain; the haze engine falls back to a plain rotate in the same situation. The vector overloads are unchanged. |
-| `EvalRotate` | PASS | keyswitch-first path unified onto the hoisted core upstream (O1, `fideslib-ref-v1.5.1.2`) |
+| `EvalFastRotation` | PASS | single-index hoisted rotation. **CUDA, 2026-09-18:** the GPU engine used to return `nullptr` from `EvalFastRotationPrecompute` and ignore the handle, so the single-index call fell through to `Ciphertext::rotate` and redid the ModUp per index — hoisting was a no-op on this backend while the CPU path really hoisted (values always agreed; only cost differed). `CudaEngine` now owns a real handle (the ModUp of the source `c1`, an `RNSPoly` of its own, not the context scratch) and `Ciphertext::rotate_precomputed` applies it per index — one index of `rotate_hoisted`. A handle used after its source descends a level THROWS (`std::invalid_argument`) rather than decompose a stale chain; the haze engine falls back to a plain rotate in the same situation. The vector overloads are unchanged. **Moved to `ApiParityTechniqueTest.FastRotation` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `EvalRotate` | PASS | keyswitch-first path unified onto the hoisted core upstream (O1, `fideslib-ref-v1.5.1.2`) **Moved to `ApiParityTechniqueTest.Rotation` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
 | `EvalBootstrap` | PASS | sparse, N=4096, slots=8, FLEXIBLEAUTO, budget {3,3} |
 | `EvalBootstrapDense` | PASS | fully packed, slots=N/2 |
-| `EvalArithmetic` | PASS | add/sub/negate/mult/square, ct∘ct and ct∘scalar |
-| `EvalArithmeticPt` | PASS | ct∘plaintext variants |
-| `EvalAdjust` | PASS | 9 mixed noise-degree / level-gap adjustment cases |
-| `EvalChebyshev` | PASS | standalone degree-12 Paterson–Stockmeyer |
-| `EvalAddMany` | PASS | |
-| `AccumulateSum` | PASS | api rotation fold: CPU fallback ≡ GPU `Accumulate` at `PARTIAL_SUM_RADIX` (R11, O8) |
-| `EvalFastRotationHoisted` | PASS | multi-index hoisted rotations; re-enabled after O2 turned out to be a test-macro bug |
+| `EvalArithmetic` | PASS | add/sub/negate/mult/square, ct∘ct and ct∘scalar **Moved to `ApiParityTechniqueTest.Arithmetic` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `EvalArithmeticPt` | PASS | ct∘plaintext variants **Moved to `ApiParityTechniqueTest.ArithmeticWithPlaintext` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `EvalAdjust` | PASS | 9 mixed noise-degree / level-gap adjustment cases **Moved to `ApiParityTechniqueTest.OperandAdjustment` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA; on haze the numbers agree but the ciphertext is not identical. |
+| `EvalChebyshev` | PASS | standalone degree-12 Paterson–Stockmeyer **Moved to `ApiParityTechniqueTest.ChebyshevSeries` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA; on haze the numbers agree but the ciphertext is not identical. |
+| `EvalAddMany` | PASS | **Moved to `ApiParityTechniqueTest.AddMany` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `AccumulateSum` | PASS | api rotation fold: CPU fallback ≡ GPU `Accumulate` at `PARTIAL_SUM_RADIX` (R11, O8) **Moved to `ApiParityTechniqueTest.AccumulateSum` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA; on haze the numbers agree but the ciphertext is not identical. |
+| `EvalFastRotationHoisted` | PASS | multi-index hoisted rotations; re-enabled after O2 turned out to be a test-macro bug **Moved to `ApiParityTechniqueTest.FastRotationHoisted` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
 | `EvalBootstrapLT` | PASS | Tier-2: level budget {1,1}, `isLT`/`EvalLinearTransform` branch (O6) |
 | `EvalBootstrapSlots64` | PASS | Tier-2: slots=64 sparse bootstrap (O6) |
 | `EvalBootstrapFlexExt` | PASS | Tier-2: FLEXIBLEAUTOEXT bootstrap (O6) |
-| `EvalArithmeticFlexExt` | PASS | Tier-2: FLEXIBLEAUTOEXT arithmetic (O6) |
-| `EvalArithmeticFixedManual` | PASS | Tier-2: FIXEDMANUAL arithmetic incl. explicit `Rescale` (O6) |
-| `EvalChebyshevFixedManual` | PASS | Tier-2: re-enabled after O6a fix (T2km1 level alignment) |
+| `EvalArithmeticFlexExt` | PASS | Tier-2: FLEXIBLEAUTOEXT arithmetic (O6) **Moved to `ApiParityTechniqueTest.Arithmetic` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `EvalArithmeticFixedManual` | PASS | Tier-2: FIXEDMANUAL arithmetic incl. explicit `Rescale` (O6) **Moved to `ApiParityTechniqueTest.Arithmetic` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
+| `EvalChebyshevFixedManual` | PASS | Tier-2: re-enabled after O6a fix (T2km1 level alignment) **Moved to `ApiParityTechniqueTest.ChebyshevSeries` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA; on haze the numbers agree but the ciphertext is not identical. |
 | `EvalBootstrapFixedManual` | PASS | Tier-2: re-enabled after O6b (double-angle rescale placement) + O6a fixes |
 | `EvalBootstrapDenseFixedManual` | PASS | fully packed + FIXEDMANUAL combination, gap found after the sweep (O6d) |
 | `EvalBootstrapDenseFlexExt` | PASS | combination sweep: fully packed × FLEXIBLEAUTOEXT |
 | `EvalBootstrapLTFixedManual` | PASS | combination sweep: level budget {1,1} (LT branch) × FIXEDMANUAL |
 | `EvalBootstrapSparseSecret` | PASS (upstream) | combination sweep: SPARSE_TERNARY keys (`g_coefficientsSparse`, bootK=1.0 path). Re-established independently on this tree by `SparseSecretModEval.*` and `ApiParitySparseSecretBootstrapTest` - see R13 |
-| `EvalArithmeticFixedAuto` | PASS | combination sweep: FIXEDAUTO arithmetic (same-level ops) |
+| `EvalArithmeticFixedAuto` | PASS | combination sweep: FIXEDAUTO arithmetic (same-level ops) **Moved to `ApiParityTechniqueTest.Arithmetic` (run on the real backends, each of the four scaling techniques):** bit-identical to OpenFHE on CUDA. |
 | `DISABLED_EvalBootstrapFixedAuto` | **disabled** | combination sweep finding O6e: FIXEDAUTO add/sub operand adjustment missing on GPU |
 | `DISABLED_EvalBootstrapSparseEncaps` | **disabled** | Tier-2 finding O6c: encapsulation designs differ structurally (dual-context GPU vs in-context stock) |
 
