@@ -18,12 +18,14 @@
 #include <vector>
 
 #include "Serialize.hpp"
+#include "TestRegistration.hpp" // FIDES_TEST_IF
 #include "TestEngineConfig.hpp" // FIDESlib::Testing::ConfigureTestEngine
 #include "engine/Engine.hpp"	// Engine::reducedNoise(), for cc->engine_->reducedNoise()
 #include "fideslib.hpp"
 
 using namespace fideslib;
 using FIDESlib::Testing::ConfigureTestEngine;
+using FIDESlib::Testing::OnCuda;
 
 namespace {
 
@@ -326,10 +328,7 @@ TEST(ReducedNoise, DeserializeRefusesMissingReducedNoise) {
 // refusal gate, so this is a legal, distinct configuration), and confirms the deserialized
 // engine reports the same reducedNoise() the original was built with -- i.e. that the .dev
 // field, not some default, is what determines it on read-back.
-TEST(ReducedNoise, SerializeDeserializeCudaReducedNoiseRoundTrip) {
-	if (!IsBackendAvailable(Backend::CUDA))
-		GTEST_SKIP() << "requires a CUDA build";
-
+FIDES_TEST_IF(OnCuda(), ReducedNoise, SerializeDeserializeCudaReducedNoiseRoundTrip) {
 	ScopedTempDir dir;
 	const bool kOppositeOfOracle = !LinkedOpenFheReducedNoise();
 

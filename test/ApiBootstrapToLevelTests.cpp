@@ -17,10 +17,12 @@
 #include <string>
 #include <vector>
 
+#include "TestRegistration.hpp" // FIDES_TEST_F_IF
 #include "engine/Engine.hpp"
 #include "fideslib.hpp"
 
 using namespace fideslib;
+using FIDESlib::Testing::OnDevice;
 
 namespace {
 
@@ -211,9 +213,7 @@ TEST_F(BootstrapToLevelTest, InPlaceMatchesTheValueForm) {
 // a backend that ran a different bootstrap variant (StC-first instead of ModRaise-first) or spent
 // a level the reference does not hands the caller a different level budget for the same program,
 // and every values-only test still passes.
-TEST_F(BootstrapToLevelTest, RefreshLandsOnTheCpuEngineLevel) {
-	if (GetTestBackend() == TestBackend::CPU)
-		GTEST_SKIP() << "compares a device backend against the CPU engine";
+FIDES_TEST_F_IF(OnDevice(), BootstrapToLevelTest, RefreshLandsOnTheCpuEngineLevel) {
 	// The device refresh goes first: building a second context clears OpenFHE's process-global
 	// eval-key maps, which haze reads while it records the bootstrap.
 	const uint32_t deviceOut = MeasuredOutputLevel();

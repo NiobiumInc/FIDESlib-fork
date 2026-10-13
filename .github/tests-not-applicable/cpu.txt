@@ -1,13 +1,9 @@
 # Tests left out of the runs on the CPU backend, one `PATTERN | REASON` per line (gtest patterns,
-# several joined with `:`). A test belongs here when it has no meaning on this backend: it is
-# counted as not applicable in the test report, with this reason, and it is not run. A test that
-# only fails or is missing a feature does not belong here.
+# several joined with `:`). It is counted as not applicable in the test report, with this reason,
+# and it is not run. There are none.
+#
+# A test that exists only on some backends is registered only there (test/TestRegistration.hpp), so
+# it is not listed here. This list holds what is left: a test that is present on the backend and
+# does not apply to it for another reason, such as the hardware it needs.
 #
 # A pattern that matches no test is an error (see .github/scripts/run_gtest.py).
-
-*ApiParity*Test.*:*ApiParity*Test/*:ApiParityTest.* | The api is OpenFHE on the CPU backend, so a comparison of the api with OpenFHE proves nothing: these tests compare a device backend with OpenFHE
-ChebyshevFixedManual.HazeMatchesOpenFheOracle:Repro/ChebyshevFixedManualCoworker.*:DropInputHost.DecryptSurvivesDroppedInput:HazeBootstrap.* | Regression tests of the haze backend, which compare it with the CPU engine
-DropInputHost.DecryptSurvivesDroppedInputCuda | Tests the CUDA backend's device ciphertexts
-ReducedNoise.SerializeDeserializeCudaReducedNoiseRoundTrip | Serializes a CUDA context, which needs a build with the CUDA backend
-BootstrapToLevelTest.RefreshLandsOnTheCpuEngineLevel | Compares a device backend with the CPU engine
-CKKSTest.ConcurrentHostShadowCopyOnWrite | Needs the concurrent-operations mode of the CUDA backend (FIDESLIB_CONCURRENT_OPS=1)
