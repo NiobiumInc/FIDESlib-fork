@@ -16,7 +16,7 @@
 //
 // Every one of those is ONE object per context in the default mode; FIDESLIB_CONCURRENT_OPS=1
 // gives each issuing thread its own (see src/CudaUtils.cuh, ContextData::OpScratch). THIS TEST
-// REQUIRES THE CONCURRENT MODE and skips without it: the default mode is documented as one issuing
+// REQUIRES THE CONCURRENT MODE and exists only with it: the default mode is documented as one issuing
 // thread per context, so running these lanes concurrently there is out of contract, not a failure.
 //
 
@@ -46,6 +46,7 @@
 #include "ConcurrentOps.hpp"
 #include "CudaUtils.cuh"
 #include "ParametrizedTest.cuh"
+#include "TestRegistration.hpp"
 
 using namespace FIDESlib::CKKS;
 
@@ -243,9 +244,6 @@ class ConcurrentOpsTest : public GeneralParametrizedTest {
 
 /// N threads x M ops, each lane on its own ciphertexts, against the same lanes run serially.
 TEST_P(ConcurrentOpsTest, LanesMatchSerial) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
 	CKKS::DeregisterAllContexts();
 	for (auto& i : cached_cc) {
 		i.second.first->ClearEvalAutomorphismKeys();
@@ -422,9 +420,6 @@ TEST_P(ConcurrentOpsTest, LanesMatchSerial) {
 // its producer has not finished writing, which shows up as a ciphertext that decrypts to noise.
 // So the bar is the same as above -- bit-identical to the serial run.
 TEST_P(ConcurrentOpsTest, SharedOperandsMatchSerial) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
 
 	constexpr int kLanes = 4;
 	const std::vector<int> rot_index{ 1, 2, 3, 4 };
@@ -539,9 +534,6 @@ TEST_P(ConcurrentOpsTest, SharedOperandsMatchSerial) {
 // device path is clean under concurrency, a remaining failure is in the host composition, not in
 // the kernels.
 TEST_P(ConcurrentOpsTest, BootstrapLanesMatchSerial) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
 
 	constexpr int kLanes = 4;
 	const std::vector<int> rot_index{ 1, 2, 3, 4 };
@@ -940,9 +932,6 @@ TEST_P(ConcurrentOpsTest, BootstrapLanesMatchSerial) {
 // Reading: a mismatch already in one_thread/serialized is per-thread state; a mismatch only in
 // concurrent is overlap. The first stage that mismatches names the primitive.
 TEST_P(ConcurrentOpsTest, StagedLanesMatchSerial) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
 	constexpr int kLanes = 4;
 	const std::vector<int> rot_index{ 1, 2, 3, 4 };
 	int numSlots = 0;
@@ -1226,9 +1215,7 @@ struct BlockQueue {
 
 } // namespace
 
-TEST(ConcurrentOpsPoolDrainTest, ProducerConsumerBoundsChunkCount) {
-	if (!FIDESlib::ConcurrentOps())
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1: the lane pool this case is about does not exist in the default mode";
+FIDES_TEST_IF(FIDESlib::Testing::InConcurrentOpsMode(), ConcurrentOpsPoolDrainTest, ProducerConsumerBoundsChunkCount) {
 	int devices = 0;
 	if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
 		GTEST_SKIP() << "no CUDA device";
@@ -1475,8 +1462,6 @@ PoolHeld PoolHeldFrom(const FIDESlib::MemPoolStats& st) {
 } // namespace
 
 TEST_P(ConcurrentOpsTest, PassBoundaryReleaseReturnsParkedScratch) {
-	if (!FIDESlib::ConcurrentOps())
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1: there is no per-slot list to drift in the default mode";
 	int visible = 0;
 	if (cudaGetDeviceCount(&visible) != cudaSuccess || visible == 0)
 		GTEST_SKIP() << "no CUDA device";
@@ -1855,9 +1840,6 @@ TEST_P(ConcurrentOpsTest, MultPtWaitsForThePlaintext) {
 // into the pool including the ones this test does not name. `StagedLanesMatchSerial` remains the
 // end-to-end acceptance test; this one says WHICH invariant broke when that one fails again.
 TEST_P(ConcurrentOpsTest, NoNullStreamAtThePool) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
 	const std::vector<int> rot_index{ 1, 2 };
 	int numSlots				   = 0;
 	FIDESlib::CKKS::Context GPUcc_ = Prepare(rot_index, numSlots);
@@ -1966,10 +1948,7 @@ TEST_P(ConcurrentOpsTest, NoNullStreamAtThePool) {
 // The producer's last write is the round's byte value, behind a long chain of writes of the
 // PREVIOUS value, so a consumer that is not ordered behind it copies the previous round's bytes
 // and the check fails with a value that names the round it came from.
-TEST(ConcurrentOpsFence, SharedProducerFenceAcrossLanes) {
-	if (!FIDESlib::ConcurrentOps()) {
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op suite";
-	}
+FIDES_TEST_IF(FIDESlib::Testing::InConcurrentOpsMode(), ConcurrentOpsFence, SharedProducerFenceAcrossLanes) {
 	int devices = 0;
 	ASSERT_EQ(cudaGetDeviceCount(&devices), cudaSuccess);
 	if (devices < 1)
@@ -2096,15 +2075,14 @@ TEST(ConcurrentOpsFence, SharedProducerFenceAcrossLanes) {
 /// high" out of Decode (ckkspackedencoding.cpp:453). So in those sets the chain is already
 /// undecodable before any second thread exists, and BootstrapLanesMatchSerial's raw comparisons
 /// there are comparing garbage with garbage. Two things that run did not say: WHICH op in the
-/// chain loses it, and whether the default (non-concurrent) mode loses it too -- every test in
-/// this file GTEST_SKIPs without FIDESLIB_CONCURRENT_OPS, so this chain has never been seen there.
+/// chain loses it, and whether the default (non-concurrent) mode loses it too -- the tests of
+/// this file exist only with FIDESLIB_CONCURRENT_OPS, so this chain has never been seen there.
 ///
 /// This probe answers both. It runs lane 0's chain ONCE on the calling thread -- same Prepare,
 /// same values, same ops in the same order -- and after EVERY step stores the ciphertext and
 /// decrypts it the way the [decrypt] block does (fresh level-0 holder, GetOpenFHECipherText,
-/// Decrypt), against a cleartext expectation carried along step by step. It does NOT skip without
-/// the concurrent mode, so the `_0` and `_1` invocations of the binary each print their own nine
-/// lines per parameter set and `mode=` says which is which.
+/// Decrypt), against a cleartext expectation carried along step by step. It prints nine lines per
+/// parameter set, and `mode=` says which mode produced them.
 ///
 /// It asserts NOTHING. Every line must print even when every decrypt fails, so each step owns its
 /// try/catch and the whole body sits under a catch-all; a probe must not be able to turn a
@@ -2112,8 +2090,7 @@ TEST(ConcurrentOpsFence, SharedProducerFenceAcrossLanes) {
 /// opens with the file path and the first 120 characters of it -- which is what 51b0f77 printed --
 /// are the path, never the reason.
 TEST_P(ConcurrentOpsTest, ChainDecodesPerStep) {
-	// mode is read per invocation of the binary, not per parameter set: this is the one test here
-	// that runs in both, and the line has to say which one produced it.
+	// mode is read per invocation of the binary, not per parameter set, and the line says which one produced it.
 	const char* const mode = FIDESlib::ConcurrentOps() ? "concurrent" : "default";
 
 	// THE PARAMETER. The fixture is TestWithParam<tuple<tuple<GeneralTestParams, Parameters>,
@@ -2281,6 +2258,9 @@ TEST_P(ConcurrentOpsTest, PoolsDoNotReuseOnEventDependencies) {
 	}
 }
 
-INSTANTIATE_TEST_SUITE_P(ConcurrencyTests, ConcurrentOpsTest, testing::Values(TTALL64BOOT));
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ConcurrentOpsTest);
+INSTANTIATE_TEST_SUITE_P(ConcurrencyTests, ConcurrentOpsTest,
+  FIDESlib::Testing::OnlyIf<ConcurrentOpsTest::ParamType>(FIDESlib::Testing::InConcurrentOpsMode(), testing::Values(TTALL64BOOT)));
 
 } // namespace FIDESlib::Testing

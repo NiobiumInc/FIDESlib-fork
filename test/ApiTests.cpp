@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "Serialize.hpp"
+#include "TestRegistration.hpp" // FIDES_TEST_IF, FIDES_TEST_F_IF, OnlyIf
 #include "TestEngineConfig.hpp" // FIDESlib::Testing::{ConfigureTestEngine, GetTestBackend, TestBackend}
 #include "engine/Engine.hpp"		 // Engine::backend(), for the hard backend guard
 #include "engine/EngineCommon.hpp" // bootstrapModEvalLevels
@@ -33,6 +34,11 @@ using namespace fideslib;
 using FIDESlib::Testing::ConfigureTestEngine;
 using FIDESlib::Testing::GetTestBackend;
 using FIDESlib::Testing::TestBackend;
+using FIDESlib::Testing::OnHaze;
+using FIDESlib::Testing::OnCuda;
+using FIDESlib::Testing::OnHostBackend;
+using FIDESlib::Testing::InConcurrentOpsMode;
+using FIDESlib::Testing::OnlyIf;
 
 // Any device backend (CUDA or haze): gates SetBackend + LoadContext in the fixtures.
 static bool TestUseDevice() {
@@ -548,9 +554,7 @@ TEST_F(CKKSTest, EvalChebyshevSeries) {
 // (TEST_F) case: the fixture's SetUp already loads a device context, and haze context
 // state is process-global (only one may be loaded at a time), so both contexts here are
 // built and torn down explicitly, oracle first.
-TEST(ChebyshevFixedManual, HazeMatchesOpenFheOracle) {
-	if (GetTestBackend() != TestBackend::HAZE)
-		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=haze";
+FIDES_TEST_IF(OnHaze(), ChebyshevFixedManual, HazeMatchesOpenFheOracle) {
 
 	constexpr uint32_t kDepth	 = 5;
 	constexpr uint32_t kRingDim = 1u << 16;
@@ -637,8 +641,6 @@ struct ChebyshevManualCase {
 class ChebyshevFixedManualCoworker : public ::testing::TestWithParam<ChebyshevManualCase> {};
 
 TEST_P(ChebyshevFixedManualCoworker, MatchesClosedForm) {
-	if (GetTestBackend() != TestBackend::HAZE)
-		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=haze";
 	const auto& tc = GetParam();
 	const double x = 0.5;
 
@@ -684,24 +686,24 @@ TEST_P(ChebyshevFixedManualCoworker, MatchesClosedForm) {
 	EXPECT_NEAR(got, expected, 1e-2);
 }
 
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ChebyshevFixedManualCoworker);
 INSTANTIATE_TEST_SUITE_P(
   Repro, ChebyshevFixedManualCoworker,
-  ::testing::Values(
+  OnlyIf<ChebyshevFixedManualCoworker::ParamType>(OnHaze(), ::testing::Values(
     ChebyshevManualCase{ "identity", { 0.0, 1.0 } }, ChebyshevManualCase{ "simple", { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 } },
     ChebyshevManualCase{ "simple7", { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0 } },
     ChebyshevManualCase{ "cmp13",
       { -0.5714285714285714, 1.1495595991805079, 0.5019312556142438, -0.09624801724554126, -0.32099708624535217,
         -0.1674146646899354, 0.09941364095727803, 0.2020305089104422, 0.0792797331553387, -0.10519360586987322,
-        -0.15458404944693244, -0.03367863784660501, 0.11456253368640568, 0.1295242596300609 } }),
+        -0.15458404944693244, -0.03367863784660501, 0.11456253368640568, 0.1295242596300609 } })),
   [](const ::testing::TestParamInfo<ChebyshevManualCase>& info) { return info.param.name; });
 
 // Regression coverage for HazeEngine::setDropInputHostAfterUpload: with the opt-in on, an
 // uploaded input's host residues are freed right after upload, so decrypting that same input
 // later must still work via refreshHostShadow's empty-shell rebuild. EvalRotate also exercises
 // the (unconditional) per-key host-limb drop in ensureKeyUploaded (HazeEngine.cpp:1476).
-TEST(DropInputHost, DecryptSurvivesDroppedInput) {
-	if (GetTestBackend() != TestBackend::HAZE)
-		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=haze";
+FIDES_TEST_IF(OnHaze(), DropInputHost, DecryptSurvivesDroppedInput) {
 #ifdef FIDESLIB_ENABLE_HAZE
 	constexpr uint32_t kDepth	  = 5;
 	constexpr uint32_t kRingDim  = 1u << 16;
@@ -755,9 +757,7 @@ TEST(DropInputHost, DecryptSurvivesDroppedInput) {
 // Same regression, CUDA backend: CudaEngine::setDropInputHostAfterUpload frees an uploaded
 // input's host residues right after upload; refreshHostShadow's empty-shell rebuild (needsFresh
 // path, CudaEngine.cpp:637-642) must still recover it for decryption.
-TEST(DropInputHost, DecryptSurvivesDroppedInputCuda) {
-	if (GetTestBackend() != TestBackend::CUDA)
-		GTEST_SKIP() << "requires FIDESLIB_TEST_BACKEND=cuda";
+FIDES_TEST_IF(OnCuda(), DropInputHost, DecryptSurvivesDroppedInputCuda) {
 #ifdef FIDESLIB_ENABLE_CUDA
 	constexpr uint32_t kDepth	  = 5;
 	constexpr uint32_t kRingDim  = 1u << 16;
@@ -996,11 +996,9 @@ TEST_F(CKKSTest, SparseEncapsulatedContext) {
 // for the lock that closes it, and the reason a laptop can hold the line on a defect that was
 // found on a GPU.
 //
-// It skips unless FIDESLIB_CONCURRENT_OPS=1, exactly like the CUDA suite: the default mode is one
+// It exists only with FIDESLIB_CONCURRENT_OPS=1 on the CUDA backend, like the CUDA suite: the default mode is one
 // issuing thread per context, so several threads here are out of contract, not a failure.
-TEST_F(CKKSTest, ConcurrentHostShadowCopyOnWrite) {
-	if (!ConcurrentOpsEnabled())
-		GTEST_SKIP() << "set FIDESLIB_CONCURRENT_OPS=1 to run the concurrent-op cases";
+FIDES_TEST_F_IF(OnCuda() && InConcurrentOpsMode(), CKKSTest, ConcurrentHostShadowCopyOnWrite) {
 
 	constexpr int kLanes = 4;
 	constexpr int kReps	 = 40;
@@ -1833,10 +1831,7 @@ TEST_F(CKKSTest, MakeCKKSPackedPlaintextExtendedMatchesOrdinaryEncoding) {
 // unconditionally, and what makes an application's device-encode flag a behavioural no-op on CPU
 // rather than a different answer. The bit-for-bit device-vs-host comparison needs a device and
 // lives in test/DeviceEncodeTests.cu.
-TEST_F(CKKSTest, MakeCKKSPackedPlaintextDeviceFallsBackOnHostBackends) {
-	if (cc->SupportsDeviceEncode())
-		GTEST_SKIP() << "backend encodes on the device; the fallback under test is the host-backend path.";
-
+FIDES_TEST_F_IF(OnHostBackend(), CKKSTest, MakeCKKSPackedPlaintextDeviceFallsBackOnHostBackends) {
 	auto plain = cc->MakeCKKSPackedPlaintext(v1);
 	auto dev   = cc->MakeCKKSPackedPlaintextDevice(v1);
 
@@ -1868,10 +1863,7 @@ TEST_F(CKKSTest, MakeCKKSPackedPlaintextDeviceFallsBackOnHostBackends) {
 // api-level substitute -- multiply one ciphertext by each plaintext and compare the products -- is
 // NOT usable as a parity oracle here: the api's Clone copies the handle, and EvalMult adjusts its
 // operands, so the two products would not start from the same ciphertext.
-TEST_F(CKKSTest, MakeCKKSPackedPlaintextDeviceManyMatchesSingleOnHostBackends) {
-	if (cc->SupportsDeviceEncode())
-		GTEST_SKIP() << "backend encodes on the device; the limb-level batch-vs-single comparison lives in DeviceEncodeTests.cu.";
-
+FIDES_TEST_F_IF(OnHostBackend(), CKKSTest, MakeCKKSPackedPlaintextDeviceManyMatchesSingleOnHostBackends) {
 	// Mixed signs and magnitudes, and a SHORT vector among them: the batch shares one `slots`
 	// resolution, so a member shorter than the rest is exactly the case where a batched encoder
 	// could silently pad differently from the single one.

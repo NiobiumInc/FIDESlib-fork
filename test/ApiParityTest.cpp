@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "TestRegistration.hpp" // FIDES_TEST_IF, FIDES_TEST_F_IF, OnlyIf
 #include "TestEngineConfig.hpp" // FIDESlib::Testing::{ConfigureTestEngine, GetTestBackend, TestBackend}
 #include "fideslib.hpp"
 
@@ -35,6 +36,9 @@ using namespace fideslib;
 using FIDESlib::Testing::ConfigureTestEngine;
 using FIDESlib::Testing::GetTestBackend;
 using FIDESlib::Testing::TestBackend;
+using FIDESlib::Testing::OnDevice;
+using FIDESlib::Testing::OnHaze;
+using FIDESlib::Testing::OnlyIf;
 
 // Exact ciphertext equality: scaling metadata + every RNS limb of both polynomials. Mirrors the
 // ASSERT_EQ_CIPHERTEXT in test/ParametrizedTest.cuh, minus the per-limb debug printing.
@@ -226,9 +230,6 @@ class ApiParityTest : public ::testing::Test {
 	const std::vector<double> vsq = { 0.93, 0.96, 0.99, 1.0, 1.01, 1.04, 1.07, 0.95 };
 
 	void SetUp() override {
-		if (GetTestBackend() == TestBackend::CPU)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(kDepth);
@@ -270,7 +271,7 @@ class ApiParityTest : public ::testing::Test {
 
 };
 
-TEST_F(ApiParityTest, EvalAdd) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalAdd) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -280,7 +281,7 @@ TEST_F(ApiParityTest, EvalAdd) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalSub) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalSub) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -290,7 +291,7 @@ TEST_F(ApiParityTest, EvalSub) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalMult) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMult) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -300,7 +301,7 @@ TEST_F(ApiParityTest, EvalMult) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalSquare) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalSquare) {
 	auto a1		= EncryptV1();
 	auto lb1	= LbCt(a1);
 	auto res	= cc->EvalSquare(a1);
@@ -309,7 +310,7 @@ TEST_F(ApiParityTest, EvalSquare) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalNegate) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalNegate) {
 	auto a1		= EncryptV1();
 	auto lb1	= LbCt(a1);
 	auto res	= cc->EvalNegate(a1);
@@ -321,7 +322,7 @@ TEST_F(ApiParityTest, EvalNegate) {
 	ExpectApproxEq(got, oracle);
 }
 
-TEST_F(ApiParityTest, EvalRotate) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalRotate) {
 	auto a1		= EncryptV1();
 	auto lb1	= LbCt(a1);
 	auto res	= cc->EvalRotate(a1, 1);
@@ -330,7 +331,7 @@ TEST_F(ApiParityTest, EvalRotate) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
-TEST_F(ApiParityTest, EvalRotateSlotsAware) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalRotateSlotsAware) {
 	// Rotate an 8-slot ciphertext by 5/6/7 — steps > slots/2 — to lock the slots-aware rotation
 	// (parity #7: normalyzeIndex + the actual_index/alternate-key selection) to CUDA/OpenFHE. The
 	// EvalRotate case above rotates by 1, where normalyzeIndex is the identity and the gap is hidden.
@@ -398,8 +399,10 @@ TEST_P(ApiParityRotateManyTest, MatchesSerialAndOpenFHE) {
 	}
 }
 
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityRotateManyTest);
 INSTANTIATE_TEST_SUITE_P(BatchWidthsAndIndices, ApiParityRotateManyTest,
-	::testing::Combine(::testing::Values(1u, 2u, 7u, 32u), ::testing::Values(1, 2, 4, 8, -1, -2)),
+	OnlyIf<ApiParityRotateManyTest::ParamType>(OnDevice(), ::testing::Combine(::testing::Values(1u, 2u, 7u, 32u), ::testing::Values(1, 2, 4, 8, -1, -2))),
 	[](const ::testing::TestParamInfo<std::tuple<uint32_t, int32_t>>& info) {
 		const int32_t idx = std::get<1>(info.param);
 		return "B" + std::to_string(std::get<0>(info.param)) + (idx < 0 ? "_neg" : "_pos") + std::to_string(std::abs(idx));
@@ -416,7 +419,7 @@ INSTANTIATE_TEST_SUITE_P(BatchWidthsAndIndices, ApiParityRotateManyTest,
 // The bar is VALUE IDENTITY: sharing the ModUp must not change a single bit against the same
 // backend's EvalRotate. One program per context: every rotation is declared an output before any
 // readback.
-TEST_F(ApiParityTest, FastRotationPrecompute) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, FastRotationPrecompute) {
 	auto a1			 = EncryptV1();
 	auto lb1		 = LbCt(a1);
 	const uint32_t m = cc->GetCyclotomicOrder();
@@ -470,7 +473,7 @@ TEST_F(ApiParityTest, FastRotationPrecompute) {
 	}
 }
 
-TEST_F(ApiParityTest, EvalAddPlaintext) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalAddPlaintext) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1	= LbCt(a1);
@@ -482,7 +485,7 @@ TEST_F(ApiParityTest, EvalAddPlaintext) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalMultPlaintext) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMultPlaintext) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1	= LbCt(a1);
@@ -494,7 +497,7 @@ TEST_F(ApiParityTest, EvalMultPlaintext) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, EvalAddScalar) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalAddScalar) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1	 = LbCt(a1);
@@ -512,7 +515,7 @@ TEST_F(ApiParityTest, EvalAddScalar) {
 	ASSERT_EQ_CIPHERTEXT(oracleN, gotN);
 }
 
-TEST_F(ApiParityTest, EvalMultScalar) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMultScalar) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1);
@@ -524,7 +527,7 @@ TEST_F(ApiParityTest, EvalMultScalar) {
 	ASSERT_EQ_CIPHERTEXT(oracle, got);
 }
 
-TEST_F(ApiParityTest, RescaleAfterMult) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, RescaleAfterMult) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -550,7 +553,7 @@ TEST_F(ApiParityTest, RescaleAfterMult) {
 // The op sequence and order are identical to the previous interleaved form — only the
 // readback placement moved — so CPU/CUDA results are unchanged (MarkOutput is a no-op there).
 
-TEST_F(ApiParityTest, EvalMultAllLevels) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMultAllLevels) {
 	Ciphertext<DCRTPoly> a, b;
 	EncryptInputs(a, b);
 	auto lbA = LbCt(a);
@@ -573,7 +576,7 @@ TEST_F(ApiParityTest, EvalMultAllLevels) {
 	}
 }
 
-TEST_F(ApiParityTest, EvalSquareAllLevels) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalSquareAllLevels) {
 	auto p	 = cc->MakeCKKSPackedPlaintext(vsq);
 	auto a	 = cc->Encrypt(p, keys.publicKey);
 	auto lbA = LbCt(a);
@@ -595,7 +598,7 @@ TEST_F(ApiParityTest, EvalSquareAllLevels) {
 	}
 }
 
-TEST_F(ApiParityTest, EvalRotateAllLevels) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalRotateAllLevels) {
 	Ciphertext<DCRTPoly> a, b;
 	EncryptInputs(a, b);
 	auto lbA = LbCt(a);
@@ -633,7 +636,7 @@ TEST_F(ApiParityTest, EvalRotateAllLevels) {
 // belongs to the subtrahend (sub); negate, plaintext multiply, scalar multiply and rescale all
 // loop over EVERY component.
 
-TEST_F(ApiParityTest, EvalMultNoRelin) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMultNoRelin) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -652,7 +655,7 @@ TEST_F(ApiParityTest, EvalMultNoRelin) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
 }
 
-TEST_F(ApiParityTest, RelinearizeAfterNoRelin) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, RelinearizeAfterNoRelin) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -664,7 +667,7 @@ TEST_F(ApiParityTest, RelinearizeAfterNoRelin) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
-TEST_F(ApiParityTest, RelinearizeInPlaceAfterNoRelin) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, RelinearizeInPlaceAfterNoRelin) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -679,7 +682,7 @@ TEST_F(ApiParityTest, RelinearizeInPlaceAfterNoRelin) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
 }
 
-TEST_F(ApiParityTest, RelinearizeDegree1NoOp) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, RelinearizeDegree1NoOp) {
 	// OpenFHE's Relinearize/RelinearizeInPlace on a degree-1 (2-component) ciphertext is a no-op
 	// (RelinearizeCore returns early). Pins that no-op both out-of-place and in-place, and that the
 	// in-place path never rebinds a payload onto itself (which would corrupt or double-free it).
@@ -704,7 +707,7 @@ TEST_F(ApiParityTest, RelinearizeDegree1NoOp) {
 	ASSERT_EQ_CIPHERTEXT(gotP, gotR);
 }
 
-TEST_F(ApiParityTest, EvalMultEqualsRelinearizeNoRelin) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, EvalMultEqualsRelinearizeNoRelin) {
 	// The primary gate for splitting evalMult into tensor product + relinearize: the composition
 	// must be BIT-IDENTICAL to the fused op, and both must match OpenFHE's EvalMult.
 	Ciphertext<DCRTPoly> a1, a2;
@@ -729,7 +732,7 @@ TEST_F(ApiParityTest, EvalMultEqualsRelinearizeNoRelin) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, gotQ, 2);
 }
 
-TEST_F(ApiParityTest, Degree2EvalAdd) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalAdd) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -773,7 +776,7 @@ TEST_F(ApiParityTest, Degree2EvalAdd) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2EvalAddInPlace) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalAddInPlace) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -790,7 +793,7 @@ TEST_F(ApiParityTest, Degree2EvalAddInPlace) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
 }
 
-TEST_F(ApiParityTest, Degree2EvalAddMany) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalAddMany) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -807,7 +810,7 @@ TEST_F(ApiParityTest, Degree2EvalAddMany) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
 }
 
-TEST_F(ApiParityTest, Degree2EvalSub) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalSub) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -836,7 +839,7 @@ TEST_F(ApiParityTest, Degree2EvalSub) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2EvalSubMixedMinuend) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalSubMixedMinuend) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -861,7 +864,7 @@ TEST_F(ApiParityTest, Degree2EvalSubMixedMinuend) {
 	ExpectApproxEq(got, oMixed);
 }
 
-TEST_F(ApiParityTest, Degree2EvalNegate) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalNegate) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -875,7 +878,7 @@ TEST_F(ApiParityTest, Degree2EvalNegate) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
 }
 
-TEST_F(ApiParityTest, Degree2EvalMultPlaintext) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalMultPlaintext) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -918,7 +921,7 @@ TEST_F(ApiParityTest, Degree2EvalMultPlaintext) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2EvalMultScalar) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalMultScalar) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -943,7 +946,7 @@ TEST_F(ApiParityTest, Degree2EvalMultScalar) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2EvalAddSubPlaintext) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalAddSubPlaintext) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -975,7 +978,7 @@ TEST_F(ApiParityTest, Degree2EvalAddSubPlaintext) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2EvalSubScalarReversed) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2EvalSubScalarReversed) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -1004,7 +1007,7 @@ TEST_F(ApiParityTest, Degree2EvalSubScalarReversed) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2Rescale) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2Rescale) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -1033,7 +1036,7 @@ TEST_F(ApiParityTest, Degree2Rescale) {
 	}
 }
 
-TEST_F(ApiParityTest, Degree2HostReadback) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2HostReadback) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	const size_t nsd1 = a1->GetNoiseScaleDeg(), nsd2 = a2->GetNoiseScaleDeg();
@@ -1054,7 +1057,7 @@ TEST_F(ApiParityTest, Degree2HostReadback) {
 	EXPECT_EQ(d2->GetElements().size(), 3u);
 }
 
-TEST_F(ApiParityTest, Degree2HostReadbackAtReducedLevel) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2HostReadbackAtReducedLevel) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 
@@ -1074,7 +1077,7 @@ TEST_F(ApiParityTest, Degree2HostReadbackAtReducedLevel) {
 		EXPECT_EQ(got->GetElements().at(j).GetNumOfElements(), towers) << "component " << j;
 }
 
-TEST_F(ApiParityTest, Degree2HostLoad) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2HostLoad) {
 	// Mirror of Degree2HostReadback in the opposite direction: build a degree-2 ciphertext
 	// entirely on the HOST via the OpenFHE oracle (EvalMultNoRelin never runs on the device for
 	// this value), wrap it in a fresh facade ciphertext by assigning ->host directly -- the same
@@ -1096,7 +1099,7 @@ TEST_F(ApiParityTest, Degree2HostLoad) {
 	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
 }
 
-TEST_F(ApiParityTest, Degree2CloneKeepsThirdComponent) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2CloneKeepsThirdComponent) {
 	Ciphertext<DCRTPoly> a1, a2;
 	EncryptInputs(a1, a2);
 	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
@@ -1114,7 +1117,7 @@ TEST_F(ApiParityTest, Degree2CloneKeepsThirdComponent) {
 	ASSERT_EQ_CIPHERTEXT(gotP, gotQ);
 }
 
-TEST_F(ApiParityTest, Degree2DotProductLazyRelin) {
+FIDES_TEST_F_IF(OnDevice(), ApiParityTest, Degree2DotProductLazyRelin) {
 	// Lazy relinearization: accumulate degree-2 products and key-switch ONCE at the end, versus
 	// key-switching after every product.
 	const std::vector<std::vector<double>> lv = { v1, v2, v1, v2 };
@@ -1205,9 +1208,6 @@ class ApiParityBootstrapTest : public ::testing::TestWithParam<std::vector<uint3
 	}
 
 	void SetUp() override {
-		if (GetTestBackend() == TestBackend::CPU)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(depth());
 		params.SetScalingModSize(kScaleMod);
@@ -1256,8 +1256,10 @@ TEST_P(ApiParityBootstrapTest, EvalBootstrap) {
 	ExpectSlotsNear(cc, keys.secretKey, got, oracle, kSlots, 1e-2);
 }
 
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityBootstrapTest);
 INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityBootstrapTest,
-  ::testing::Values(std::vector<uint32_t>{ 1, 1 }, std::vector<uint32_t>{ 2, 2 }, std::vector<uint32_t>{ 3, 3 }),
+  OnlyIf<ApiParityBootstrapTest::ParamType>(OnDevice(), ::testing::Values(std::vector<uint32_t>{ 1, 1 }, std::vector<uint32_t>{ 2, 2 }, std::vector<uint32_t>{ 3, 3 })),
   [](const ::testing::TestParamInfo<std::vector<uint32_t>>& info) {
 	  return "lvlb" + std::to_string(info.param[0]) + "_" + std::to_string(info.param[1]);
   });
@@ -1302,10 +1304,6 @@ class ApiParityFullPackBootstrapTest : public ::testing::TestWithParam<FullPackP
 	std::vector<double> v1;
 
 	void SetUp() override {
-		if (GetTestBackend() == TestBackend::CPU && std::getenv("FIDESLIB_FULLPACK_RUN_CPU") == nullptr)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE). Set "
-							"FIDESLIB_FULLPACK_RUN_CPU=1 to run the OpenFHE-oracle isolation path (setup/keygen "
-							"+ bootstrap on pure OpenFHE, no haze) for parameter diagnosis.";
 		const FullPackParam& p = GetParam();
 
 		if (const char* r = std::getenv("FIDESLIB_FULLPACK_RING")) {
@@ -1436,13 +1434,15 @@ TEST_P(ApiParityFullPackBootstrapTest, EvalBootstrapFullyPacked) {
 	EXPECT_LT(maxErrPlain, 1e-2);
 }
 
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityFullPackBootstrapTest);
 INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityFullPackBootstrapTest,
-  ::testing::Values(FullPackParam{ { 3, 3 }, FIXEDAUTO, "FIXEDAUTO" },
+  OnlyIf<ApiParityFullPackBootstrapTest::ParamType>(OnDevice() || std::getenv("FIDESLIB_FULLPACK_RUN_CPU") != nullptr, ::testing::Values(FullPackParam{ { 3, 3 }, FIXEDAUTO, "FIXEDAUTO" },
 	FullPackParam{ { 3, 3 }, FLEXIBLEAUTO, "FLEXIBLEAUTO" },
 	FullPackParam{ { 3, 3 }, FLEXIBLEAUTOEXT, "FLEXIBLEAUTOEXT" },
 	FullPackParam{ { 4, 4 }, FIXEDAUTO, "FIXEDAUTO" },
 	FullPackParam{ { 4, 4 }, FLEXIBLEAUTO, "FLEXIBLEAUTO" },
-	FullPackParam{ { 3, 3 }, FIXEDMANUAL, "FIXEDMANUAL" }),
+	FullPackParam{ { 3, 3 }, FIXEDMANUAL, "FIXEDMANUAL" })),
   [](const ::testing::TestParamInfo<FullPackParam>& info) {
 	  return "lvlb" + std::to_string(info.param.levelBudget[0]) + "_" + std::to_string(info.param.levelBudget[1]) + "_" + info.param.techName;
   });
@@ -1474,9 +1474,6 @@ class ApiParitySparseSecretBootstrapTest : public ::testing::Test {
 	}
 
 	void SetUp() override {
-		if (GetTestBackend() == TestBackend::CPU)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 		CCParams<CryptoContextCKKSRNS> params;
 		params.SetMultiplicativeDepth(kDepth);
 		params.SetScalingModSize(kScaleMod);
@@ -1503,7 +1500,7 @@ class ApiParitySparseSecretBootstrapTest : public ::testing::Test {
 	}
 };
 
-TEST_F(ApiParitySparseSecretBootstrapTest, EvalBootstrap) {
+FIDES_TEST_F_IF(OnDevice(), ApiParitySparseSecretBootstrapTest, EvalBootstrap) {
 	auto pt					 = cc->MakeCKKSPackedPlaintext(v1, 1, maxBootLevel(), nullptr, kSlots);
 	auto ct					 = cc->Encrypt(pt, keys.publicKey);
 	auto lbCt				 = LbCt(ct);
@@ -1549,11 +1546,6 @@ class ApiParityTechniqueTest : public ::testing::TestWithParam<ScalingTechnique>
 
 	bool Manual() const { return GetParam() == FIXEDMANUAL; }
 
-	void SetUp() override {
-		if (GetTestBackend() == TestBackend::CPU)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
-	}
 
 	// A context of `depth` levels with the multiplication key and the given rotation keys.
 	void MakeContext(uint32_t depth, const std::vector<int32_t>& rotations = {}) {
@@ -1794,8 +1786,12 @@ TEST_P(ApiParityTechniqueTest, AddMany) {
 	ExpectIdentical("add many", res, LbCc(cc)->EvalAddMany(lbs));
 }
 
-INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
-INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityOperandAdjustmentTest, ::testing::Values(FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityTechniqueTest);
+INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, OnlyIf<ApiParityTechniqueTest::ParamType>(OnDevice(), ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT)), TechniqueParamName);
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityOperandAdjustmentTest);
+INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityOperandAdjustmentTest, OnlyIf<ApiParityOperandAdjustmentTest::ParamType>(OnDevice(), ::testing::Values(FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT)), TechniqueParamName);
 
 // ---------------------------------------------------------------------------------------------
 // Bootstrap parity across scaling techniques, key distributions, level budgets and slot counts.
@@ -1830,9 +1826,6 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 
 	void SetUp() override {
 		const BootstrapShape& p = GetParam();
-		if (GetTestBackend() == TestBackend::CPU)
-			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
-							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 		if (GetTestBackend() == TestBackend::HAZE) {
 			if (p.dist == SPARSE_ENCAPSULATED)
 				GTEST_SKIP() << "the haze bootstrap refuses SPARSE_ENCAPSULATED secrets (HazeBootstrap.RefusesSparseEncapsulatedSecrets)";
@@ -1888,8 +1881,10 @@ TEST_P(ApiParityBootstrapShapeTest, EvalBootstrap) {
 	ExpectDeviceBootstrapAsAccurateAsHost(p.name, cc, keys.secretKey, HostCt(cc, refreshed), hostRuns, x);
 }
 
+// The suite has no cases on the backends it does not apply to.
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityBootstrapShapeTest);
 INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
-  ::testing::Values(
+  OnlyIf<ApiParityBootstrapShapeTest::ParamType>(OnDevice(), ::testing::Values(
 	BootstrapShape{ "Sparse_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "LinearTransform_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
 	BootstrapShape{ "Slots64_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 64, 0 },
@@ -1902,15 +1897,13 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
-	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 }),
+	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 })),
   BootstrapShapeName);
 
 // The haze bootstrap does not implement the key switches of a SPARSE_ENCAPSULATED secret (to the
 // sparse key before the modulus is raised and back after it), and without them its output does not
 // decrypt. It has to say so when the bootstrap keys are generated, and not return that output.
-TEST(HazeBootstrap, RefusesSparseEncapsulatedSecrets) {
-	if (GetTestBackend() != TestBackend::HAZE)
-		GTEST_SKIP() << "tests the haze backend";
+FIDES_TEST_IF(OnHaze(), HazeBootstrap, RefusesSparseEncapsulatedSecrets) {
 	CCParams<CryptoContextCKKSRNS> params;
 	params.SetSecretKeyDist(SPARSE_ENCAPSULATED);
 	params.SetScalingTechnique(FIXEDAUTO);
