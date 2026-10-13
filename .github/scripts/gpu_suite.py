@@ -38,6 +38,7 @@ report.
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -219,6 +220,9 @@ def main():
                         help="run every test in a process of its own")
     parser.add_argument("--repeat", type=int, default=1,
                         help="run the gate tests this many times over in one process")
+    parser.add_argument("--not-applicable", metavar="FILE",
+                        help="tests that do not apply to this pass, one `PATTERN | REASON` per line (run_gtest.py): "
+                             "they are left out and recorded in not-applicable.json next to the reports")
     parser.add_argument("--retries", type=int, default=RETRIES,
                         help=f"extra attempts for a gate test that fails (default {RETRIES})")
     args = parser.parse_args()
@@ -232,6 +236,23 @@ def main():
 
     # 1. Gate, with up to args.retries more attempts for whatever fails.
     excluded = benchmarks + known + flaky
+    if args.not_applicable:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import run_gtest
+        listed = run_gtest.list_tests(args.binary)
+        left_out, stale = {}, []
+        for pattern, reason in run_gtest.read_list(args.not_applicable):
+            hit = [n for n in listed if run_gtest.matches(n, pattern)]
+            if not hit:
+                stale.append(pattern)
+            for name in hit:
+                left_out.setdefault(name, reason)
+        if stale:
+            print("::error::These not-applicable patterns match no test (renamed or removed?): " + ", ".join(stale))
+            return 2
+        with open(os.path.join(args.out, "not-applicable.json"), "w") as f:
+            json.dump({"list": args.not_applicable, "tests": [{"test": n, "reason": r} for n, r in sorted(left_out.items())]}, f, indent=1)
+        excluded = excluded + sorted(left_out)
     gate_filter = args.only + ("-" + ":".join(excluded) if excluded else "")
     if args.isolate:
         gate_status, gate = run_isolated(args.binary, list_tests(args.binary, gate_filter),
