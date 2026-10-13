@@ -1,8 +1,8 @@
 # Tests left out of the runs on the haze backend, one `PATTERN | REASON` per line (gtest patterns,
-# several joined with `:`). A test belongs here when it has no meaning on this backend, or when
-# the backend lacks the feature it tests; the reason says which, and a missing feature says so
-# ("Not implemented on haze"). It is counted as not applicable in the test report, with this
-# reason, and it is not run.
+# several joined with `:`). A test belongs here when it has no meaning on this backend. A test
+# that has a meaning here and fails because the backend lacks something goes in
+# .github/tests-known-gaps/haze.txt instead. It is counted as not applicable in the test report,
+# with this reason, and it is not run.
 #
 # A pattern that matches no test is an error (see .github/scripts/run_gtest.py).
 
@@ -10,6 +10,3 @@ DropInputHost.DecryptSurvivesDroppedInputCuda | Tests the CUDA backend's device 
 ReducedNoise.SerializeDeserializeCudaReducedNoiseRoundTrip | Serializes a CUDA context, which needs a build with the CUDA backend
 CKKSTest.ConcurrentHostShadowCopyOnWrite | Needs the concurrent-operations mode of the CUDA backend (FIDESLIB_CONCURRENT_OPS=1)
 Techniques/ApiParityTechniqueTest.OperandAdjustment/FIXEDMANUAL | FIXEDMANUAL does not adjust operands: a degree or level mismatch is the caller's to resolve
-Shapes/ApiParityBootstrapShapeTest.EvalBootstrap/Sparse_FIXEDMANUAL:LevelBudgets/ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked/*FIXEDMANUAL | Not matching OpenFHE on haze: the bootstrap under FIXEDMANUAL ends one level lower than OpenFHE's, so at the deepest input OpenFHE accepts it gains no level and returns its input
-Shapes/ApiParityBootstrapShapeTest.EvalBootstrap/SparseEncapsulated_* | Not implemented on haze: the bootstrap of SPARSE_ENCAPSULATED secrets is refused with an error (HazeBootstrap.RefusesSparseEncapsulatedSecrets tests the refusal)
-LevelBudgets/ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked/*FLEXIBLEAUTO*:LevelBudgets/ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked/*FLEXIBLEAUTOEXT | The in-process simulator cannot hold a fully packed FLEXIBLE bootstrap at the ring size its replay bridge accepts for FLEXIBLE scaling primes (2^16)
