@@ -241,7 +241,8 @@ jobs:
           source /opt/rh/gcc-toolset-14/enable
           mkdir -p "$FIDESLIB_HAZE_RUNS_DIR"
           python3 "$GITHUB_WORKSPACE/.github/scripts/run_gtest.py" --binary ./fideslib-cpu-test \
-            --list "$GITHUB_WORKSPACE/.github/tests-not-applicable/${{ matrix.backend }}.txt" --xml "$RUNNER_TEMP/test-results/results.xml"
+            --list "$GITHUB_WORKSPACE/.github/tests-not-applicable/${{ matrix.backend }}.txt" \
+            --gaps "$GITHUB_WORKSPACE/.github/tests-known-gaps/${{ matrix.backend }}.txt" --xml "$RUNNER_TEMP/test-results/results.xml"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

@@ -5,10 +5,12 @@
 
 Each row sums every gtest XML report the glob matches (the shards of one run, say). A
 not-applicable.json next to a report (written by run_gtest.py) lists the tests left out of that
-run because they do not apply to the backend, each with its reason. The report has a table with,
-per row, the tests the binary defines, how many were executed, passed, failed, skipped, not
-applicable and disabled and the time of the tests, a table of the slowest tests, and a table of
-the reasons of the tests that were not executed. The Markdown goes to $GITHUB_STEP_SUMMARY when it
+run because they do not apply to the backend, each with its reason. A known-gaps.json next to it
+lists the tests that should pass on the backend and do not yet: they are counted apart, as known gaps,
+so that a missing feature is not taken for a test that has no meaning on the backend. The report has
+a table with, per row, the tests the binary defines, how many were executed, passed, failed, skipped,
+not applicable, known gaps and disabled and the time of the tests, a table of the slowest tests, and
+a table of the reasons of the tests that were not executed. The Markdown goes to $GITHUB_STEP_SUMMARY when it
 is set, and to standard output otherwise.
 
 Exits 1 if a row matched no report, so the job that calls it cannot go green on a missing result.
@@ -32,6 +34,7 @@ def read(files):
     skip_reasons = collections.defaultdict(list)
     times = []  # (seconds, test) of every test that ran
     not_applicable = {}  # test -> reason, over the not-applicable.json next to each report
+    gaps = {}  # test -> reason, over the known-gaps.json next to each report
     for path in files:
         root = ET.parse(path).getroot()
         for case in root.iter("testcase"):
@@ -49,16 +52,20 @@ def read(files):
                 times.append((float(case.get("time") or 0), name))
                 if case.find("failure") is not None or case.find("error") is not None:
                     failed += 1
-        na_file = os.path.join(os.path.dirname(path), "not-applicable.json")
-        if os.path.exists(na_file):
-            with open(na_file) as f:
-                for item in json.load(f)["tests"]:
-                    not_applicable[item["test"]] = item["reason"]
-    na_reasons = collections.defaultdict(list)
-    for name, reason in not_applicable.items():
-        na_reasons[reason].append(name)
-    return {"total": total + len(not_applicable), "failed": failed, "skipped": skipped, "disabled": disabled,
-            "not_applicable": len(not_applicable), "skip_reasons": skip_reasons, "na_reasons": na_reasons, "times": times}
+        for file_name, into in (("not-applicable.json", not_applicable), ("known-gaps.json", gaps)):
+            extra = os.path.join(os.path.dirname(path), file_name)
+            if os.path.exists(extra):
+                with open(extra) as f:
+                    for item in json.load(f)["tests"]:
+                        into[item["test"]] = item["reason"]
+    reasons = {}
+    for key, found in (("na_reasons", not_applicable), ("gap_reasons", gaps)):
+        reasons[key] = collections.defaultdict(list)
+        for name, reason in found.items():
+            reasons[key][reason].append(name)
+    return {"total": total + len(not_applicable) + len(gaps), "failed": failed, "skipped": skipped, "disabled": disabled,
+            "not_applicable": len(not_applicable), "known_gaps": len(gaps), "skip_reasons": skip_reasons,
+            "times": times, **reasons}
 
 
 def percent(part, whole):
@@ -98,25 +105,25 @@ def main():
     missing = sum(1 for _, r in rows if r is None)
 
     def executed(r):
-        return r["total"] - r["skipped"] - r["disabled"] - r["not_applicable"]
+        return r["total"] - r["skipped"] - r["disabled"] - r["not_applicable"] - r["known_gaps"]
 
     lines = [f"### {args.title}", "",
-             "| Run | Status | Tests | Executed | Passed | Failed | Skipped | Not applicable | Disabled | Test time |",
-             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "| Run | Status | Tests | Executed | Passed | Failed | Skipped | Not applicable | Known gaps | Disabled | Test time |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for label, r in rows:
         if r is None:
-            lines.append(f"| {label} | {status(None)} | | | | | | | | |")
+            lines.append(f"| {label} | {status(None)} | | | | | | | | | |")
             continue
         ran = executed(r)
         lines.append(f"| {label} | {status(r)} | {r['total']:,} | {ran:,} ({percent(ran, r['total'])}) | {ran - r['failed']:,} | {r['failed']} | "
-                     f"{r['skipped']} | {r['not_applicable']} | {r['disabled']} | {duration(sum(t for t, _ in r['times']))} |")
+                     f"{r['skipped']} | {r['not_applicable']} | {r['known_gaps']} | {r['disabled']} | {duration(sum(t for t, _ in r['times']))} |")
     found = [r for _, r in rows if r is not None]
     if len(rows) > 1 and found:
         total = sum(r["total"] for r in found)
         ran = sum(executed(r) for r in found)
         lines.append(f"| **Total** | | **{total:,}** | **{ran:,} ({percent(ran, total)})** | **{ran - sum(r['failed'] for r in found):,}** | "
                      f"**{sum(r['failed'] for r in found)}** | **{sum(r['skipped'] for r in found)}** | **{sum(r['not_applicable'] for r in found)}** | "
-                     f"**{sum(r['disabled'] for r in found)}** | **{duration(sum(t for r in found for t, _ in r['times']))}** |")
+                     f"**{sum(r['known_gaps'] for r in found)}** | **{sum(r['disabled'] for r in found)}** | **{duration(sum(t for r in found for t, _ in r['times']))}** |")
     lines += ["", "Test time is the sum of the time of every executed test. Runs split into shards or processes that run side by side take less wall-clock time than that sum."]
 
     slowest = sorted(((t, label, name) for label, r in rows if r for t, name in r["times"]), reverse=True)[:10]
@@ -124,7 +131,8 @@ def main():
         lines += ["", "#### Slowest tests", "", "| Test | Run | Time |", "|---|---|---:|"]
         lines += [f"| `{name}` | {label} | {duration(t)} |" for t, label, name in slowest]
 
-    for heading, key in (("Tests not applicable, by reason", "na_reasons"), ("Tests skipped, by reason", "skip_reasons")):
+    for heading, key in (("Tests not applicable, by reason", "na_reasons"), ("Known gaps, by reason", "gap_reasons"),
+                         ("Tests skipped, by reason", "skip_reasons")):
         section = [(label, reasons) for label, r in rows if r for reasons in [r[key]] if reasons]
         if section:
             lines += ["", f"#### {heading}", "", "| Run | Reason | Tests |", "|---|---|---:|"]
