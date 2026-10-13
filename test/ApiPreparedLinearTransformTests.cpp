@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-#include "TestEngineConfig.hpp" // FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM
+#include "TestEngineConfig.hpp"
 #include "fideslib.hpp"
 
 using namespace fideslib;
@@ -46,7 +46,11 @@ bool TestUseDevice() {
 }
 
 // Exact ciphertext equality: scaling metadata + every RNS limb of both polynomials.
-void ExpectSameCiphertext(Ciphertext<DCRTPoly>& a, Ciphertext<DCRTPoly>& b) {
+// Both results must have been declared with MarkOutput before the first readback (the haze backend
+// runs its one program at that readback); everywhere else the declaration is free.
+void ExpectSameCiphertext(CryptoContext<DCRTPoly>& cc, Ciphertext<DCRTPoly>& a, Ciphertext<DCRTPoly>& b) {
+	cc->RecoverHostCiphertext(a);
+	cc->RecoverHostCiphertext(b);
 	ASSERT_EQ(a->GetNoiseScaleDeg(), b->GetNoiseScaleDeg());
 	ASSERT_EQ(a->GetScalingFactor(), b->GetScalingFactor());
 	ASSERT_EQ(a->GetLevel(), b->GetLevel());
@@ -150,7 +154,6 @@ class PreparedLtTest : public ::testing::Test {
 // ---- 1. Equality with the vector overloads ----
 
 TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverload) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// gStep = 2: the backwards Horner fold and its bStep*stride rotation are live, which is the
 	// shape the application's matmul actually runs.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
@@ -167,8 +170,10 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverload) {
 	ASSERT_TRUE(prepared != nullptr);
 	auto viaPrepared = src->Clone();
 	cc->LinearTransformInPlace(viaPrepared, prepared);
+	cc->MarkOutput(viaVector);
+	cc->MarkOutput(viaPrepared);
 
-	ExpectSameCiphertext(viaVector, viaPrepared);
+	ExpectSameCiphertext(cc, viaVector, viaPrepared);
 	// ...and it is the right answer, not merely the same wrong one.
 	Plaintext out;
 	cc->Decrypt(viaPrepared, keys.secretKey, &out);
@@ -180,7 +185,6 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverload) {
 }
 
 TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverloadAcrossShapes) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// Every branch the single transform has: gStep == 1, a short last giant step, and a non-zero
 	// offset. Random diagonals in each, so equality is not an artefact of one matrix.
 	struct Shape {
@@ -192,6 +196,13 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverloadAcrossShapes) {
 		{ 8, 3, 1, 0, 22u },  // gStep = 3 with a 2-wide last giant step (null padding)
 		{ 8, 2, 1, -2, 33u }, // non-zero offset: the final rotation branch
 	};
+	// Every transform is computed and declared as an output before the first one is read back: a
+	// record/replay backend runs its one program at that first readback.
+	struct Computed {
+		Ciphertext<DCRTPoly> viaVector, viaPrepared;
+		std::string label;
+	};
+	std::vector<Computed> computed;
 	for (const auto& s : shapes) {
 		auto M	 = MakeRandomMatrix(static_cast<int>(kSlots), s.seed);
 		auto pts = PackDiagonals(cc, M, s.rowSize, s.bStep, s.stride, s.offset);
@@ -202,14 +213,17 @@ TEST_F(PreparedLtTest, PreparedSingleEqualsVectorOverloadAcrossShapes) {
 
 		auto viaPrepared = src->Clone();
 		cc->LinearTransformInPlace(viaPrepared, cc->PrepareLinearTransform(pts, s.rowSize, s.bStep, s.stride, s.offset));
-
-		SCOPED_TRACE("rowSize=" + std::to_string(s.rowSize) + " bStep=" + std::to_string(s.bStep) + " offset=" + std::to_string(s.offset));
-		ExpectSameCiphertext(viaVector, viaPrepared);
+		cc->MarkOutput(viaVector);
+		cc->MarkOutput(viaPrepared);
+		computed.push_back({ viaVector, viaPrepared, "rowSize=" + std::to_string(s.rowSize) + " bStep=" + std::to_string(s.bStep) + " offset=" + std::to_string(s.offset) });
+	}
+	for (auto& c : computed) {
+		SCOPED_TRACE(c.label);
+		ExpectSameCiphertext(cc, c.viaVector, c.viaPrepared);
 	}
 }
 
 TEST_F(PreparedLtTest, PreparedManyEqualsVectorMany) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The batched shape the application runs: several independent transforms of ONE source.
 	const int n = static_cast<int>(kSlots), rowSize = n, bStep = 4, stride = 1, offset = 0;
 	std::vector<std::vector<std::vector<double>>> Ms;
@@ -230,13 +244,16 @@ TEST_F(PreparedLtTest, PreparedManyEqualsVectorMany) {
 	ASSERT_EQ(viaVector.size(), sets.size());
 	ASSERT_EQ(viaPrepared.size(), sets.size());
 	for (size_t t = 0; t < sets.size(); ++t) {
+		cc->MarkOutput(viaVector[t]);
+		cc->MarkOutput(viaPrepared[t]);
+	}
+	for (size_t t = 0; t < sets.size(); ++t) {
 		SCOPED_TRACE("transform " + std::to_string(t));
-		ExpectSameCiphertext(viaVector[t], viaPrepared[t]);
+		ExpectSameCiphertext(cc, viaVector[t], viaPrepared[t]);
 	}
 }
 
 TEST_F(PreparedLtTest, PreparedHandleIsReusableAcrossCalls) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The whole point of the handle: prepare once, call many times. Every call must equal the
 	// vector overload, not just the first — a table that is consumed or invalidated by use would
 	// pass the single-call test and fail here.
@@ -245,6 +262,9 @@ TEST_F(PreparedLtTest, PreparedHandleIsReusableAcrossCalls) {
 	auto pts	  = PackDiagonals(cc, M, rowSize, bStep, stride, offset);
 	auto prepared = cc->PrepareLinearTransform(pts, rowSize, bStep, stride, offset);
 
+	// All the calls first, then the comparisons: a record/replay backend runs its one program at the
+	// first readback.
+	std::vector<std::pair<Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>>> computed;
 	for (const auto& v : { v1, v2 }) {
 		for (int rep = 0; rep < 2; ++rep) {
 			auto src	   = Encrypt(v);
@@ -252,14 +272,18 @@ TEST_F(PreparedLtTest, PreparedHandleIsReusableAcrossCalls) {
 			cc->LinearTransformInPlace(viaVector, rowSize, bStep, pts, stride, offset);
 			auto viaPrepared = src->Clone();
 			cc->LinearTransformInPlace(viaPrepared, prepared);
-			SCOPED_TRACE("rep " + std::to_string(rep));
-			ExpectSameCiphertext(viaVector, viaPrepared);
+			cc->MarkOutput(viaVector);
+			cc->MarkOutput(viaPrepared);
+			computed.emplace_back(viaVector, viaPrepared);
 		}
+	}
+	for (size_t i = 0; i < computed.size(); ++i) {
+		SCOPED_TRACE("call " + std::to_string(i));
+		ExpectSameCiphertext(cc, computed[i].first, computed[i].second);
 	}
 }
 
 TEST_F(PreparedLtTest, PreparedHandleKeepsItsDiagonalsAlive) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The handle holds the diagonals BY SHARED HANDLE, so a caller that drops its own vector (the
 	// application's diagonal pool evicting an entry while a prepared transform still references it)
 	// cannot free the buffers the table points at.
@@ -280,7 +304,9 @@ TEST_F(PreparedLtTest, PreparedHandleKeepsItsDiagonalsAlive) {
 
 	auto viaPrepared = src->Clone();
 	cc->LinearTransformInPlace(viaPrepared, prepared);
-	ExpectSameCiphertext(viaVector, viaPrepared);
+	cc->MarkOutput(viaVector);
+	cc->MarkOutput(viaPrepared);
+	ExpectSameCiphertext(cc, viaVector, viaPrepared);
 }
 
 // ---- 2. Staleness is a throw, never a stale read ----
@@ -325,7 +351,6 @@ TEST_F(PreparedLtTest, PreparedHandleThrowsOnReleasedDiagonal) {
 }
 
 TEST_F(PreparedLtTest, PreparedHandleAcceptsAnUntouchedDiagonalSet) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	// The negative control for the two throws above: the identity check must not be so eager that
 	// an ordinary reuse trips it. Encrypting, transforming and decrypting around the handle leaves
 	// the diagonals alone, so the second call still runs.
@@ -336,8 +361,12 @@ TEST_F(PreparedLtTest, PreparedHandleAcceptsAnUntouchedDiagonalSet) {
 
 	auto a = Encrypt(v1);
 	EXPECT_NO_THROW(cc->LinearTransformInPlace(a, prepared));
-	Plaintext scratch;
-	cc->Decrypt(a, keys.secretKey, &scratch);
+	// A readback between the calls is the ordinary reuse this guards; the haze backend runs one
+	// program per context, so there the second call goes in before the first readback.
+	if (GetTestBackend() != TestBackend::HAZE) {
+		Plaintext scratch;
+		cc->Decrypt(a, keys.secretKey, &scratch);
+	}
 	auto b = Encrypt(v2);
 	EXPECT_NO_THROW(cc->LinearTransformInPlace(b, prepared));
 }
@@ -362,7 +391,6 @@ TEST_F(PreparedLtTest, PrepareRejectsBadArguments) {
 }
 
 TEST_F(PreparedLtTest, PreparedCallsRejectNullAndTheWrongHandleKind) {
-	FIDESLIB_SKIP_ON_HAZE_NO_LINEAR_TRANSFORM();
 	const int n = static_cast<int>(kSlots);
 	auto M		= MakeRandomMatrix(n, 2u);
 	auto pts	= PackDiagonals(cc, M, n, 4, 1, 0);

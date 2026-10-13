@@ -263,9 +263,62 @@ void Engine::dropToLevel(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>&
 }
 
 // ---- Linear transform (fused BSGS matrix-vector product) ----
-// CPU and CUDA override this; haze falls through to here.
-void Engine::linearTransformInPlace(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRTPoly>&, int, int, const std::vector<Plaintext>&, int, int, bool) {
-	notImplemented("linearTransformInPlace");
+// CPU and CUDA override this; every other backend (haze) takes this composition of the context's own
+// operations. It is the CPU engine's algorithm (baby steps from one hoisted precompute, a Horner fold
+// over the giant steps), so the result has the same values, level and noise degree on every backend:
+// the product of the diagonals with the rotated input, left at noise degree 2 for the caller to rescale.
+//   result = sum_{k < rowSize} Rot(ct, k*stride + offset) * D_k
+// with D_k already counter-rotated by -bStep*(k/bStep)*stride - offset.
+// `ext` is unused: a backend without an extended plaintext basis hands out ordinary encodings.
+void Engine::linearTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int rowSize, int bStep, const std::vector<Plaintext>& diagonals, int stride, int offset, bool) {
+	const int gStep = (rowSize + bStep - 1) / bStep;
+
+	// The diagonals' level requirement is stated against the post-rescale level, as on CUDA.
+	if (ctx.CiphertextNoiseScaleDeg(*ct) == 2)
+		ctx.RescaleInPlace(ct);
+
+	// Baby steps: one precompute feeds every rotation; index 0 is the identity and takes no key.
+	const auto precomp = ctx.EvalFastRotationPrecompute(ct);
+	const uint32_t m   = ctx.GetCyclotomicOrder();
+	std::vector<Ciphertext<DCRTPoly>> baby(static_cast<size_t>(bStep));
+	for (int i = 0; i < bStep; ++i)
+		baby[static_cast<size_t>(i)] = (i * stride == 0) ? ct->Clone() : ctx.EvalFastRotation(ct, i * stride, m, precomp);
+
+	// A giant-step rotation by a whole number of full slot cycles is the identity.
+	const int fullCycle			= static_cast<int>(ctx.GetRingDimension() / 2);
+	const bool giantStepIsNoOp	= (bStep * stride) % fullCycle == 0;
+	const int giantStepRotation = bStep * stride;
+
+	// One dot product per giant step, folded backwards: the running sum is rotated by bStep*stride
+	// each time, so the giant part is paid once per step and not once per diagonal.
+	Ciphertext<DCRTPoly> acc;
+	for (int j = gStep - 1; j >= 0; --j) {
+		Ciphertext<DCRTPoly> inner;
+		for (int i = 0; i < bStep; ++i) {
+			const int k = bStep * j + i;
+			if (k >= rowSize)
+				break; // the last giant step is short
+			Plaintext diagonal = diagonals[static_cast<size_t>(k)];
+			auto term		   = ctx.EvalMult(baby[static_cast<size_t>(i)], diagonal);
+			if (!inner)
+				inner = term;
+			else
+				ctx.EvalAddInPlace(inner, term);
+		}
+		// gStep = ceil(rowSize / bStep) guarantees bStep * j < rowSize, so `inner` is never null.
+		if (!acc)
+			acc = inner;
+		else
+			ctx.EvalAddInPlace(acc, inner);
+
+		if (j > 0) {
+			if (!giantStepIsNoOp)
+				acc = ctx.EvalRotate(acc, giantStepRotation);
+		} else if (offset != 0) {
+			acc = ctx.EvalRotate(acc, offset);
+		}
+	}
+	ct = acc;
 }
 
 // The reference for LinearTransformMany on every backend, and the CPU engine's actual
@@ -338,7 +391,6 @@ uint64_t Engine::plaintextIdentity(CryptoContextImpl<DCRTPoly>&, const Plaintext
 		return h;
 	h = FoldWord(h, pt->extended ? 0x9e37u : 0x1u);
 	h = FoldWord(h, pt->device_only ? 0x85ebu : 0x2u);
-	h = FoldWord(h, pt->device.has_value() ? 0xc2b2u : 0x3u);
 	if (!pt->host.has_value())
 		return FoldWord(h, 0xdeadbeefull);
 	const auto& impl	  = std::any_cast<const lbcrypto::Plaintext&>(pt->host);
