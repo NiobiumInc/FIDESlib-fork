@@ -31,7 +31,7 @@ Measured on this tree:
 | Scenario | Test | CUDA | haze |
 |---|---|---|---|
 | add, sub, negate, mult, square with ciphertexts, scalars and plaintexts; explicit rescale under FIXEDMANUAL | `ApiParityTechniqueTest.Arithmetic`, `.ArithmeticWithPlaintext` | identical ciphertext, all four techniques | identical |
-| operand adjustment across noise degrees and level gaps (FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT) | `ApiParityTechniqueTest.OperandAdjustment` | identical | same numbers, not the same ciphertext |
+| operand adjustment across noise degrees and level gaps (FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT) | `ApiParityOperandAdjustmentTest.OperandAdjustment` | identical | same numbers, not the same ciphertext |
 | Chebyshev series, degree 12 | `ApiParityTechniqueTest.ChebyshevSeries` | identical | same numbers, not the same ciphertext |
 | rotation, fast rotation, hoisted rotation, add-many | `ApiParityTechniqueTest.Rotation`, `.FastRotation`, `.FastRotationHoisted`, `.AddMany` | identical | identical |
 | accumulate sum | `ApiParityTechniqueTest.AccumulateSum` | identical | same numbers, not the same ciphertext |

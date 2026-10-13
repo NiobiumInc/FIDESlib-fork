@@ -1687,10 +1687,11 @@ TEST_P(ApiParityTechniqueTest, ArithmeticWithPlaintext) {
 }
 
 // Operands at mixed noise degrees and level gaps (including degree 2 against degree 2 with a gap of
-// two). Under FIXEDMANUAL operands of different degrees cannot be combined, so it has no case here.
-TEST_P(ApiParityTechniqueTest, OperandAdjustment) {
-	if (Manual())
-		GTEST_SKIP() << "FIXEDMANUAL does not adjust operands: a degree or level mismatch is the caller's to resolve";
+// two). Under FIXEDMANUAL operands of different degrees cannot be combined (a degree or level mismatch is the
+// caller's to resolve), so the case is instantiated for the other techniques only.
+class ApiParityOperandAdjustmentTest : public ApiParityTechniqueTest {};
+
+TEST_P(ApiParityOperandAdjustmentTest, OperandAdjustment) {
 	MakeContext(6);
 	auto c1 = Encrypt(x1);
 	auto l1 = LbCt(c1);
@@ -1794,6 +1795,7 @@ TEST_P(ApiParityTechniqueTest, AddMany) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
+INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityOperandAdjustmentTest, ::testing::Values(FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT), TechniqueParamName);
 
 // ---------------------------------------------------------------------------------------------
 // Bootstrap parity across scaling techniques, key distributions, level budgets and slot counts.

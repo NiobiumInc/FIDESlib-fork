@@ -84,6 +84,11 @@ constexpr double kCoeffsToSlotsTolerance = 1e-12;
 class OpenFHEInterfaceTest : public GeneralParametrizedTest {
 };
 
+// The tests that mix noise degrees and levels. FIXEDMANUAL rescales after every product, so its operands never meet at
+// different depths: it is left out of the instantiation, not skipped.
+class OpenFHEInterfaceAutoDepthTest : public GeneralParametrizedTest {
+};
+
 TEST_P(OpenFHEInterfaceTest, ExtractContextShowAdd) {
 	// Enable the features that you wish to use
 	cc->Enable(lbcrypto::PKE);
@@ -1764,9 +1769,8 @@ TEST_P(OpenFHEInterfaceTest, MultAllLevels) {
 // A product of ciphertexts at different depths, in both orders: a ciphertext that has just been multiplied (depth 2,
 // not rescaled) and a fresh one (depth 1), with the depth-2 operand at the fresh one's level and one level below it.
 // Under the automatic techniques OpenFHE raises the shallower operand, level-reduces it if it has more limbs, and
-// rescales both, and the residues of the GPU result must be the same. FIXEDMANUAL never mixes depths here, because it
-// rescales after every product.
-TEST_P(OpenFHEInterfaceTest, MultMixedDepth) {
+// rescales both, and the residues of the GPU result must be the same.
+TEST_P(OpenFHEInterfaceAutoDepthTest, MultMixedDepth) {
 	cc->Enable(lbcrypto::PKE);
 	cc->Enable(lbcrypto::KEYSWITCH);
 	cc->Enable(lbcrypto::LEVELEDSHE);
@@ -1786,8 +1790,6 @@ TEST_P(OpenFHEInterfaceTest, MultMixedDepth) {
 	FIDESlib::CKKS::Context& cc_        = GPUcc;
 	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
 	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
-	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
-		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
 
 	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
@@ -1879,8 +1881,8 @@ static void ExpectMixedDepthResult(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
 // ciphertext (depth 1), the product of two (depth 2, not rescaled), that product multiplied again (depth 2, one level
 // lower) and that one rescaled (depth 1, two levels lower than the fresh one). Under the automatic techniques OpenFHE
 // adjusts the operands with AdjustLevelsAndDepthInPlace before it adds or subtracts them, and the residues of the GPU
-// result must be the same. FIXEDMANUAL does not mix depths here, because it rescales after every product.
-TEST_P(OpenFHEInterfaceTest, AddSubMixedDepth) {
+// result must be the same. FIXEDMANUAL is not instantiated: it rescales after every product, so depths are never mixed.
+TEST_P(OpenFHEInterfaceAutoDepthTest, AddSubMixedDepth) {
 	cc->Enable(lbcrypto::PKE);
 	cc->Enable(lbcrypto::KEYSWITCH);
 	cc->Enable(lbcrypto::LEVELEDSHE);
@@ -1900,8 +1902,6 @@ TEST_P(OpenFHEInterfaceTest, AddSubMixedDepth) {
 	FIDESlib::CKKS::Context& cc_        = GPUcc;
 	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
 	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
-	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
-		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
 
 	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
@@ -1974,8 +1974,8 @@ TEST_P(OpenFHEInterfaceTest, AddSubMixedDepth) {
 // (depth 1), the product of two (depth 2, not rescaled), that product multiplied again (depth 2, one level lower) and
 // that one rescaled (depth 1, two levels lower than the fresh one). Under the automatic techniques OpenFHE adjusts the
 // operands with AdjustLevelsAndDepthInPlace and rescales them before it multiplies, and the residues of the GPU result
-// must be the same. FIXEDMANUAL does not mix depths here, because it rescales after every product.
-TEST_P(OpenFHEInterfaceTest, MultEveryDepthPair) {
+// must be the same. FIXEDMANUAL is not instantiated: it rescales after every product, so depths are never mixed.
+TEST_P(OpenFHEInterfaceAutoDepthTest, MultEveryDepthPair) {
 	cc->Enable(lbcrypto::PKE);
 	cc->Enable(lbcrypto::KEYSWITCH);
 	cc->Enable(lbcrypto::LEVELEDSHE);
@@ -1995,8 +1995,6 @@ TEST_P(OpenFHEInterfaceTest, MultEveryDepthPair) {
 	FIDESlib::CKKS::Context& cc_        = GPUcc;
 	cc_                                 = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
 	FIDESlib::CKKS::ContextData& GPUcc  = *cc_;
-	if (GPUcc.rescaleTechnique == CKKS::FIXEDMANUAL)
-		GTEST_SKIP() << "FIXEDMANUAL rescales after every product, so depths are never mixed";
 
 	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 	FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
@@ -2661,6 +2659,8 @@ TEST_P(OpenFHEInterfaceTest, MatVecPtScalar) {
 
 // Define the parameter sets
 INSTANTIATE_TEST_SUITE_P(OpenFHEInterfaceTests, OpenFHEInterfaceTest, testing::Values(TTALL64BOOT));
+INSTANTIATE_TEST_SUITE_P(OpenFHEInterfaceAutoDepthTests, OpenFHEInterfaceAutoDepthTest,
+  testing::Values(tparams64_13_1_flex, tparams64_13_1_fix, tparams64_13_2_flex, tparams64_13_3_flex, tparams64_13_4_flex));
 
 class OpenFHEBootstrapTest : public GeneralParametrizedTest {
 };
