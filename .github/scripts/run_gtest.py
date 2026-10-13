@@ -47,8 +47,11 @@ def read_list(path):
     return entries
 
 
-def list_tests(binary):
-    out = subprocess.run([binary, "--gtest_list_tests"], check=True, capture_output=True, text=True).stdout
+def list_tests(binary, env=None):
+    """The tests the binary defines, as gtest lists them. `env` adds to the environment of the listing:
+    tests are registered per backend (test/TestRegistration.hpp), so the list depends on it."""
+    out = subprocess.run([binary, "--gtest_list_tests"], check=True, capture_output=True, text=True,
+                         env={**os.environ, **env} if env else None).stdout
     names, suite = [], ""
     for line in out.splitlines():
         if not line.strip():
