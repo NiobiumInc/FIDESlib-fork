@@ -67,6 +67,13 @@ void FIDESlib::Testing::fft_forPrime(std::vector<uint64_t>& a, bool invert, int 
 	  its);
 }
 
+void FIDESlib::Testing::fft_forPrime32(std::vector<uint64_t>& a, bool invert, int primeid, int its) {
+	FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+	FIDESlib::Global& host_global		= *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
+
+	fft(a, invert, ((uint32_t*)hG_.psi[primeid])[a.size() >> 2], ((uint32_t*)hG_.inv_psi[primeid])[a.size() >> 2], hC_.primes[primeid], its);
+}
+
 #define M (4)
 
 #define OFFSET_T(i) ((blockDim * 2 * M) * blockIdx + 2 * blockDim * (i) + 2 * tid)

@@ -223,6 +223,9 @@ def main():
     parser.add_argument("--not-applicable", metavar="FILE",
                         help="tests that do not apply to this pass, one `PATTERN | REASON` per line (run_gtest.py): "
                              "they are left out and recorded in not-applicable.json next to the reports")
+    parser.add_argument("--gaps", metavar="FILE",
+                        help="tests that should pass on this backend and do not yet, in the same format: they are left "
+                             "out too and recorded in known-gaps.json, so the report counts them as known gaps")
     parser.add_argument("--retries", type=int, default=RETRIES,
                         help=f"extra attempts for a gate test that fails (default {RETRIES})")
     args = parser.parse_args()
@@ -236,23 +239,30 @@ def main():
 
     # 1. Gate, with up to args.retries more attempts for whatever fails.
     excluded = benchmarks + known + flaky
-    if args.not_applicable:
+    if args.not_applicable or args.gaps:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import run_gtest
         listed = run_gtest.list_tests(args.binary)
-        left_out, stale = {}, []
-        for pattern, reason in run_gtest.read_list(args.not_applicable):
-            hit = [n for n in listed if run_gtest.matches(n, pattern)]
-            if not hit:
-                stale.append(pattern)
-            for name in hit:
-                left_out.setdefault(name, reason)
-        if stale:
-            print("::error::These not-applicable patterns match no test (renamed or removed?): " + ", ".join(stale))
-            return 2
-        with open(os.path.join(args.out, "not-applicable.json"), "w") as f:
-            json.dump({"list": args.not_applicable, "tests": [{"test": n, "reason": r} for n, r in sorted(left_out.items())]}, f, indent=1)
-        excluded = excluded + sorted(left_out)
+        taken = set()
+        for path, option, output in ((args.not_applicable, "not-applicable", "not-applicable.json"),
+                                     (args.gaps, "known-gaps", "known-gaps.json")):
+            if not path:
+                continue
+            left_out, stale = {}, []
+            for pattern, reason in run_gtest.read_list(path):
+                hit = [n for n in listed if run_gtest.matches(n, pattern)]
+                if not hit:
+                    stale.append(pattern)
+                for name in hit:
+                    if name not in taken:
+                        left_out.setdefault(name, reason)
+            if stale:
+                print(f"::error::These {option} patterns match no test (renamed or removed?): " + ", ".join(stale))
+                return 2
+            taken.update(left_out)
+            with open(os.path.join(args.out, output), "w") as f:
+                json.dump({"list": path, "tests": [{"test": n, "reason": r} for n, r in sorted(left_out.items())]}, f, indent=1)
+            excluded = excluded + sorted(left_out)
     gate_filter = args.only + ("-" + ":".join(excluded) if excluded else "")
     if args.isolate:
         gate_status, gate = run_isolated(args.binary, list_tests(args.binary, gate_filter),
