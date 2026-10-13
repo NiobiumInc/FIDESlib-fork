@@ -1815,12 +1815,12 @@ struct BootstrapShape {
 	std::vector<uint32_t> levelBudget;
 	uint32_t slots;
 	uint32_t correctionFactor;
+	uint32_t scaleMod = 50;
 };
 
 class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapShape> {
   protected:
 	static constexpr uint32_t kDepth	 = 25;
-	static constexpr uint32_t kScaleMod	 = 50;
 	static constexpr uint32_t kRingDim	 = 1u << 12;
 
 	CryptoContext<DCRTPoly> cc;
@@ -1842,7 +1842,7 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 		params.SetSecretKeyDist(p.dist);
 		params.SetScalingTechnique(p.technique);
 		params.SetMultiplicativeDepth(kDepth);
-		params.SetScalingModSize(kScaleMod);
+		params.SetScalingModSize(p.scaleMod);
 		params.SetBatchSize(p.slots);
 		params.SetSecurityLevel(HEStd_NotSet);
 		params.SetRingDim(ringDim);
@@ -1892,9 +1892,11 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "LinearTransform_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
 	BootstrapShape{ "Slots64_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 64, 0 },
 	BootstrapShape{ "Sparse_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
-	// The default correction factor under FIXEDMANUAL is 9 at the ring the device backends use (2^16), below the degree
-	// of the modulus chain (10), and EvalBootstrap rejects that, so the factor is given explicitly.
-	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 12 },
+	// FIXEDMANUAL needs a scaling modulus close to the first modulus (60 bits): the default correction factor is 9 at
+	// the ring the device backends use (2^16), and EvalBootstrap rejects it when the gap between the two moduli is larger
+	// (10 at 50 bits). Giving a larger factor passes the check but leaves a bootstrap whose result sometimes does not
+	// decrypt, on OpenFHE alone as well; the 59-bit modulus of OpenFHE's own bootstrapping examples works.
+	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 0, 59 },
 	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
