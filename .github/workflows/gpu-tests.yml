@@ -213,7 +213,8 @@ jobs:
         run: |
           args=()
           if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results "${args[@]}"
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt "${args[@]}"
 
       # The concurrent-operations suite, in a process of its own: the library reads
       # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
