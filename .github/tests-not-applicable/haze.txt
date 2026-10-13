@@ -9,4 +9,3 @@
 DropInputHost.DecryptSurvivesDroppedInputCuda | Tests the CUDA backend's device ciphertexts
 ReducedNoise.SerializeDeserializeCudaReducedNoiseRoundTrip | Serializes a CUDA context, which needs a build with the CUDA backend
 CKKSTest.ConcurrentHostShadowCopyOnWrite | Needs the concurrent-operations mode of the CUDA backend (FIDESLIB_CONCURRENT_OPS=1)
-Techniques/ApiParityTechniqueTest.OperandAdjustment/FIXEDMANUAL | FIXEDMANUAL does not adjust operands: a degree or level mismatch is the caller's to resolve
