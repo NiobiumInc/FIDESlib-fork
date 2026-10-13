@@ -1899,3 +1899,35 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 }),
   BootstrapShapeName);
+
+// The haze bootstrap does not implement the key switches of a SPARSE_ENCAPSULATED secret (to the
+// sparse key before the modulus is raised and back after it), and without them its output does not
+// decrypt. It has to say so when the bootstrap keys are generated, and not return that output.
+TEST(HazeBootstrap, RefusesSparseEncapsulatedSecrets) {
+	if (GetTestBackend() != TestBackend::HAZE)
+		GTEST_SKIP() << "tests the haze backend";
+	CCParams<CryptoContextCKKSRNS> params;
+	params.SetSecretKeyDist(SPARSE_ENCAPSULATED);
+	params.SetScalingTechnique(FIXEDAUTO);
+	params.SetMultiplicativeDepth(25);
+	params.SetScalingModSize(50);
+	params.SetBatchSize(8);
+	params.SetSecurityLevel(HEStd_NotSet);
+	params.SetRingDim(1u << 12);
+	ConfigureTestEngine(params);
+	auto cc = GenCryptoContext(params);
+	cc->Enable(PKE);
+	cc->Enable(KEYSWITCH);
+	cc->Enable(LEVELEDSHE);
+	cc->Enable(ADVANCEDSHE);
+	cc->Enable(FHE);
+	auto keys = cc->KeyGen();
+	cc->EvalMultKeyGen(keys.secretKey);
+	cc->EvalBootstrapSetup({ 3, 3 }, { 0, 0 }, 8, 0);
+	try {
+		cc->EvalBootstrapKeyGen(keys.secretKey, 8);
+		FAIL() << "the bootstrap keys were generated for a SPARSE_ENCAPSULATED secret";
+	} catch (const std::runtime_error& e) {
+		EXPECT_NE(std::string(e.what()).find("SPARSE_ENCAPSULATED"), std::string::npos) << e.what();
+	}
+}

@@ -2322,7 +2322,20 @@ BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool precompute, bool btsf
 	return BootstrapSetupPolicy{ precompute, btsfirstboot, modEvalLevels };
 }
 
+namespace {
+// The bootstrap of a SPARSE_ENCAPSULATED secret switches the ciphertext to a sparse key before the
+// modulus is raised and back to the dense key after it. The haze bootstrap records neither switch,
+// so what it computed would not decrypt: refuse the request instead of returning that.
+void refuseSparseEncapsulated(const CryptoContextImpl<DCRTPoly>& ctx) {
+	if (ctx.keyDist == SPARSE_ENCAPSULATED) {
+		throw std::runtime_error("haze backend: bootstrapping with SPARSE_ENCAPSULATED secrets is not implemented "
+								 "(the key switches to the sparse key and back are not recorded); use another secret key distribution");
+	}
+}
+} // namespace
+
 void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
+	refuseSparseEncapsulated(ctx);
 	if (isContextLoaded()) {
 		throw std::runtime_error("Context is already loaded");
 	}
