@@ -1892,7 +1892,9 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "LinearTransform_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
 	BootstrapShape{ "Slots64_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 64, 0 },
 	BootstrapShape{ "Sparse_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
-	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
+	// The default correction factor under FIXEDMANUAL is 9 at the ring the device backends use (2^16), below the degree
+	// of the modulus chain (10), and EvalBootstrap rejects that, so the factor is given explicitly.
+	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 12 },
 	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
