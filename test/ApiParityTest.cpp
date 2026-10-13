@@ -1278,8 +1278,8 @@ INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityBootstrapTest,
 // runs the real pipeline rather than early-returning unchanged (a false pass).
 //
 // Parametrized over (levelBudget, scalingTechnique): the haze bootstrap supports
-// FIXEDAUTO/FLEXIBLEAUTO/FLEXIBLEAUTOEXT; the haze bootstrap does not support FIXEDMANUAL, so that case
-// runs on CUDA only. N=4096 fully-packed runs in-process on the local FHETCH simulator (OOM is no
+// FIXEDAUTO/FLEXIBLEAUTO/FLEXIBLEAUTOEXT; the haze bootstrap under FIXEDMANUAL ends one level lower than
+// OpenFHE's, so that case runs on CUDA only. N=4096 fully-packed runs in-process on the local FHETCH simulator (OOM is no
 // longer a concern at this ring) and on CUDA.
 struct FullPackParam {
 	std::vector<uint32_t> levelBudget;
@@ -1832,10 +1832,8 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 			GTEST_SKIP() << "api-vs-OpenFHE parity is trivial on the CPU backend (api == OpenFHE); "
 							"set FIDESLIB_TEST_BACKEND=cuda or =haze to run it.";
 		if (GetTestBackend() == TestBackend::HAZE) {
-			if (p.technique == FIXEDMANUAL)
-				GTEST_SKIP() << "the haze bootstrap supports FIXEDAUTO, FLEXIBLEAUTO and FLEXIBLEAUTOEXT, not FIXEDMANUAL";
 			if (p.dist == SPARSE_ENCAPSULATED)
-				GTEST_SKIP() << "the haze bootstrap does not support SPARSE_ENCAPSULATED secrets: its output does not decrypt";
+				GTEST_SKIP() << "the haze bootstrap refuses SPARSE_ENCAPSULATED secrets (HazeBootstrap.RefusesSparseEncapsulatedSecrets)";
 		}
 		// The in-process replay bridge rejects FLEXIBLE scaling primes at rings below 2^16, so the
 		// FLEXIBLE techniques run on haze at that ring.
