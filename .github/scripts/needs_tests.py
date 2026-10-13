@@ -68,8 +68,7 @@ def main():
     run, reason = decide(paths, read_lines(args.skippable), args.always, args.file_limit)
 
     decision = "true" if run else "false"
-    verdict = "Tests run" if run else "Tests skipped"
-    summary = f"**{verdict}:** {reason}.\n"
+    summary = f"### Test selection\n\n| Item | Value |\n|---|---|\n| Decision | {'Tests executed' if run else 'Tests not executed'} |\n| Reason | {reason} |\n"
     print(f"run={decision}: {reason}")
 
     output = os.environ.get("GITHUB_OUTPUT")
