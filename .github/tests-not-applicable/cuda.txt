@@ -6,7 +6,7 @@
 # A pattern that matches no test is an error (see .github/scripts/run_gtest.py).
 
 ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite | Needs the concurrent-operations mode (FIDESLIB_CONCURRENT_OPS=1), which the default pass runs without; these tests run in the concurrent passes
-ChebyshevFixedManual.HazeMatchesOpenFheOracle:Repro/ChebyshevFixedManualCoworker.*:DropInputHost.DecryptSurvivesDroppedInput | Regression tests of the haze backend
+ChebyshevFixedManual.HazeMatchesOpenFheOracle:Repro/ChebyshevFixedManualCoworker.*:DropInputHost.DecryptSurvivesDroppedInput:HazeBootstrap.* | Regression tests of the haze backend
 CKKSTest.MakeCKKSPackedPlaintextDeviceFallsBackOnHostBackends:CKKSTest.MakeCKKSPackedPlaintextDeviceManyMatchesSingleOnHostBackends | Test the fallback of a backend that cannot encode on the device; the CUDA backend encodes on the device
 P2PTransferTest.MultiGPUIfAvailable* | Need two or more GPUs; the runner has one
 Techniques/ApiParityTechniqueTest.OperandAdjustment/FIXEDMANUAL | FIXEDMANUAL does not adjust operands: a degree or level mismatch is the caller's to resolve
