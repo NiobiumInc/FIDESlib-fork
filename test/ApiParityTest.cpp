@@ -1824,10 +1824,6 @@ class ApiParityBootstrapShapeTest : public ::testing::TestWithParam<BootstrapSha
 
 	void SetUp() override {
 		const BootstrapShape& p = GetParam();
-		if (GetTestBackend() == TestBackend::HAZE) {
-			if (p.dist == SPARSE_ENCAPSULATED)
-				GTEST_SKIP() << "the haze bootstrap refuses SPARSE_ENCAPSULATED secrets (HazeBootstrap.RefusesSparseEncapsulatedSecrets)";
-		}
 		// The in-process replay bridge rejects FLEXIBLE scaling primes at rings below 2^16, so the
 		// FLEXIBLE techniques run on haze at that ring.
 		const uint32_t ringDim = (GetTestBackend() == TestBackend::HAZE && p.technique != FIXEDAUTO) ? (1u << 16) : kRingDim;
@@ -1899,35 +1895,6 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseSecret_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_TERNARY, { 3, 3 }, 8, 0 },
+	BootstrapShape{ "SparseEncapsulated_FIXEDAUTO", FIXEDAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 })),
   BootstrapShapeName);
-
-// The haze bootstrap does not implement the key switches of a SPARSE_ENCAPSULATED secret (to the
-// sparse key before the modulus is raised and back after it), and without them its output does not
-// decrypt. It has to say so when the bootstrap keys are generated, and not return that output.
-FIDES_TEST_IF(OnHaze(), HazeBootstrap, RefusesSparseEncapsulatedSecrets) {
-	CCParams<CryptoContextCKKSRNS> params;
-	params.SetSecretKeyDist(SPARSE_ENCAPSULATED);
-	params.SetScalingTechnique(FIXEDAUTO);
-	params.SetMultiplicativeDepth(25);
-	params.SetScalingModSize(50);
-	params.SetBatchSize(8);
-	params.SetSecurityLevel(HEStd_NotSet);
-	params.SetRingDim(1u << 12);
-	ConfigureTestEngine(params);
-	auto cc = GenCryptoContext(params);
-	cc->Enable(PKE);
-	cc->Enable(KEYSWITCH);
-	cc->Enable(LEVELEDSHE);
-	cc->Enable(ADVANCEDSHE);
-	cc->Enable(FHE);
-	auto keys = cc->KeyGen();
-	cc->EvalMultKeyGen(keys.secretKey);
-	cc->EvalBootstrapSetup({ 3, 3 }, { 0, 0 }, 8, 0);
-	try {
-		cc->EvalBootstrapKeyGen(keys.secretKey, 8);
-		FAIL() << "the bootstrap keys were generated for a SPARSE_ENCAPSULATED secret";
-	} catch (const std::runtime_error& e) {
-		EXPECT_NE(std::string(e.what()).find("SPARSE_ENCAPSULATED"), std::string::npos) << e.what();
-	}
-}

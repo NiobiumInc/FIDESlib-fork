@@ -186,6 +186,18 @@ HazeEngine::Operand HazeEngine::modRaiseCore(const Operand& x, size_t targetTowe
 	return res;
 }
 
+HazeEngine::Operand HazeEngine::raiseModulusCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, size_t targetTowers) {
+	if (ctx.keyDist != SPARSE_ENCAPSULATED) {
+		return modRaiseCore(x, targetTowers);
+	}
+	// OpenFHE EvalBootstrap, SPARSE_ENCAPSULATED: KeySwitchSparse (2N-4) to the sparse secret, the raise from its
+	// first prime, then the hybrid KeySwitchInPlace (2N-2) back to the dense secret.
+	const uint32_t N = static_cast<uint32_t>(ringDim_);
+	Operand sparse	 = keySwitchSparseCore(ctx, x);
+	Operand raised	 = modRaiseCore(sparse, targetTowers);
+	return keySwitchByAutoIndex(ctx, raised, 2 * N - 2);
+}
+
 HazeEngine::Operand HazeEngine::multIntCore(const Operand& x, uint64_t scalar) {
 	// OpenFHE MultByIntegerInPlace: per-limb scalar mod q_i; no metadata change.
 	std::vector<uint64_t> scalars(x.towers);
@@ -977,7 +989,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	{
 		auto p					  = devicePayload(work);
 		const size_t raiseTowers  = L0 - (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0);
-		Operand r				  = modRaiseCore(asOperand(p), raiseTowers);
+		Operand r				  = raiseModulusCore(ctx, asOperand(p), raiseTowers);
 		rebindPayload(*p, std::move(r.p->components), r);
 	}
 	if (bootDebugStage() == 3) {
@@ -1129,7 +1141,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 	{
 		auto p					 = devicePayload(raised);
 		const size_t raiseTowers = L0 - (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0);
-		Operand r				 = modRaiseCore(asOperand(p), raiseTowers);
+		Operand r				 = raiseModulusCore(ctx, asOperand(p), raiseTowers);
 		rebindPayload(*p, std::move(r.p->components), r);
 	}
 	if (bootDebugStage() == 1) {

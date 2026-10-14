@@ -182,6 +182,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	}
 	rotKeys_.clear();
 	autoKeys_.clear();
+	sparseKey_.reset();
 	for (const int32_t step : ctx.rotation_indexes) {
 		if (rotKeys_.count(step) != 0) {
 			continue;
@@ -313,6 +314,7 @@ void HazeEngine::teardown() {
 	haveRelinKey_ = false;
 	rotKeys_.clear();
 	autoKeys_.clear();
+	sparseKey_.reset();
 	boot_.clear();
 	numPartQ_ = 0;
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
@@ -2025,6 +2027,85 @@ HazeEngine::KsKey& HazeEngine::autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint
 	return it->second;
 }
 
+HazeEngine::SparseSwitchKey& HazeEngine::sparseKeyFor(CryptoContextImpl<DCRTPoly>& ctx) {
+	if (!sparseKey_) {
+		auto& context = hostContext(ctx);
+		SparseSwitchKey key;
+		key.host = hazebk::extractSparseSwitchKeyLimbs(context, keyTag_, 2 * static_cast<uint32_t>(ringDim_) - 4);
+		if (key.host.q0 != qBase_.front() || pBase_.empty() || key.host.p0 != pBase_.front()) {
+			throw std::runtime_error("haze backend: the sparse switching key is not over the first primes of Q and P");
+		}
+		const std::vector<uint64_t> base = { key.host.q0, key.host.p0 };
+		key.a							 = LimbChain(key.host.a_limbs, base);
+		key.b							 = LimbChain(key.host.b_limbs, base);
+		key.uploaded					 = true;
+		key.host.a_limbs.clear();
+		key.host.b_limbs.clear();
+		sparseKey_ = std::move(key);
+	}
+	return *sparseKey_;
+}
+
+HazeEngine::Operand HazeEngine::keySwitchSparseCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x) {
+	requireRelinearized(*x.p, "EvalBootstrap");
+	SparseSwitchKey& key = sparseKeyFor(ctx);
+	const uint64_t q0	 = key.host.q0;
+	const uint64_t p0	 = key.host.p0;
+	const std::vector<uint64_t> baseQ	= { q0 };
+	const std::vector<uint64_t> baseP	= { p0 };
+	const std::vector<uint64_t> baseQP = { q0, p0 };
+
+	// c1 mod q0, extended to q0*p0: the p0 row is the centered lift of the coefficients.
+	const void* const c1Row0[1] = { x.p->c1()[0] };
+	LimbChain c1Coeff(1, polyBytes_);
+	hazeCheck(hazeINTTMrp(c1Coeff.data(), c1Row0, baseQ.data(), 1, nullptr), "hazeINTTMrp(sparse)");
+	const hazeBasisConvertParams toP = {
+		/*.src_base =*/baseQ.data(),
+		/*.src_base_len =*/1,
+		/*.dst_base =*/baseP.data(),
+		/*.dst_base_len =*/1,
+	};
+	LimbChain c1P(1, polyBytes_);
+	hazeCheck(hazeBasisConvertCentered(c1P.data(), c1Coeff.asConst().data(), &toP, nullptr), "hazeBasisConvertCentered(sparse)");
+	LimbChain c1PEval(1, polyBytes_);
+	hazeCheck(hazeNTTMrp(c1PEval.data(), c1P.asConst().data(), baseP.data(), 1, nullptr), "hazeNTTMrp(sparse)");
+	const void* const c1Ext[2] = { x.p->c1()[0], c1PEval[0] };
+
+	// Multiply by the key, then divide by p0 back to q0 (ApproxModDown with a centered lift).
+	auto switchOne = [&](const LimbChain& keyPoly) {
+		LimbChain prod(2, polyBytes_);
+		hazeCheck(hazeMulMrp(prod.data(), c1Ext, keyPoly.asConst().data(), baseQP.data(), 2, nullptr), "hazeMulMrp(sparse)");
+		const void* const pRow[1] = { prod[1] };
+		LimbChain pCoeff(1, polyBytes_);
+		hazeCheck(hazeINTTMrp(pCoeff.data(), pRow, baseP.data(), 1, nullptr), "hazeINTTMrp(sparse)");
+		const std::vector<const void*> surv = { prod[0] };
+		return evalModDown(surv, pCoeff, baseP, baseQ, ModDownLift::Centered);
+	};
+	LimbChain ksB = switchOne(key.b);
+	LimbChain ksA = switchOne(key.a);
+
+	// c0' = c0 + ks.b (first prime only), c1' = ks.a.
+	const void* const c0Row0[1] = { x.p->c0()[0] };
+	LimbChain out0				= addChain(polyBytes_, baseQ, c0Row0, ksB.asConst().data());
+
+	Operand res = x; // metadata unchanged
+	res.towers	= 1;
+	res.p		= finishPayload(hazebk::makeComponents(std::move(out0), std::move(ksA)), res);
+	return res;
+}
+
+HazeEngine::Operand HazeEngine::keySwitchByAutoIndex(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t autoIndex) {
+	requireRelinearized(*x.p, "EvalBootstrap");
+	KsKey& key		  = autoKeyFor(ctx, autoIndex);
+	KsContribution ks = hybridKeyswitch(x.p->c1(), x.towers, key);
+	const auto base	  = qPrefix(x.towers);
+	LimbChain out0	  = addChain(polyBytes_, base, x.p->c0().asConst().data(), ks.b.asConst().data());
+
+	Operand res = x; // metadata unchanged
+	res.p		= finishPayload(hazebk::makeComponents(std::move(out0), std::move(ks.a)), res);
+	return res;
+}
+
 HazeEngine::Operand HazeEngine::rotateByAutoIndex(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t autoIndex) {
 	// Keyswitching an automorphism only has a c1 to switch: a degree-2 operand has no valid path
 	// here (bootstrap reaches this core without passing the facade's guard).
@@ -2322,20 +2403,7 @@ BootstrapSetupPolicy HazeEngine::bootstrapSetupPolicy(bool precompute, bool btsf
 	return BootstrapSetupPolicy{ precompute, btsfirstboot, modEvalLevels };
 }
 
-namespace {
-// The bootstrap of a SPARSE_ENCAPSULATED secret switches the ciphertext to a sparse key before the
-// modulus is raised and back to the dense key after it. The haze bootstrap records neither switch,
-// so what it computed would not decrypt: refuse the request instead of returning that.
-void refuseSparseEncapsulated(const CryptoContextImpl<DCRTPoly>& ctx) {
-	if (ctx.keyDist == SPARSE_ENCAPSULATED) {
-		throw std::runtime_error("haze backend: bootstrapping with SPARSE_ENCAPSULATED secrets is not implemented "
-								 "(the key switches to the sparse key and back are not recorded); use another secret key distribution");
-	}
-}
-} // namespace
-
 void HazeEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {
-	refuseSparseEncapsulated(ctx);
 	if (isContextLoaded()) {
 		throw std::runtime_error("Context is already loaded");
 	}

@@ -64,6 +64,25 @@ HybridKeyswitchLimbs extractAutomorphismKeyLimbs(
 	const std::string& keyTag,
 	uint32_t autoIndex);
 
+/// @brief The switching key of a SPARSE_ENCAPSULATED bootstrap that takes the dense secret to the sparse one
+/// (OpenFHE KeySwitchGenSparse, registered under automorphism index 2N-4): one digit over the two primes
+/// q0 (the first prime of Q) and p0 (the first prime of P), in EVALUATION form.
+struct SparseSwitchKeyLimbs {
+	std::vector<std::vector<uint64_t>> a_limbs; // [tower in {q0, p0}][coeff]
+	std::vector<std::vector<uint64_t>> b_limbs;
+	uint64_t q0 = 0;
+	uint64_t p0 = 0;
+};
+
+/// @brief Extract the sparse switching key registered under autoIndex for keyTag.
+///
+/// @throws (std::runtime_error) when the key map or the index is missing, or the key does not have the two-prime,
+///   one-digit shape KeySwitchGenSparse produces.
+SparseSwitchKeyLimbs extractSparseSwitchKeyLimbs(
+	const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+	const std::string& keyTag,
+	uint32_t autoIndex);
+
 } // namespace fideslib::hazebk
 
 #endif // FIDESLIB_ENABLE_HAZE
