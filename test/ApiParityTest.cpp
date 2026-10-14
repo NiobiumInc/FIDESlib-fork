@@ -1593,16 +1593,11 @@ class ApiParityTechniqueTest : public ::testing::TestWithParam<ScalingTechnique>
 	}
 
 	// The device result against the OpenFHE oracle, exactly. A failure names the case and the
-	// test goes on to the next one. `exactOnHaze` is false for the operations on which the haze
-	// backend gives the same numbers as OpenFHE but not the same ciphertext (a different level or
-	// noise degree of the result, or a different order of the additions): there the decrypted
-	// values are compared, and the CUDA backend is still held to the exact result.
-	void ExpectIdentical(const char* what, Ciphertext<DCRTPoly>& device, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle, bool exactOnHaze = true) {
+	// test goes on to the next one.
+	void ExpectIdentical(const char* what, Ciphertext<DCRTPoly>& device, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle) {
 		SCOPED_TRACE(std::string(TechniqueName(GetParam())) + " " + what);
 		auto got = HostCt(cc, device);
 		ExpectCloseValues(got, oracle);
-		if (GetTestBackend() == TestBackend::HAZE && !exactOnHaze)
-			return;
 		ASSERT_EQ_CIPHERTEXT(oracle, got);
 	}
 
@@ -1703,7 +1698,7 @@ TEST_P(ApiParityOperandAdjustmentTest, OperandAdjustment) {
 	static const char* names[] = { "c2", "c3", "c4", "c1+c3 (degree 1 against 2, gap 1)", "c2+c4 (gap 2)", "c4-c2 (gap 2, reversed)",
 		"c1*c4 (degree 1 against 2, gap 2)", "c2*c3 (gap 1)", "square c1" };
 	for (size_t i = 0; i < device.size(); ++i)
-		ExpectIdentical(names[i], device[i], oracle[i], /*exactOnHaze=*/false);
+		ExpectIdentical(names[i], device[i], oracle[i]);
 }
 
 TEST_P(ApiParityTechniqueTest, ChebyshevSeries) {
@@ -1715,7 +1710,7 @@ TEST_P(ApiParityTechniqueTest, ChebyshevSeries) {
 	auto res = cc->EvalChebyshevSeries(c1, coeffs, -1.0, 1.0);
 	cc->MarkOutput(res);
 	auto oracle = LbCc(cc)->EvalChebyshevSeries(l1, coeffs, -1.0, 1.0);
-	ExpectIdentical("chebyshev series", res, oracle, /*exactOnHaze=*/false);
+	ExpectIdentical("chebyshev series", res, oracle);
 }
 
 TEST_P(ApiParityTechniqueTest, Rotation) {
@@ -1768,7 +1763,7 @@ TEST_P(ApiParityTechniqueTest, AccumulateSum) {
 	cc->MarkOutput(res);
 	auto oracle = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(*l1);
 	lbcrypto::FHECKKSRNS::EvalPartialSumInPlace(oracle, 1, kSlots, PARTIAL_SUM_RADIX);
-	ExpectIdentical("accumulate sum", res, oracle, /*exactOnHaze=*/false);
+	ExpectIdentical("accumulate sum", res, oracle);
 }
 
 TEST_P(ApiParityTechniqueTest, AddMany) {

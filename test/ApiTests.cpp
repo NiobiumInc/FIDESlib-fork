@@ -547,7 +547,7 @@ TEST_F(CKKSTest, EvalChebyshevSeries) {
 	CheckPrecision(cc, res, keys.secretKey, input, 1e-4);
 }
 
-// Regression test: HazeEngine::hazeEvalChebyshevSeriesImpl silently omitted the
+// Regression test: the haze Chebyshev series once silently omitted the
 // FIXEDMANUAL-only manual rescale/level-drop branches present in the CUDA/OpenFHE
 // reference (src/CKKS/ApproxModEval.cu), so under FIXEDMANUAL the Haze backend decrypted
 // to a different result than the CPU/OpenFHE oracle for the same series. Not a CKKSTest
