@@ -183,6 +183,52 @@ HybridKeyswitchLimbs extractAutomorphismKeyLimbs(
 	return result;
 }
 
+SparseSwitchKeyLimbs extractSparseSwitchKeyLimbs(
+	const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+	const std::string& keyTag,
+	uint32_t autoIndex)
+{
+	if (!cc)
+		throw std::runtime_error("haze backend: CryptoContext is null in extractSparseSwitchKeyLimbs");
+
+	std::shared_ptr<std::map<uint32_t, std::shared_ptr<lbcrypto::EvalKeyImpl<lbcrypto::DCRTPoly>>>> keyMapPtr;
+	try {
+		keyMapPtr =
+			lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMapPtr(keyTag);
+	} catch (...) {
+		throw std::runtime_error("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
+	}
+	if (!keyMapPtr)
+		throw std::runtime_error("haze backend: no automorphism key map registered for tag \"" + keyTag + "\"");
+
+	const auto it = keyMapPtr->find(autoIndex);
+	if (it == keyMapPtr->end())
+		throw std::runtime_error("haze backend: automorphism index " + std::to_string(autoIndex) +
+			" not found in key map for tag \"" + keyTag + "\" (is the secret key distribution SPARSE_ENCAPSULATED?)");
+
+	const auto& evalKey = it->second;
+	if (!evalKey)
+		throw std::runtime_error("haze backend: sparse switching key pointer is null");
+	const auto& aVec = evalKey->GetAVector();
+	const auto& bVec = evalKey->GetBVector();
+	// KeySwitchGenSparse builds one digit over {q0, p0}.
+	if (aVec.size() != 1 || bVec.size() != 1)
+		throw std::runtime_error("haze backend: the sparse switching key does not have one digit");
+
+	const std::size_t ringDim = cc->GetRingDimension();
+	const auto& towers		  = aVec[0].GetParams()->GetParams();
+	if (towers.size() != 2)
+		throw std::runtime_error("haze backend: the sparse switching key does not span two primes");
+
+	SparseSwitchKeyLimbs out;
+	out.q0 = towers[0]->GetModulus().template ConvertToInt<uint64_t>();
+	out.p0 = towers[1]->GetModulus().template ConvertToInt<uint64_t>();
+	if (!detail::extractDcrtpolyLimbs(aVec[0], 2, ringDim, out.a_limbs) ||
+		!detail::extractDcrtpolyLimbs(bVec[0], 2, ringDim, out.b_limbs))
+		throw std::runtime_error("haze backend: the sparse switching key has an unexpected tower count or ring dimension");
+	return out;
+}
+
 } // namespace fideslib::hazebk
 
 #endif // FIDESLIB_ENABLE_HAZE

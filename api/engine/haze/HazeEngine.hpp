@@ -420,6 +420,26 @@ class HazeEngine : public Engine {
 	/// @brief Lazily-extracted automorphism keys by raw automorphism index (bootstrap
 	/// rotations, conjugation 2N−1, and any rotation step not in rotKeys_).
 	std::map<uint32_t, KsKey> autoKeys_;
+	/// @brief The key that takes a SPARSE_ENCAPSULATED secret to its sparse key (automorphism index 2N-4):
+	/// two primes, one digit, extracted at first use and uploaded once.
+	struct SparseSwitchKey {
+		hazebk::SparseSwitchKeyLimbs host;
+		hazebk::LimbChain a; // rows over {q0, p0}
+		hazebk::LimbChain b;
+		bool uploaded = false;
+	};
+	std::optional<SparseSwitchKey> sparseKey_;
+	SparseSwitchKey& sparseKeyFor(CryptoContextImpl<DCRTPoly>& ctx);
+	/// @brief OpenFHE KeySwitchSparse: switch the first prime of a degree-1 ciphertext from the dense secret to the
+	/// sparse one. c1 mod q0 is extended to q0*p0 (centered), multiplied by the 2N-4 key and divided by p0 back to q0;
+	/// the result has one tower, the metadata of the input otherwise.
+	Operand keySwitchSparseCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x);
+	/// @brief OpenFHE KeySwitchInPlace against the key registered under `autoIndex`: the hybrid keyswitch of c1, folded
+	/// into (c0, c1), with no automorphism (the 2N-2 key of a SPARSE_ENCAPSULATED bootstrap, back to the dense secret).
+	Operand keySwitchByAutoIndex(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t autoIndex);
+	/// @brief The modulus raise of a bootstrap: modRaiseCore, and for a SPARSE_ENCAPSULATED secret the switch to the
+	/// sparse key before it and back to the dense key after it (OpenFHE EvalBootstrap).
+	Operand raiseModulusCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, size_t targetTowers);
 	std::string keyTag_;
 	/// @brief Resolve (extract + cache) the automorphism key for autoIndex from the host
 	/// context's key map.
