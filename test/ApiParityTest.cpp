@@ -1279,10 +1279,8 @@ INSTANTIATE_TEST_SUITE_P(LevelBudgets, ApiParityBootstrapTest,
 // HEStd_NotSet. Tolerance is the bootstrap precision (1e-2). The input is DEPLETED so EvalBootstrap
 // runs the real pipeline rather than early-returning unchanged (a false pass).
 //
-// Parametrized over (levelBudget, scalingTechnique): the haze bootstrap supports
-// FIXEDAUTO/FLEXIBLEAUTO/FLEXIBLEAUTOEXT; the haze bootstrap under FIXEDMANUAL ends one level lower than
-// OpenFHE's, so that case runs on CUDA only. N=4096 fully-packed runs in-process on the local FHETCH simulator (OOM is no
-// longer a concern at this ring) and on CUDA.
+// Parametrized over (levelBudget, scalingTechnique). N=4096 fully-packed runs in-process on the local FHETCH
+// simulator (OOM is no longer a concern at this ring) and on CUDA.
 struct FullPackParam {
 	std::vector<uint32_t> levelBudget;
 	ScalingTechnique scalingTech;
@@ -1318,7 +1316,7 @@ class ApiParityFullPackBootstrapTest : public ::testing::TestWithParam<FullPackP
 		// replay-bridge synthesis limitation, NOT a haze-engine defect (the haze trace records fine; it
 		// fails only when the bridge re-derives input contexts). FIXEDAUTO uses fixed primes the bridge
 		// accepts, so it is the validated in-process path. Skip FLEXIBLE* on the local in-process target.
-		if (GetTestBackend() == TestBackend::HAZE && p.scalingTech != FIXEDAUTO) {
+		if (GetTestBackend() == TestBackend::HAZE && (p.scalingTech == FLEXIBLEAUTO || p.scalingTech == FLEXIBLEAUTOEXT)) {
 			const char* tgt = std::getenv("FIDESLIB_HAZE_TARGET");
 			const bool isLocal = (tgt == nullptr || tgt[0] == '\0' || std::string(tgt) == "local");
 			if (isLocal)
@@ -1878,7 +1876,11 @@ TEST_P(ApiParityBootstrapShapeTest, EvalBootstrap) {
 	auto refreshed			  = cc->EvalBootstrap(ct);
 	// A refresh that gained no levels returns its input, and the comparison would hold vacuously.
 	ASSERT_LT(refreshed->GetLevel(), levelBefore) << "the bootstrap gained no levels, so this test exercised nothing";
-	ExpectDeviceBootstrapAsAccurateAsHost(p.name, cc, keys.secretKey, HostCt(cc, refreshed), hostRuns, x);
+	// The refresh lands on the level OpenFHE's does: a backend that spends a level more hands the caller a
+	// smaller budget for the same program, and every comparison of values still passes.
+	auto refreshedHost = HostCt(cc, refreshed);
+	ASSERT_EQ(refreshedHost->GetLevel(), hostRuns.front()->GetLevel()) << "the refresh lands on another level than OpenFHE's";
+	ExpectDeviceBootstrapAsAccurateAsHost(p.name, cc, keys.secretKey, refreshedHost, hostRuns, x);
 }
 
 // The suite has no cases on the backends it does not apply to.
@@ -1888,11 +1890,11 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "Sparse_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "LinearTransform_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 1, 1 }, 8, 0 },
 	BootstrapShape{ "Slots64_FLEXIBLEAUTO", FLEXIBLEAUTO, UNIFORM_TERNARY, { 3, 3 }, 64, 0 },
-	BootstrapShape{ "Sparse_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	// FIXEDMANUAL needs a scaling modulus close to the first modulus (60 bits): the default correction factor is 9 at
-	// the ring the device backends use (2^16), and EvalBootstrap rejects it when the gap between the two moduli is larger
+	// the ring the haze backend uses (2^16), and EvalBootstrap rejects it when the gap between the two moduli is larger
 	// (10 at 50 bits). Giving a larger factor passes the check but leaves a bootstrap whose result sometimes does not
 	// decrypt, on OpenFHE alone as well; the 59-bit modulus of OpenFHE's own bootstrapping examples works.
+	BootstrapShape{ "Sparse_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 3, 3 }, 8, 0, 59 },
 	BootstrapShape{ "LinearTransform_FIXEDMANUAL", FIXEDMANUAL, UNIFORM_TERNARY, { 1, 1 }, 8, 0, 59 },
 	BootstrapShape{ "Sparse_FIXEDAUTO", FIXEDAUTO, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "Sparse_FLEXIBLEAUTOEXT", FLEXIBLEAUTOEXT, UNIFORM_TERNARY, { 3, 3 }, 8, 0 },

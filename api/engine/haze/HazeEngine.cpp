@@ -2723,11 +2723,17 @@ Ciphertext<DCRTPoly> HazeEngine::hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRT
 		// evalLinearWSumMutableFacade leaves its result at NSD2 (see the matching comment on the cu
 		// general branch above); FIXEDMANUAL has no auto-adjust to fix that up downstream, so bring
 		// su back to NSD1 explicitly before it is added into the final combine.
-		if (st == lbcrypto::FIXEDMANUAL && su->GetNoiseScaleDeg() == 2)
+		bool suRescaled = false;
+		if (st == lbcrypto::FIXEDMANUAL && su->GetNoiseScaleDeg() == 2) {
 			ctx.RescaleInPlace(su);
+			suRescaled = true;
+		}
 		// CUDA LevelReduceInPlace(su, nullptr): only FIXEDMANUAL actually drops a level
-		// (ApproxModEval.cu:392-393); a no-op for the AUTO scaling techniques.
-		if (st == lbcrypto::FIXEDMANUAL)
+		// (ApproxModEval.cu:392-393); a no-op for the AUTO scaling techniques. The rescale above
+		// already spent that level when the weighted sum was NSD2 (its target already sits one tower
+		// below T[k-1]'s), so the drop applies only to the copy of T[k-1]; OpenFHE's su ends one tower
+		// below T2[m-1] either way.
+		if (st == lbcrypto::FIXEDMANUAL && !suRescaled)
 			dropCiphertextToTowers(ctx, su, towersOf(ctx, su) - 1);
 	}
 
