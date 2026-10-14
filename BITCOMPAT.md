@@ -31,12 +31,12 @@ Measured on this tree:
 | Scenario | Test | CUDA | haze |
 |---|---|---|---|
 | add, sub, negate, mult, square with ciphertexts, scalars and plaintexts; explicit rescale under FIXEDMANUAL | `ApiParityTechniqueTest.Arithmetic`, `.ArithmeticWithPlaintext` | identical ciphertext, all four techniques | identical |
-| operand adjustment across noise degrees and level gaps (FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT) | `ApiParityOperandAdjustmentTest.OperandAdjustment` | identical | same numbers, not the same ciphertext |
-| Chebyshev series, degree 12 | `ApiParityTechniqueTest.ChebyshevSeries` | identical | same numbers, not the same ciphertext |
+| operand adjustment across noise degrees and level gaps (FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT) | `ApiParityOperandAdjustmentTest.OperandAdjustment` | identical | identical |
+| Chebyshev series, degree 12 | `ApiParityTechniqueTest.ChebyshevSeries` | identical | identical |
 | rotation, fast rotation, hoisted rotation, add-many | `ApiParityTechniqueTest.Rotation`, `.FastRotation`, `.FastRotationHoisted`, `.AddMany` | identical | identical |
-| accumulate sum | `ApiParityTechniqueTest.AccumulateSum` | identical | same numbers, not the same ciphertext |
-| bootstrap: sparse, 64 slots, level budgets {1,1} and {3,3}, FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT, sparse-ternary and sparse-encapsulated secrets | `ApiParityBootstrapShapeTest.EvalBootstrap` | as accurate as OpenFHE (see below) | FIXEDAUTO only (the in-process replay bridge rejects FLEXIBLE primes at small rings, and the haze bootstrap has no FIXEDMANUAL) |
-| bootstrap, fully packed (slots = N/2), FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT and FIXEDMANUAL | `ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked` | pass | FIXEDAUTO only, as above |
+| accumulate sum | `ApiParityTechniqueTest.AccumulateSum` | identical | identical |
+| bootstrap: sparse, 64 slots, level budgets {1,1} and {3,3}, FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT, sparse-ternary and sparse-encapsulated secrets | `ApiParityBootstrapShapeTest.EvalBootstrap` | as accurate as OpenFHE (see below) | as accurate as OpenFHE, and on the same level (FLEXIBLE at N = 65536, because the in-process replay bridge rejects FLEXIBLE primes at small rings) |
+| bootstrap, fully packed (slots = N/2), FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT and FIXEDMANUAL | `ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked` | pass | FIXEDAUTO and FIXEDMANUAL; the FLEXIBLE cases do not fit the in-process simulator at the ring the bridge accepts for them |
 | bootstrap at N = 65536, level budgets {1,1}, {2,2}, {3,3}; sparse-ternary secret | `ApiParityBootstrapTest`, `ApiParitySparseSecretBootstrapTest` | pass | pass |
 
 **A bootstrap is not reproducible bit for bit, on OpenFHE or on the device.** Two bootstraps of copies of

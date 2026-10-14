@@ -278,16 +278,14 @@ class HazeEngine : public Engine {
 	/// the EvalSub tail rule (unmatched subtrahend components are negated, not copied).
 	hazebk::LimbChain negateChain(const hazebk::LimbChain& src, size_t towers);
 	/// @brief OpenFHE AdjustLevelsAndDepthInPlace port (all AUTO modes share one
-	/// implementation; compositeDegree == 1): equalize (level, NSD) of the two views via
+	/// implementation, FIXEDAUTO included; compositeDegree == 1): equalize (level, NSD) of the two views via
 	/// recorded compute + view truncation. FIXEDMANUAL: level-align by truncation only.
 	void adjustForAddOrSub(Operand& a, Operand& b);
 	/// @brief Adjust `x` toward `tgt` (the c1lvl<c2lvl branch body of
 	/// AdjustLevelsAndDepthInPlace). Works on 1-component operands too (morphed
-	/// plaintexts: empty c1 chains are skipped by the cores). `ctRule` selects the depth2/depth2
-	/// branch1 rule (parity #5): true = CUDA Ciphertext::adjustScaleAndLevel (q1=ModReduceFactor[c2lvl+1],
-	/// trim-before-rescale, used for ciphertext operands); false = CUDA Plaintext::adjustScaleAndLevel
-	/// (q1=ModReduceFactor[c1lvl], rescale-before-trim, used only by adjustPtToward).
-	void adjustOperandToward(Operand& x, const Operand& tgt, bool ctRule = true);
+	/// plaintexts: empty c1 chains are skipped by the cores). Follows OpenFHE's operation order: the factor
+	/// uses the mod-reduce factor of the operand's own top tower and the rescale comes before the level reduction.
+	void adjustOperandToward(Operand& x, const Operand& tgt);
 	/// @brief GPU Plaintext::adjustPlaintextToCiphertext port: adjust a plaintext operand
 	/// (single chain) toward the ciphertext's (level, NSD, scalingFactor). FIXEDAUTO uses
 	/// the drop/rescale rules from src/CKKS/Plaintext.cu:195-225; FLEXIBLE modes reuse
@@ -379,6 +377,12 @@ class HazeEngine : public Engine {
 	/// larger operand's tail copied (add) or negated when it comes from the subtrahend (sub).
 	/// Result component count = max(a, b).
 	Operand addSubCore(Operand a, Operand b, bool subtract);
+	/// @brief OpenFHE EvalPartialSumInPlace (the radix fold behind AccumulateSum), in the extended basis: per level
+	/// one digit decomposition of the current c1, the rotations' key switches kept in Q∥P with the accumulated c0·P
+	/// folded in before each automorphism, c0 settled by ONE mod-down at the end and c1 once per level. The
+	/// association and the mod-down placement are bit-significant (the plain rotate-and-add fold gives the same
+	/// numbers, not the same ciphertext).
+	Operand partialSumCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int stride, int size, int startFactor);
 	/// @brief Rotation (ops.cpp rotate): hybridKeyswitch(c1) against the step's
 	/// automorphism key, c0' = c0 + ks.b / c1' = ks.a, then AutomorphMrp BOTH (keyswitch
 	/// first, automorphism last — OpenFHE EvalAtIndex order). Metadata unchanged. Steps
@@ -550,39 +554,15 @@ class HazeEngine : public Engine {
 	  uint32_t numBlocks,
 	  uint32_t numRotSkip);
 
-	// ---- Chebyshev Paterson-Stockmeyer cores (parity #12-#15; CUDA src/CKKS/ApproxModEval.cu
-	// + Ciphertext.cpp evalLinearWSumMutable are the spec). ----
+	// ---- Chebyshev series ----
 
-	/// @brief Fused weighted-sum producing a result Operand directly at `targetTowers` (NSD=2):
-	/// out = sum_i weights[i]*ops[i], computed via multScalar (bootstrap-prescale encoding,
-	/// towersIn = ops[i].towers) + add-accumulate, exactly reproducing CUDA
-	/// Ciphertext::evalLinearWSumMutable (Ciphertext.cpp:1168). CUDA grows a fresh ct to the
-	/// target level and fills it; haze cannot grow (setCiphertextLevel only drops), so this
-	/// produces the result at `targetTowers` directly. NoiseFactor = ScalingFactorReal[level]^2
-	/// where level = |Q| - targetTowers. All ops[i] must have towers >= targetTowers.
-	Operand evalLinearWSumMutableCore(size_t targetTowers,
-	  const std::vector<Operand>& ops,
-	  const std::vector<double>& weights);
-	/// @brief Facade wrapper: extract operands from `ctxs`, call evalLinearWSumMutableCore at the
-	/// CUDA target level, and wrap the result back into a value-type Ciphertext parented to ctx.
-	Ciphertext<DCRTPoly> evalLinearWSumMutableFacade(CryptoContextImpl<DCRTPoly>& ctx,
-	  size_t targetTowers,
-	  const std::vector<Ciphertext<DCRTPoly>>& ctxs,
-	  const std::vector<double>& weights);
-	/// @brief Port of CUDA innerEvalChebyshevPS (ApproxModEval.cu:138) — Paterson-Stockmeyer
-	/// recursion threading level_offset (q@level_offset, s@level_offset+1) and max_m (cu caching
-	/// when max_m-m<=1). Returns the recursive PS result; the caller subtracts T2km1.
-	Ciphertext<DCRTPoly> hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
-	  const std::vector<double>& coefficients,
-	  uint32_t k, uint32_t m,
-	  const std::vector<Ciphertext<DCRTPoly>>& T,
-	  const std::vector<Ciphertext<DCRTPoly>>& T2,
-	  int level_offset, int max_m);
-	/// @brief Port of CUDA evalChebyshevSeries (ApproxModEval.cu:370) — always PS (no degree
-	/// dispatch, #12), CUDA centering affine map (#13), T/T2/T2km1 build, then InnerEvalChebyshevPS.
-	Ciphertext<DCRTPoly> hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
+	/// @brief OpenFHE's EvalChebyshevSeries (AdvancedSHECKKSRNS), transcribed operation for operation over the
+	/// facade: the linear evaluation for degree < 5, otherwise Paterson-Stockmeyer (internalEvalChebyPolysPS,
+	/// InnerEvalChebyshevPS, EvalPartialLinearWSum). The result is the same ciphertext as OpenFHE's, which the
+	/// CUDA-style port above is not (it differs in the primes it divides by and in the order of its additions).
+	Ciphertext<DCRTPoly> openFheChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx,
 	  const Ciphertext<DCRTPoly>& ct,
-	  std::vector<double>& coeffs,
+	  const std::vector<double>& coeffs,
 	  double a, double b);
 	/// @brief FIXEDMANUAL-only level drop on a live Ciphertext (CUDA dropToLevel / OpenFHE
 	/// LevelReduceInPlace analog): pure tower-count truncation, no IR emitted, no new limb

@@ -7,6 +7,8 @@
 #include "CryptoContext.hpp"
 #include "engine/EngineCommon.hpp"
 
+#include <functional>
+
 #include <haze/haze.h>
 #include <haze/replay_bridge.h>
 
@@ -914,47 +916,10 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 		b.towers			= towers;
 		return;
 	}
-	if (st == lbcrypto::FIXEDAUTO) {
-		// CUDA Ciphertext::adjustForAddOrSub FIXEDAUTO branch (Ciphertext.cpp:1473-1488): a SIMPLE
-		// depth-fix only — rescale a depth-2 operand or multScalar(1.0)-bump a depth-1 operand so both
-		// reach a common depth — and the level alignment is PURE TRUNCATION in the add/sub tail
-		// (:187-195, dropToLevel@1140 drops the fresher/more-towers operand). NOT OpenFHE's generic
-		// AdjustLevelsAndDepth (the FIXEDAUTO scale tables degenerate to a constant, so its
-		// multScalar(~1/S)+rescale is wasted work that perturbs NSD); that generic path is reserved for
-		// the FLEXIBLE modes below. The depth-adjusted-level comparison mirrors CUDA's
-		// getLevel()-NoiseLevel (getLevel = towers−1, so the −1 cancels): towers − noiseScaleDeg.
-		auto depthFix = [&](Operand& x, const Operand& y) -> bool {
-			const long dlx = static_cast<long>(x.towers) - static_cast<long>(x.noiseScaleDeg);
-			const long dly = static_cast<long>(y.towers) - static_cast<long>(y.noiseScaleDeg);
-			if (dlx > dly) {
-				if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
-					x = rescaleCore(x);
-				} else if (y.noiseScaleDeg == 2 && x.noiseScaleDeg == 1) {
-					x = multScalarCore(x, 1.0);
-				}
-				return true;
-			} else if (y.noiseScaleDeg == 1 && x.noiseScaleDeg == 2) {
-				x = rescaleCore(x);
-				return true;
-			} else if (x.noiseScaleDeg == 1 && y.noiseScaleDeg == 2) {
-				return false; // ask the caller to adjust the other operand instead (CUDA's swap+retry)
-			}
-			return true;
-		};
-		if (!depthFix(a, b)) {
-			if (!depthFix(b, a)) {
-				throw std::runtime_error("haze backend: FIXEDAUTO add/sub adjust failed to reconcile depth");
-			}
-		}
-		// Tail: pure truncation of the fresher (more-towers) operand to the other's tower count.
-		const size_t towers = std::min(a.towers, b.towers);
-		a.towers			= towers;
-		b.towers			= towers;
-		return;
-	}
-	// FLEXIBLEAUTO / FLEXIBLEAUTOEXT: OpenFHE/CUDA AdjustScaleAndLevel via the generic ciphertext
-	// helper (towers-space; OpenFHE level = |Q| − towers). The "fresher" operand (more towers / lower
-	// level) is adjusted toward the other; equal level only needs a depth bump.
+	// FIXEDAUTO / FLEXIBLEAUTO / FLEXIBLEAUTOEXT: OpenFHE AdjustLevelsAndDepthInPlace (CUDA
+	// adjustScaleAndLevel, which follows it since the FIXEDAUTO alignment fix) via the generic
+	// ciphertext helper (towers-space; OpenFHE level = |Q| − towers). The "fresher" operand (more
+	// towers / lower level) is adjusted toward the other; equal level only needs a depth bump.
 	if (levelOf(a) < levelOf(b)) {
 		adjustOperandToward(a, b);
 	} else if (levelOf(a) > levelOf(b)) {
@@ -968,76 +933,67 @@ void HazeEngine::adjustForAddOrSub(Operand& a, Operand& b) {
 	}
 }
 
-void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt, bool ctRule) {
-	{
-		const size_t c1lvl	 = levelOf(x);
-		const size_t c2lvl	 = levelOf(tgt);
-		const size_t c1depth = x.noiseScaleDeg;
-		const size_t c2depth = tgt.noiseScaleDeg;
-		if (c1depth == 2) {
-			if (c2depth == 2) {
-				const double scf1 = x.scalingFactor;
-				const double scf2 = tgt.scalingFactor;
-				const double scf  = sfReal_[c1lvl];
-				if (ctRule) {
-					// Ciphertext rule (CUDA Ciphertext::adjustScaleAndLevel, Ciphertext.cpp:1388-1400):
-					// q1 = ModReduceFactor[c2lvl+1] = modReduceFactor_[tgt.towers] (tower-indexed, matches
-					// CUDA param.ModReduceFactor), and TRIM the extra top towers BEFORE rescale (dropToLevel
-					// then rescale) so the correct top tower is folded when operands are >1 level apart.
-					const double q1 = modReduceFactor_[tgt.towers];
-					x				= multScalarCore(x, scf2 * q1 / scf1 / scf);
-					if (c1lvl + 1 < c2lvl) {
-						x.towers -= c2lvl - c1lvl - 1;
-					}
-					x = rescaleCore(x);
-				} else {
-					// Plaintext rule (CUDA Plaintext::adjustScaleAndLevel, Plaintext.cu:119-134): q1 =
-					// ModReduceFactor[c1lvl] = modReduceFactor_[x.towers−1], and rescale BEFORE trim. Kept
-					// only for adjustPtToward (the pt operand), per parity #5.
-					const double q1 = modReduceFactor_[x.towers - 1];
-					x				= multScalarCore(x, scf2 / scf1 * q1 / scf);
-					x				= rescaleCore(x);
-					if (c1lvl + 1 < c2lvl) {
-						x.towers -= c2lvl - c1lvl - 1;
-					}
-				}
-				x.scalingFactor = tgt.scalingFactor;
-			} else {
-				if (c1lvl + 1 == c2lvl) {
-					x = rescaleCore(x);
-				} else {
-					const double scf1 = x.scalingFactor;
-					const double scf2 = sfRealBig_[c2lvl - 1];
-					const double scf  = sfReal_[c1lvl];
-					const double q1	  = modReduceFactor_[x.towers - 1];
-					x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
-					x				  = rescaleCore(x);
-					if (c1lvl + 2 < c2lvl) {
-						x.towers -= c2lvl - c1lvl - 2;
-					}
-					x				= rescaleCore(x);
-					x.scalingFactor = tgt.scalingFactor;
-				}
+void HazeEngine::adjustOperandToward(Operand& x, const Operand& tgt) {
+	// OpenFHE AdjustLevelsAndDepthInPlace, the c1lvl < c2lvl branch, operation for operation: the same
+	// floating-point evaluation order for the adjustment factor, the mod-reduce factor of the operand's own
+	// top tower, and the rescale before the level reduction (a pure truncation here).
+	const size_t c1lvl	 = levelOf(x);
+	const size_t c2lvl	 = levelOf(tgt);
+	const size_t c1depth = x.noiseScaleDeg;
+	const size_t c2depth = tgt.noiseScaleDeg;
+	// The scaling factor of a depth-2 operand at a level. OpenFHE's table holds the factor itself under FIXEDAUTO
+	// (every level has the same one), which makes the factors below come out as 1/factor and the adjusted operand
+	// as its value divided by the scaling factor; the square is what the formulas mean (CUDA does the same).
+	auto bigFactor = [&](size_t i) {
+		return static_cast<lbcrypto::ScalingTechnique>(scalingTech_) == lbcrypto::FIXEDAUTO ? sfReal_[i] * sfReal_[i] : sfRealBig_[i];
+	};
+	if (c1depth == 2) {
+		if (c2depth == 2) {
+			const double scf1 = x.scalingFactor;
+			const double scf2 = tgt.scalingFactor;
+			const double scf  = sfReal_[c1lvl];
+			const double q1	  = modReduceFactor_[x.towers - 1];
+			x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
+			x				  = rescaleCore(x);
+			if (c1lvl + 1 < c2lvl) {
+				x.towers -= c2lvl - c1lvl - 1;
 			}
+			x.scalingFactor = tgt.scalingFactor;
 		} else {
-			if (c2depth == 2) {
-				const double scf1 = x.scalingFactor;
-				const double scf2 = tgt.scalingFactor;
-				const double scf  = sfReal_[c1lvl];
-				x				  = multScalarCore(x, scf2 / scf1 / scf);
-				x.towers -= c2lvl - c1lvl;
-				x.scalingFactor = scf2;
+			if (c1lvl + 1 == c2lvl) {
+				x = rescaleCore(x);
 			} else {
 				const double scf1 = x.scalingFactor;
-				const double scf2 = sfRealBig_[c2lvl - 1];
+				const double scf2 = bigFactor(c2lvl - 1);
 				const double scf  = sfReal_[c1lvl];
-				x				  = multScalarCore(x, scf2 / scf1 / scf);
-				if (c1lvl + 1 < c2lvl) {
-					x.towers -= c2lvl - c1lvl - 1;
+				const double q1	  = modReduceFactor_[x.towers - 1];
+				x				  = multScalarCore(x, scf2 / scf1 * q1 / scf);
+				x				  = rescaleCore(x);
+				if (c1lvl + 2 < c2lvl) {
+					x.towers -= c2lvl - c1lvl - 2;
 				}
 				x				= rescaleCore(x);
 				x.scalingFactor = tgt.scalingFactor;
 			}
+		}
+	} else {
+		if (c2depth == 2) {
+			const double scf1 = x.scalingFactor;
+			const double scf2 = tgt.scalingFactor;
+			const double scf  = sfReal_[c1lvl];
+			x				  = multScalarCore(x, scf2 / scf1 / scf);
+			x.towers -= c2lvl - c1lvl;
+			x.scalingFactor = scf2;
+		} else {
+			const double scf1 = x.scalingFactor;
+			const double scf2 = bigFactor(c2lvl - 1);
+			const double scf  = sfReal_[c1lvl];
+			x				  = multScalarCore(x, scf2 / scf1 / scf);
+			if (c1lvl + 1 < c2lvl) {
+				x.towers -= c2lvl - c1lvl - 1;
+			}
+			x				= rescaleCore(x);
+			x.scalingFactor = tgt.scalingFactor;
 		}
 	}
 }
@@ -1083,13 +1039,12 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	}
 	if (st == lbcrypto::FLEXIBLEAUTO || st == lbcrypto::FLEXIBLEAUTOEXT) {
 		// Plaintext::adjustScaleAndLevel(c.NSD, c.level, c.sf): same generic adjust as
-		// ciphertext operands, including the equal-level depth bump. ctRule=false keeps the
-		// Plaintext-rule depth2/depth2 branch1 (parity #5).
+		// ciphertext operands, including the equal-level depth bump.
 		if (ptOp.towers < ct.towers) {
 			throw std::runtime_error("haze backend: plaintext is encoded deeper than the ciphertext (cannot raise a plaintext)");
 		}
 		if (levelOf(ptOp) < levelOf(ct)) {
-			adjustOperandToward(ptOp, ct, /*ctRule=*/false);
+			adjustOperandToward(ptOp, ct);
 		} else if (ptOp.noiseScaleDeg < ct.noiseScaleDeg) {
 			ptOp = multScalarCore(ptOp, 1.0);
 		} else if (ptOp.noiseScaleDeg > ct.noiseScaleDeg) {
@@ -2342,46 +2297,122 @@ std::vector<Ciphertext<DCRTPoly>> HazeEngine::evalFastRotationExt(CryptoContextI
 	return results;
 }
 
-namespace {
-// Radix reduction cascade — CUDA Accumulate / AccumulateCascadeImpl (AccumulateBroadcast.cu:9-113),
-// expressed over facade rotate+add (the CUDA rotate_hoisted/extend/modDown are the hoisting form of the
-// same rotate-then-add; hoisting itself is the extended-basis BSGS). bStep=radix: outer s *= radix from
-// startFactor, inner adds rot(snapshot, stride*s*k) for k in [1, radix) while stride*s*k < stride*size.
-// Each step rotates the PRE-STEP snapshot (CUDA rotates ctxt for all indexes before any of the step's
-// adds), unlike the old radix-2 byte-copy of the OpenFHE doubling loop which rotated the running sum.
-// The radix comes from ACCUMULATE_SUM_RADIX so this folds in the same order as OpenFHE's
-// EvalPartialSumInPlace and the CUDA Accumulate — the association is bit-significant.
-void hazeAccumulateCascade(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int size, int stride, int startFactor) {
-	if (startFactor <= 0 || size <= 0)
-		return;
+HazeEngine::Operand HazeEngine::partialSumCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, int stride, int size, int startFactor) {
+	requireRelinearized(*x.p, "AccumulateSum");
 	constexpr int radix = ACCUMULATE_SUM_RADIX;
-	for (int s = startFactor; s < size; s *= radix) {
-		Ciphertext<DCRTPoly> snapshot = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-		for (int idx = stride * s; idx < stride * size && idx < radix * stride * s; idx += stride * s) {
-			ctx.EvalAddInPlace(ct, ctx.EvalRotate(snapshot, idx));
-		}
+	if (startFactor <= 0 || size <= 0 || startFactor >= size) {
+		return x;
 	}
+	const size_t towers			 = x.towers;
+	const auto qSub				 = qPrefix(towers);
+	std::vector<uint64_t> qpBase = qSub;
+	qpBase.insert(qpBase.end(), pBase_.begin(), pBase_.end());
+	auto& context = hostContext(ctx);
+
+	auto addInPlace = [&](LimbChain& dst, const LimbChain& src) {
+		hazeCheck(hazeAddMrp(dst.data(), dst.asConst().data(), src.asConst().data(), qpBase.data(), qpBase.size(), nullptr), "hazeAddMrp(partialSum)");
+	};
+	// In-place add of a base-Q chain into the leading Q rows of an extended chain (the P rows of the term are zero).
+	auto addQIntoExt = [&](LimbChain& ext, const LimbChain& srcQ) {
+		std::vector<void*> dst(towers);
+		std::vector<const void*> s1(towers);
+		for (size_t t = 0; t < towers; ++t) {
+			dst[t] = ext[t];
+			s1[t]  = ext[t];
+		}
+		hazeCheck(hazeAddMrp(dst.data(), s1.data(), srcQ.asConst().data(), qSub.data(), towers, nullptr), "hazeAddMrp(partialSum Q)");
+	};
+	auto automorphChain = [&](const LimbChain& src, uint32_t autoIndex) {
+		LimbChain out(qpBase.size(), polyBytes_);
+		hazeCheck(hazeAutomorphMrp(out.data(), src.asConst().data(), autoIndex, qpBase.data(), qpBase.size(), nullptr), "hazeAutomorphMrp(partialSum)");
+		return out;
+	};
+
+	// acc starts as c0 · (P mod q_i) on the Q rows (the P rows are zero until the first level adds into them).
+	const auto pmodq = pModqPrefix(towers);
+	LimbChain raised0(towers, polyBytes_);
+	hazeCheck(hazeMulScalarMrp(raised0.data(), x.p->c0().asConst().data(), pmodq.data(), qSub.data(), towers, nullptr), "hazeMulScalarMrp(partialSum raise)");
+	std::optional<LimbChain> acc;
+
+	// The current c1: the input's until the first level has settled its update.
+	const LimbChain* c1 = &x.p->c1();
+	LimbChain c1Owned;
+	for (int s = startFactor; s < size; s *= radix) {
+		const HoistedDigits digits = hoistedKeyswitchPrefix(*c1, towers, numPartQ_);
+		std::optional<LimbChain> lvl0, lvl1;
+		for (int idx = stride * s; idx < stride * size && idx < radix * stride * s; idx += stride * s) {
+			const uint32_t autoIndex = context->FindAutomorphismIndex(static_cast<uint32_t>(idx));
+			KsKey& key				 = autoKeyFor(ctx, autoIndex);
+			KsContribution ks		 = hybridKeyswitchFromDigits(digits, key, /*ext=*/true);
+			// ba[0] += acc, then the automorphism of both extended components.
+			if (acc) {
+				addInPlace(ks.b, *acc);
+			} else {
+				addQIntoExt(ks.b, raised0);
+			}
+			LimbChain ba0 = automorphChain(ks.b, autoIndex);
+			LimbChain ba1 = automorphChain(ks.a, autoIndex);
+			if (!lvl0) {
+				lvl0 = std::move(ba0);
+				lvl1 = std::move(ba1);
+			} else {
+				addInPlace(*lvl0, ba0);
+				addInPlace(*lvl1, ba1);
+			}
+		}
+		if (!lvl0) {
+			continue; // no rotation at this level
+		}
+		// acc += lvl0 (the first level also carries c0·P on the Q rows).
+		if (!acc) {
+			acc = std::move(*lvl0);
+			addQIntoExt(*acc, raised0);
+		} else {
+			addInPlace(*acc, *lvl0);
+		}
+		// c1 += ModDown(lvl1): settled once per level, the next level's digits need it.
+		LimbChain down	= extModDownChain(*lvl1, towers);
+		LimbChain next	= addChain(polyBytes_, qSub, c1->asConst().data(), down.asConst().data());
+		c1Owned			= std::move(next);
+		c1				= &c1Owned;
+	}
+	if (!acc) {
+		return x;
+	}
+	LimbChain out0 = extModDownChain(*acc, towers);
+
+	Operand res = x; // metadata unchanged
+	res.p		= finishPayload(hazebk::makeComponents(std::move(out0), std::move(c1Owned)), res);
+	return res;
 }
-} // namespace
 
 Ciphertext<DCRTPoly> HazeEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	ensureCt(ctx, ct);
-	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-	hazeAccumulateCascade(ctx, result, slots, stride, /*startFactor=*/1);
+	auto p		= ensureCt(ctx, ct);
+	Operand res = partialSumCore(ctx, asOperand(p), stride, slots, /*startFactor=*/1);
+	if (res.p.get() == p.get()) { // nothing to fold: a copy of the input
+		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+	}
 	// No slots-shrink: CudaEngine::accumulateSum now saves and restores the input slots around
 	// Accumulate, so the CUDA broadcast-shrink this used to compensate for no longer happens, and the
 	// CPU path never shrank. Keeping it here would diverge from both.
-	return result;
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride) {
-	ensureCt(ctx, ct);
-	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/1);
+	auto p		= ensureCt(ctx, ct);
+	Operand res = partialSumCore(ctx, asOperand(p), stride, slots, /*startFactor=*/1);
+	if (res.p.get() != p.get()) {
+		rebindPayload(*p, std::move(res.p->components), res);
+	}
 }
 
 void HazeEngine::accumulateSumInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct, int slots, int stride, int start) {
-	const size_t ctSlots = ensureCt(ctx, ct)->slots;
-	hazeAccumulateCascade(ctx, ct, slots, stride, /*startFactor=*/start);
+	auto p				 = ensureCt(ctx, ct);
+	const size_t ctSlots = p->slots;
+	Operand res			 = partialSumCore(ctx, asOperand(p), stride, slots, /*startFactor=*/start);
+	if (res.p.get() != p.get()) {
+		rebindPayload(*p, std::move(res.p->components), res);
+	}
 	// Cascade slots-shrink (AccumulateBroadcast.cu:41-42): result is a broadcast over stride*startFactor.
 	if (static_cast<size_t>(slots) * static_cast<size_t>(stride) == ctSlots)
 		ct->SetSlots(static_cast<size_t>(stride) * static_cast<size_t>(start));
@@ -2544,89 +2575,7 @@ static Ciphertext<DCRTPoly> hazeConvolutionTransform(CryptoContextImpl<DCRTPoly>
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Chebyshev Paterson-Stockmeyer — port of the CUDA spec src/CKKS/ApproxModEval.cu
-// (evalChebyshevSeries@370, innerEvalChebyshevPS@138). FIDESlib/CUDA is the spec;
-// OpenFHE is reference-only. Divergences from OpenFHE are commented inline (#12-#15).
-// ---------------------------------------------------------------------------
-
-HazeEngine::Operand HazeEngine::evalLinearWSumMutableCore(size_t targetTowers,
-  const std::vector<Operand>& ops,
-  const std::vector<double>& weights) {
-	// Port of CUDA Ciphertext::evalLinearWSumMutable (Ciphertext.cpp:1168): out = sum_i
-	// weights[i]*ops[i] produced directly at `targetTowers` (NSD=2). CUDA grows a fresh ct to
-	// the target level then fills it via per-limb ElemForEvalMult + evalLinearWSum; haze cannot
-	// grow (setCiphertextLevel only drops), so we build the result at targetTowers here.
-	// Each ops[i] is at NoiseLevel 1 and ops[i].towers >= targetTowers; reading the leading
-	// targetTowers limbs is a valid Q-prefix view (CUDA ElemForEvalMult uses level_in=towersIn).
-	const size_t n	= ops.size();
-	const auto base = qPrefix(targetTowers);
-	if (n == 0) {
-		throw std::runtime_error("haze backend: evalLinearWSumMutableCore needs at least one operand");
-	}
-
-	// CUDA encodes each weight with level_in = ops[i].towers (the bootstrap-prescale fast path:
-	// scFactorOut * ModReduceFactor[targetTowers-1] / scFactorIn), exact for FIXED modes.
-	for (size_t i = 0; i < n; ++i) {
-		// CUDA asserts target level <= ctxs[i] level, i.e. each op must have >= targetTowers limbs
-		// (reading the leading targetTowers limbs as a Q-prefix view).
-		if (ops[i].towers < targetTowers) {
-			throw std::runtime_error("haze backend: evalLinearWSumMutableCore operand has fewer towers than target");
-		}
-	}
-	auto encode = [&](size_t i) {
-		return hazebk::elemForEvalMult(scalarParams(), targetTowers, weights[i], ops[i].towers);
-	};
-
-	// Component count comes from ops[0] (all operands are same-degree here); the emission order is
-	// per-operand-then-per-component, matching the original c0/c1 pair ordering.
-	const size_t comps = ops[0].p->components.size();
-	std::vector<LimbChain> acc;
-	acc.reserve(comps);
-	{
-		const auto f0 = encode(0);
-		for (size_t e = 0; e < comps; ++e) {
-			LimbChain out(targetTowers, polyBytes_);
-			hazeCheck(hazeMulScalarMrp(out.data(), ops[0].p->components.at(e).asConst().data(), f0.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
-			acc.push_back(std::move(out));
-		}
-	}
-	for (size_t i = 1; i < n; ++i) {
-		const auto fi = encode(i);
-		for (size_t e = 0; e < comps; ++e) {
-			LimbChain term(targetTowers, polyBytes_);
-			hazeCheck(hazeMulScalarMrp(term.data(), ops[i].p->components.at(e).asConst().data(), fi.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp");
-			LimbChain sum(targetTowers, polyBytes_);
-			hazeCheck(hazeAddMrp(sum.data(), acc[e].asConst().data(), term.asConst().data(), base.data(), base.size(), nullptr), "hazeAddMrp");
-			acc[e] = std::move(sum);
-		}
-	}
-
-	Operand res;
-	res.towers		  = targetTowers;
-	res.noiseScaleDeg = 2; // CUDA NoiseLevel=2 after the weighted sum
-	const size_t level = qBase_.size() - targetTowers;
-	res.scalingFactor = sfReal_[level] * sfReal_[level]; // CUDA NoiseFactor = ScalingFactorReal[level]^2
-	// ops[0].slots only: OpenFHE's EvalLinearWSumMutable accumulates into ciphertexts[0] in place
-	// and returns it directly, never folding in another operand's own GetSlots().
-	res.slots		  = ops[0].slots;
-	res.p = finishPayload(std::move(acc), res);
-	return res;
-}
-
-Ciphertext<DCRTPoly> HazeEngine::evalLinearWSumMutableFacade(CryptoContextImpl<DCRTPoly>& ctx,
-  size_t targetTowers,
-  const std::vector<Ciphertext<DCRTPoly>>& ctxs,
-  const std::vector<double>& weights) {
-	std::vector<Operand> ops;
-	ops.reserve(ctxs.size());
-	for (const auto& c : ctxs) {
-		auto pc = ensureCt(ctx, c);
-		ops.push_back(asOperand(pc));
-	}
-	Operand res = evalLinearWSumMutableCore(targetTowers, ops, weights);
-	return wrapDeviceResult(ctx, ctxs[0], std::move(res.p));
-}
+// ---- Chebyshev series ----
 
 size_t HazeEngine::towersOf(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) {
 	return ensureCt(ctx, ct)->towers;
@@ -2644,313 +2593,243 @@ void HazeEngine::dropCiphertextToTowers(CryptoContextImpl<DCRTPoly>& ctx, Cipher
 	p->towers = targetTowers;
 }
 
-Ciphertext<DCRTPoly> HazeEngine::hazeInnerEvalChebyshevPS(CryptoContextImpl<DCRTPoly>& ctx,
+Ciphertext<DCRTPoly> HazeEngine::openFheChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx,
+  const Ciphertext<DCRTPoly>& x,
   const std::vector<double>& coefficients,
-  uint32_t k, uint32_t m,
-  const std::vector<Ciphertext<DCRTPoly>>& T,
-  const std::vector<Ciphertext<DCRTPoly>>& T2,
-  int level_offset, int max_m) {
-	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	// CUDA getLevel of a facade ct = towers-1 = (|Q| - GetLevel()) - 1 (inverse of OpenFHE GetLevel).
-	auto cudaLevel = [&](const Ciphertext<DCRTPoly>& c) -> int {
-		return static_cast<int>(qBase_.size()) - static_cast<int>(c->GetLevel()) - 1;
-	};
-	auto noiseLevel = [&](const Ciphertext<DCRTPoly>& c) -> size_t { return c->GetNoiseScaleDeg(); };
-
-	// --- Coefficient long division (identical to OpenFHE / CUDA, left as-is) ---
-	uint32_t k2m2k = k * (1u << (m - 1)) - k;
-	auto f2		   = coefficients;
-	f2.resize(2 * k2m2k + k + 1, 0.0);
-	if (f2.size() > coefficients.size())
-		f2.back() = 1.0;
-	std::vector<double> Tkm(int32_t(k2m2k + k) + 1, 0.0);
-	Tkm.back()	= 1.0;
-	auto divqr	= lbcrypto::LongDivisionChebyshev(f2, Tkm);
-	std::vector<double> r2 = divqr->r;
-	if (int32_t(k2m2k - lbcrypto::Degree(divqr->r)) <= 0) {
-		r2[int32_t(k2m2k)] -= 1.0;
-		r2.resize(lbcrypto::Degree(r2) + 1);
-	} else {
-		r2.resize(int32_t(k2m2k + 1), 0.0);
-		r2.back() = -1.0;
-	}
-	auto divcs			   = lbcrypto::LongDivisionChebyshev(r2, divqr->q);
-	std::vector<double> s2 = divcs->r;
-	s2.resize(int32_t(k2m2k + 1), 0.0);
-	s2.back() = 1.0;
-
-	// --- Evaluate c at u (cu) ---
-	Ciphertext<DCRTPoly> cu;
-	uint32_t dc	  = lbcrypto::Degree(divcs->q);
-	bool flag_c	  = false;
-	if (dc >= 1) {
-		if (dc == 1) {
-			if (divcs->q[1] != 1) {
-				// CUDA cu.multScalar(*T[0], divcs->q[1], true): under FIXEDAUTO the rescale arg is
-				// inert (multScalar passes rescale&&FIXEDMANUAL), so this is just multScalar -> NSD2.
-				cu = ctx.EvalMult(T[0], divcs->q[1]);
-				if (st == lbcrypto::FIXEDMANUAL)
-					ctx.RescaleInPlace(cu);
-			} else {
-				cu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[0]);
-			}
-		} else {
-			std::vector<double> weights(dc);
-			for (uint32_t i = 0; i < dc; ++i)
-				weights[i] = divcs->q[i + 1];
-			// CUDA: cu.dropToLevel(target); cu.growToLevel(target); cu.evalLinearWSumMutable(dc, T, weights).
-			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - level_offset;
-			std::vector<Ciphertext<DCRTPoly>> ctxs(T.begin(), T.begin() + dc);
-			cu = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxs, weights);
-		}
-		ctx.EvalAddInPlace(cu, divcs->q.front() / 2.0);
-		// evalLinearWSumMutableFacade leaves its result at NSD2 (fused scalar-weighted sum, not a
-		// fused-rescale like OpenFHE/CUDA's own equivalent); FIXEDAUTO's EvalAdd/EvalMult silently
-		// auto-adjust that away downstream, but FIXEDMANUAL does not, so it must be brought back to
-		// NSD1 explicitly here (mirrors the qu leaf branch below, which already does this).
-		if (st == lbcrypto::FIXEDMANUAL && cu->GetNoiseScaleDeg() == 2)
-			ctx.RescaleInPlace(cu);
-		// CUDA LevelReduceInPlace(cu, ...): only FIXEDMANUAL actually drops levels
-		// (ApproxModEval.cu:423-426); a no-op for the AUTO scaling techniques.
-		if (st == lbcrypto::FIXEDMANUAL && cudaLevel(cu) > cudaLevel(T2[m - 1]))
-			dropCiphertextToTowers(ctx, cu, towersOf(ctx, T2[m - 1]));
-		flag_c = true;
-	}
-
-	// --- Evaluate q at u (qu) ---
-	Ciphertext<DCRTPoly> qu;
-	if (lbcrypto::Degree(divqr->q) > k) {
-		assert(m > 2);
-		// q recurses at level_offset (CUDA ApproxModEval.cu:230).
-		qu = hazeInnerEvalChebyshevPS(ctx, divqr->q, k, m - 1, T, T2, level_offset, max_m);
-		if (noiseLevel(qu) == 2)
-			ctx.RescaleInPlace(qu);
-	} else {
-		auto qcopy = divqr->q;
-		qcopy.resize(k);
-		if (lbcrypto::Degree(qcopy) > 0) {
-			std::vector<double> weights;
-			std::vector<Ciphertext<DCRTPoly>> ctxs;
-			for (uint32_t i = 0; i < divqr->q.size() - 1; ++i) {
-				if (divqr->q[i + 1] != 0) {
-					weights.push_back(divqr->q[i + 1]);
-					ctxs.push_back(T[i]);
-				}
-			}
-			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - level_offset;
-			qu		   = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxs, weights);
-			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
-			// CUDA: if (T[k-1]->NoiseLevel==1) qu.rescale(); ... if (T[k-1]->NoiseLevel==2) qu.rescale();
-			// Either way qu is rescaled exactly once (NSD2 -> NSD1) since T[k-1] NL is 1 or 2.
-			ctx.RescaleInPlace(qu);
-		} else {
-			qu = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
-			if (divqr->q.back() > 0 && divqr->q.back() - std::round(divqr->q.back()) == 0.0) {
-				// CUDA multIntScalar (integer scalar mult); for the degree path this is the leading
-				// power-of-2 coefficient. EvalMult by a double is metadata-equivalent here.
-				ctx.EvalMultInPlace(qu, divqr->q.back());
-			} else {
-				__builtin_unreachable();
-			}
-			ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
-			if (noiseLevel(qu) == 2)
-				ctx.RescaleInPlace(qu);
-		}
-	}
-
-	// --- Evaluate s2 at u (su) ---
-	Ciphertext<DCRTPoly> su;
-	if (lbcrypto::Degree(s2) > k) {
-		assert(m > 2);
-		// s recurses at level_offset + 1 (CUDA ApproxModEval.cu:308).
-		su = hazeInnerEvalChebyshevPS(ctx, s2, k, m - 1, T, T2, level_offset + 1, max_m);
-	} else {
-		auto scopy = s2;
-		scopy.resize(k);
-		if (lbcrypto::Degree(scopy) > 0) {
-			std::vector<Ciphertext<DCRTPoly>> ctxs;
-			std::vector<double> weights;
-			for (uint32_t i = 0; i < s2.size() - 1; ++i) {
-				if (s2[i + 1] != 0) {
-					ctxs.emplace_back(T[i]);
-					weights.push_back(s2[i + 1]);
-				}
-			}
-			int target = cudaLevel(T2[m - 1]) + (noiseLevel(T2[m - 1]) == 1 ? 1 : 0) - 1 - level_offset;
-			// CUDA quirk: evalLinearWSumMutable(ctxs.size(), T, weights) passes the FULL T vector with
-			// n=ctxs.size() (ApproxModEval.cu:328), not the filtered ctxs. Match CUDA verbatim.
-			std::vector<Ciphertext<DCRTPoly>> ctxsFull(T.begin(), T.begin() + ctxs.size());
-			su = evalLinearWSumMutableFacade(ctx, static_cast<size_t>(target) + 1, ctxsFull, weights);
-			ctx.EvalAddInPlace(su, s2.front() / 2.0);
-			// CUDA leaves su un-rescaled here (the rescale lines are commented out); s2 is monic.
-			assert(s2.back() == 1.0);
-		} else {
-			su = std::make_shared<CiphertextImpl<DCRTPoly>>(*T[k - 1]);
-			ctx.EvalAddInPlace(su, s2.front() / 2.0);
-		}
-		// evalLinearWSumMutableFacade leaves its result at NSD2 (see the matching comment on the cu
-		// general branch above); FIXEDMANUAL has no auto-adjust to fix that up downstream, so bring
-		// su back to NSD1 explicitly before it is added into the final combine.
-		bool suRescaled = false;
-		if (st == lbcrypto::FIXEDMANUAL && su->GetNoiseScaleDeg() == 2) {
-			ctx.RescaleInPlace(su);
-			suRescaled = true;
-		}
-		// CUDA LevelReduceInPlace(su, nullptr): only FIXEDMANUAL actually drops a level
-		// (ApproxModEval.cu:392-393); a no-op for the AUTO scaling techniques. The rescale above
-		// already spent that level when the weighted sum was NSD2 (its target already sits one tower
-		// below T[k-1]'s), so the drop applies only to the copy of T[k-1]; OpenFHE's su ends one tower
-		// below T2[m-1] either way.
-		if (st == lbcrypto::FIXEDMANUAL && !suRescaled)
-			dropCiphertextToTowers(ctx, su, towersOf(ctx, su) - 1);
-	}
-
-	// --- Combine: cu = (T2[m-1] + cu) * qu + su ---
-	if (flag_c) {
-		// CUDA: for m>3 the required cu levels are not strictly decreasing, so cache-align cu to
-		// T2[m-1] only when max_m - m <= 1 (ApproxModEval.cu:351). adjustForAddOrSub equalizes
-		// level+depth in place; in the facade EvalAdd does the adjust, so we let EvalAdd handle it
-		// when caching applies and otherwise still EvalAdd (the metadata outcome is the same).
-		ctx.EvalAddInPlace(cu, T2[m - 1]);
-	} else {
-		cu = ctx.EvalAdd(T2[m - 1], divcs->q.front() / 2.0);
-	}
-	cu = ctx.EvalMult(cu, qu); // CUDA cu.mult(qu, false): relin, no rescale
-	// CUDA out.rescale(): only under FIXEDMANUAL (ApproxModEval.cu:460-461).
-	if (st == lbcrypto::FIXEDMANUAL)
-		ctx.RescaleInPlace(cu);
-	ctx.EvalAddInPlace(cu, su);
-	return cu;
-}
-
-Ciphertext<DCRTPoly> HazeEngine::hazeEvalChebyshevSeriesImpl(CryptoContextImpl<DCRTPoly>& ctx,
-  const Ciphertext<DCRTPoly>& ct,
-  std::vector<double>& coefficients,
   double a, double b) {
-	const auto st		= static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
-	double lower_bound	= a;
-	double upper_bound = b;
+	using Ct			  = Ciphertext<DCRTPoly>;
+	const auto st		  = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
+	const bool manual	  = (st == lbcrypto::FIXEDMANUAL);
+	const size_t sizeQ	  = qBase_.size();
+	auto clone			  = [](const Ct& c) { return std::make_shared<CiphertextImpl<DCRTPoly>>(*c); };
+	auto level			  = [&](const Ct& c) { return sizeQ - towersOf(ctx, c); }; // OpenFHE GetLevel
+	// OpenFHE's public ModReduceInPlace and LevelReduceInPlace act only under FIXEDMANUAL (the automatic
+	// techniques rescale lazily inside the operations).
+	auto modReduce		  = [&](Ct& c) {
+		if (manual)
+			ctx.RescaleInPlace(c);
+	};
+	auto levelReduce = [&](Ct& c, size_t levels) {
+		if (manual && levels > 0)
+			dropCiphertextToTowers(ctx, c, towersOf(ctx, c) - levels);
+	};
+	// AdjustLevelsAndDepthInPlace(c1, c2) on two live ciphertexts (the automatic techniques).
+	auto adjustPair = [&](Ct& c1, Ct& c2) {
+		auto p1 = ensureCt(ctx, c1);
+		auto p2 = ensureCt(ctx, c2);
+		Operand o1 = asOperand(p1);
+		Operand o2 = asOperand(p2);
+		adjustForAddOrSub(o1, o2);
+		auto commit = [&](Ct& c, const std::shared_ptr<hazebk::HazePayload>& orig, Operand& o) {
+			if (o.p.get() != orig.get()) {
+				c = wrapDeviceResult(ctx, c, std::move(o.p));
+			}
+			if (o.towers < towersOf(ctx, c)) {
+				dropCiphertextToTowers(ctx, c, o.towers);
+			}
+			// The adjustment sets the scaling factor of the operand view, not of the payload.
+			auto pc			  = ensureCt(ctx, c);
+			pc->scalingFactor = o.scalingFactor;
+			pc->noiseScaleDeg = o.noiseScaleDeg;
+		};
+		commit(c1, p1, o1);
+		commit(c2, p2, o2);
+	};
 
-	// Working copy of the input; the affine map + T[0] build mutate it (CUDA mutates ctxt in place).
-	Ciphertext<DCRTPoly> ctxt = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-
-	// #13 affine map to [-1,1] — CUDA pre-T centering (ApproxModEval.cu:377-387), NOT OpenFHE's
-	// single y=-1+2(x-a)/(b-a) (which always costs a multScalar+ModReduce). CUDA has a span==2
-	// no-multiply fast path and otherwise centers-then-scales.
-	if (std::abs(lower_bound + 1.0) > 1e-9 || std::abs(upper_bound - 1.0) > 1e-9) {
-		if (std::abs(upper_bound - lower_bound - 2.0) < 1e-8) {
-			// span == 2 fast path: shift only, no multiply (OpenFHE would still multiply by 1).
-			ctx.EvalAddInPlace(ctxt, -lower_bound + 1.0);
-		} else {
-			if (std::abs(lower_bound + upper_bound) > 1e-8)
-				// Center on 0: subtract the interval midpoint (a+b)/2 == a + (b-a)/2.
-				// CUDA writes addScalar(-a + (b-a)/2) (ApproxModEval.cu:382), distributing the minus
-				// onto only `a` — a sign BUG that gives shift (b-3a)/2 instead of -(a+b)/2. CUDA's own
-				// Chebyshev tests only use [-1,1] (the span==2 fast path above), so the bug is never
-				// exercised there; the haze [0,1] test does hit it, so we use the OpenFHE-correct
-				// shift -(a + (b-a)/2) here (the one deliberate deviation from a verbatim CUDA port).
-				ctx.EvalAddInPlace(ctxt, -(lower_bound + (upper_bound - lower_bound) / 2.0));
-			// CUDA FIXEDMANUAL pre-rescale (ApproxModEval.cu:383-384): a no-op for AUTO techniques.
-			if (st == lbcrypto::FIXEDMANUAL && ctxt->GetNoiseScaleDeg() == 2)
-				ctx.RescaleInPlace(ctxt);
-			ctx.EvalMultInPlace(ctxt, 2.0 / (upper_bound - lower_bound));
+	// OpenFHE EvalPartialLinearWSum: the first `limit` ciphertexts weighted by constants[1..limit].
+	auto partialWSum = [&](const std::vector<Ct>& cts, const std::vector<double>& constants, uint32_t limit) -> Ct {
+		if (limit == 0)
+			limit = static_cast<uint32_t>(cts.size());
+		std::vector<Ct> w(limit);
+		for (uint32_t i = 0; i < limit; ++i)
+			w[i] = clone(cts[i]);
+		if (!manual) {
+			// Bring every term to the highest level among them (a depth-2 one at equal level wins).
+			size_t maxLevel = level(w[0]);
+			uint32_t maxIdx = 0;
+			for (uint32_t i = 1; i < limit; ++i) {
+				const size_t li = level(w[i]);
+				if (li > maxLevel || (li == maxLevel && w[i]->GetNoiseScaleDeg() == 2)) {
+					maxLevel = li;
+					maxIdx	 = i;
+				}
+			}
+			for (uint32_t i = 0; i < maxIdx; ++i)
+				adjustPair(w[i], w[maxIdx]);
+			for (uint32_t i = maxIdx + 1; i < limit; ++i)
+				adjustPair(w[i], w[maxIdx]);
+			if (w[maxIdx]->GetNoiseScaleDeg() == 2) {
+				for (uint32_t i = 0; i < limit; ++i)
+					ctx.RescaleInPlace(w[i]); // ModReduceInternalInPlace
+			}
 		}
+		ctx.EvalMultInPlace(w[0], constants[1]);
+		for (uint32_t i = 1; i < limit; ++i) {
+			ctx.EvalMultInPlace(w[i], constants[i + 1]);
+			ctx.EvalAddInPlace(w[0], w[i]);
+		}
+		modReduce(w[0]);
+		return w[0];
+	};
+
+	// OpenFHE InnerEvalChebyshevPS.
+	std::function<Ct(const std::vector<double>&, uint32_t, uint32_t, const std::vector<Ct>&, const std::vector<Ct>&)> inner;
+	inner = [&](const std::vector<double>& coeffs, uint32_t k, uint32_t m, const std::vector<Ct>& T, const std::vector<Ct>& T2) -> Ct {
+		const uint32_t k2m2k = k * (1u << (m - 1)) - k;
+		std::vector<double> Tkm(k2m2k + k + 1);
+		Tkm.back()	= 1;
+		auto divqr	= lbcrypto::LongDivisionChebyshev(coeffs, Tkm);
+		auto& r2	= divqr->r;
+		if (const uint32_t n = lbcrypto::Degree(r2); static_cast<int32_t>(k2m2k - n) <= 0) {
+			r2.resize(n + 1);
+			r2[k2m2k] -= 1;
+		} else {
+			r2.resize(k2m2k + 1);
+			r2.back() = -1;
+		}
+		auto divcs = lbcrypto::LongDivisionChebyshev(r2, divqr->q);
+
+		Ct cu, qu, su;
+		{
+			if (lbcrypto::Degree(divqr->q) > k) {
+				qu = inner(divqr->q, k, m - 1, T, T2);
+			} else {
+				qu					 = clone(T[k - 1]);
+				const uint32_t limit = static_cast<uint32_t>(std::log2(divqr->q.back()));
+				for (uint32_t i = 0; i < limit; ++i)
+					ctx.EvalAddInPlace(qu, qu);
+				ctx.EvalAddInPlace(qu, divqr->q.front() / 2.0);
+				divqr->q.resize(k);
+				if (const uint32_t n = lbcrypto::Degree(divqr->q); n > 0)
+					ctx.EvalAddInPlace(qu, partialWSum(T, divqr->q, n));
+			}
+		}
+		{
+			auto& s2 = divcs->r;
+			s2.resize(k2m2k + 1);
+			s2.back() = 1;
+			if (lbcrypto::Degree(s2) > k) {
+				su = inner(s2, k, m - 1, T, T2);
+			} else {
+				su = clone(T[k - 1]);
+				s2.resize(k);
+				if (const uint32_t n = lbcrypto::Degree(s2); n > 0)
+					ctx.EvalAddInPlace(su, partialWSum(T, s2, n));
+				ctx.EvalAddInPlace(su, s2.front() / 2.0);
+				levelReduce(su, 1);
+			}
+		}
+		if (const uint32_t n = lbcrypto::Degree(divcs->q); n >= 1) {
+			if (n == 1) {
+				if (lbcrypto::IsNotEqualOne(divcs->q[1])) {
+					cu = ctx.EvalMult(T.front(), divcs->q[1]);
+					modReduce(cu);
+				} else {
+					cu = clone(T.front());
+				}
+			} else {
+				cu = partialWSum(T, divcs->q, n);
+			}
+			ctx.EvalAddInPlace(cu, divcs->q.front() / 2.0);
+			levelReduce(cu, level(T2[m - 1]) - level(cu));
+		}
+		cu = cu ? ctx.EvalAdd(T2[m - 1], cu) : ctx.EvalAdd(T2[m - 1], divcs->q.front() / 2.0);
+		Ct result = ctx.EvalMult(cu, qu);
+		modReduce(result);
+		ctx.EvalAddInPlace(result, su);
+		return result;
+	};
+
+	const uint32_t d = lbcrypto::Degree(coefficients);
+	std::vector<Ct> T;
+	// T_1(y) = y after the affine map to [-1, 1]; one level when the interval is not already that.
+	auto firstPower = [&]() -> Ct {
+		if (!lbcrypto::IsNotEqualNegOne(a) && !lbcrypto::IsNotEqualOne(b)) {
+			return clone(x);
+		}
+		const double alpha = 2 / (b - a);
+		const double beta  = a * alpha;
+		Ct t			   = ctx.EvalMult(x, alpha);
+		modReduce(t);
+		ctx.EvalAddInPlace(t, -1.0 - beta);
+		return t;
+	};
+	// T_i for i = 2..k by binary-tree multiplication.
+	auto buildPowers = [&](std::vector<Ct>& P, uint32_t k) {
+		for (uint32_t i = 2; i <= k; ++i) {
+			if (i & 0x1) {
+				P[i - 1] = ctx.EvalMult(P[i / 2 - 1], P[i / 2]);
+				ctx.EvalAddInPlace(P[i - 1], P[i - 1]);
+				modReduce(P[i - 1]);
+				ctx.EvalSubInPlace(P[i - 1], P[0]);
+			} else {
+				P[i - 1] = ctx.EvalSquare(P[i / 2 - 1]);
+				ctx.EvalAddInPlace(P[i - 1], P[i - 1]);
+				modReduce(P[i - 1]);
+				ctx.EvalAddInPlace(P[i - 1], -1.0);
+			}
+		}
+	};
+
+	if (d < 5) {
+		// internalEvalChebyPolysLinear + internalEvalChebyshevSeriesLinearWithPrecomp.
+		const uint32_t k = static_cast<uint32_t>(coefficients.size()) - 1;
+		T.resize(k);
+		T[0] = firstPower();
+		buildPowers(T, k);
+		for (uint32_t i = 1; i < k; ++i)
+			levelReduce(T[i - 1], level(T[k - 1]) - level(T[i - 1]));
+
+		const uint32_t kk = static_cast<uint32_t>(coefficients.size()) - 2;
+		Ct result		  = ctx.EvalMult(T[kk], coefficients[kk + 1]);
+		for (uint32_t i = 0; i < kk; ++i) {
+			if (lbcrypto::IsNotEqualZero(coefficients[i + 1])) {
+				ctx.EvalMultInPlace(T[i], coefficients[i + 1]);
+				ctx.EvalAddInPlace(result, T[i]);
+			}
+		}
+		modReduce(result);
+		ctx.EvalAddInPlace(result, coefficients[0] / 2.0);
+		return result;
 	}
 
-	// #12 always Paterson-Stockmeyer — CUDA has NO degree<5 linear dispatch (ApproxModEval.cu:370-404).
-	uint32_t n	= lbcrypto::Degree(coefficients);
-	auto f2coef = coefficients;
-	f2coef.resize(n + 1);
-
-	auto degs  = lbcrypto::ComputeDegreesPS(n);
-	uint32_t k = degs[0];
-	uint32_t m = degs[1];
-
-	std::vector<Ciphertext<DCRTPoly>> T(k);
-	// CUDA copies the (already-mapped) ctxt into T[0] (ApproxModEval.cu:455), then rescales if NSD2.
-	// CUDA's own FIXEDMANUAL skip here (ApproxModEval.cu:589-590) is dead code in its own test
-	// suite (only exercised via the [-1,1] fast path, where T[0] never reaches NSD2) and would
-	// leave a NSD2 operand flowing into `square`/`mult`, which assert NoiseLevel==1 on entry. Real
-	// OpenFHE's own internalEvalChebyPolysPS always ModReduceInPlace(T[0]) right after building it,
-	// independent of scaling technique (ApproxModEval.cu:562-579, commented reference block); mirror
-	// that unconditionally rather than the untested CUDA branch.
-	T[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*ctxt);
-	if (T[0]->GetNoiseScaleDeg() == 2)
-		ctx.RescaleInPlace(T[0]);
-
-	for (uint32_t i = 2; i <= k; ++i) {
-		if (i % 2 == 1) {
-			// T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
-			T[i - 1] = ctx.EvalMult(T[i / 2], T[i / 2 - 1]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]);
-			if (st == lbcrypto::FIXEDMANUAL)
-				ctx.RescaleInPlace(T[i - 1]);
-			// CUDA: ctxt.adjustForAddOrSub(*T[i-1]); if(ctxt.NL==1) T[i-1].rescale(); T[i-1].sub(ctxt).
-			// The facade EvalSub performs the adjust+depth-fix internally (Task 02 parity).
-			ctx.EvalSubInPlace(T[i - 1], ctxt);
-		} else {
-			// T_{2i}(y) = 2*T_i(y)^2 - 1
-			T[i - 1] = ctx.EvalSquare(T[i / 2 - 1]);
-			ctx.EvalAddInPlace(T[i - 1], T[i - 1]);
-			if (st == lbcrypto::FIXEDMANUAL)
-				ctx.RescaleInPlace(T[i - 1]);
-			ctx.EvalAddInPlace(T[i - 1], -1.0);
-		}
-	}
-
-	if (st == lbcrypto::FIXEDMANUAL) {
-		// FIXEDMANUAL drops all T[i] to T[k-1]'s level (ApproxModEval.cu:661-665).
-		size_t targetTowers = towersOf(ctx, T[k - 1]);
-		for (size_t i = 1; i < k; ++i)
-			dropCiphertextToTowers(ctx, T[i - 1], targetTowers);
+	// internalEvalChebyPolysPS.
+	const auto degs	   = lbcrypto::ComputeDegreesPS(d);
+	const uint32_t k   = degs[0];
+	const uint32_t m   = degs[1];
+	T.resize(k);
+	T[0] = firstPower();
+	buildPowers(T, k);
+	if (manual) {
+		for (uint32_t i = 1; i < k; ++i)
+			levelReduce(T[i - 1], level(T[k - 1]) - level(T[i - 1]));
 	} else {
-		for (size_t i = 1; i <= k; ++i) {
-			if (T[i - 1]->GetNoiseScaleDeg() == 2)
-				ctx.RescaleInPlace(T[i - 1]);
-		}
-		// Under FIXEDAUTO the GPU spec leaves the T-equalization to the lazy adjust inside the
-		// later EvalMult/EvalAdd (ApproxModEval.cu:666-677).
+		for (uint32_t i = 1; i < k; ++i)
+			adjustPair(T[i - 1], T[k - 1]);
 	}
-
-	// Build T2[0..m-1]: T2[i] = T_{k*2^i}(y); T2[0] is a placeholder = T[k-1].
-	std::vector<Ciphertext<DCRTPoly>> T2(m);
-	T2[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*T.back());
+	std::vector<Ct> T2(m);
+	T2[0]	  = T.back();
+	Ct T2km1  = T.back();
 	for (uint32_t i = 1; i < m; ++i) {
 		T2[i] = ctx.EvalSquare(T2[i - 1]);
 		ctx.EvalAddInPlace(T2[i], T2[i]);
-		// CUDA FIXEDMANUAL pre-rescale (ApproxModEval.cu:723-724); a no-op for AUTO techniques.
-		if (st == lbcrypto::FIXEDMANUAL)
-			ctx.RescaleInPlace(T2[i]);
+		modReduce(T2[i]);
 		ctx.EvalAddInPlace(T2[i], -1.0);
-	}
 
-	// T2km1 = T_{k(2m-1)}(y).
-	Ciphertext<DCRTPoly> T2km1 = std::make_shared<CiphertextImpl<DCRTPoly>>(*T2[0]);
-	for (uint32_t i = 1; i < m; ++i) {
-		// T_{k(2m-1)} = 2*T_{k(2^{m-1}-1)}(y)*T_{k*2^{m-1}}(y) - T_k(y)
 		T2km1 = ctx.EvalMult(T2km1, T2[i]);
 		ctx.EvalAddInPlace(T2km1, T2km1);
-		// CUDA FIXEDMANUAL pre-rescale (ApproxModEval.cu:730-731); a no-op for AUTO techniques.
-		if (st == lbcrypto::FIXEDMANUAL)
-			ctx.RescaleInPlace(T2km1);
-		// CUDA: T2[0].adjustForAddOrSub(T2km1); if(T2[0].NL==1) T2km1.rescale(); T2km1.sub(*T2[0]);
-		// if(T2[0].NL==2 && i<m-1) T2km1.rescale(). The facade EvalSub does the adjust; the trailing
-		// rescale matters only for m>3 (deep path), where we additionally rescale T2km1 below. It is
-		// an AUTO-technique-only auto-rescale — FIXEDMANUAL never fires it (manual rescale above
-		// already handled that case).
+		modReduce(T2km1);
 		ctx.EvalSubInPlace(T2km1, T2[0]);
-		if (st != lbcrypto::FIXEDMANUAL && T2[0]->GetNoiseScaleDeg() == 2 && i < m - 1)
-			ctx.RescaleInPlace(T2km1);
 	}
 
-	// Paterson-Stockmeyer recursion; top-level call uses level_offset=0, max_m=m.
-	Ciphertext<DCRTPoly> result = hazeInnerEvalChebyshevPS(ctx, f2coef, k, m, T, T2, 0, static_cast<int>(m));
-
-	// result - T2km1 (ApproxModEval.cu:700).
-	return ctx.EvalSub(result, T2km1);
+	// internalEvalChebyshevSeriesPSWithPrecomp.
+	const uint32_t k2m2k = k * (1u << (m - 1)) - k;
+	auto f2				 = coefficients;
+	f2.resize(lbcrypto::Degree(f2) + 1);
+	f2.resize(2 * k2m2k + k + 1);
+	f2.back() = 1;
+	return ctx.EvalSub(inner(f2, k, m, T, T2), T2km1);
 }
-
-// ---- EvalChebyshevSeries ----
 
 Ciphertext<DCRTPoly> HazeEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>& ctx,
   const Ciphertext<DCRTPoly>& ct,
@@ -2959,7 +2838,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalChebyshevSeries(CryptoContextImpl<DCRTPoly>
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalChebyshevSeries");
 	requireRelinearized(*p, "EvalChebyshevSeries");
-	return hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
+	return openFheChebyshevSeries(ctx, ct, coeffs, a, b);
 }
 
 void HazeEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx,
@@ -2969,7 +2848,7 @@ void HazeEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx,
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalChebyshevSeriesInPlace");
 	requireRelinearized(*p, "EvalChebyshevSeriesInPlace");
-	ct = hazeEvalChebyshevSeriesImpl(ctx, ct, coeffs, a, b);
+	ct = openFheChebyshevSeries(ctx, ct, coeffs, a, b);
 }
 
 // ---- ConvolutionTransform ----
