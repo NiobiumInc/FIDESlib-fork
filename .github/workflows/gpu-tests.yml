@@ -202,6 +202,13 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
+      # The test binary of this job defines the tests of every source file. Each one declared for a
+      # backend (test/TestRegistration.hpp) has to be registered on one of them: a condition no backend
+      # satisfies leaves a test that runs nowhere. Listing the tests starts no backend.
+      - name: Check that every test is registered on some backend
+        working-directory: build
+        run: python3 ../.github/scripts/check_coverage.py --binary ./fideslib-test --sources ../test/*.cpp ../test/*.cu
+
       # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
       # unless told otherwise; cuda makes them exercise the CUDA engine, which
       # is what this job is for. The CPU backend has its own job in ci.yml.
@@ -214,7 +221,8 @@ jobs:
           args=()
           if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt "${args[@]}"
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt "${args[@]}"
 
       # The concurrent-operations suite, in a process of its own: the library reads
       # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run

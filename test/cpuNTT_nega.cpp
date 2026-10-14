@@ -286,3 +286,17 @@ void FIDESlib::Testing::nega_fft2_forPrime(std::vector<uint64_t>& a, bool invert
 
 	nega_fft2(a, invert, ((uint64_t*)hG_.psi[primeid]), ((uint64_t*)hG_.inv_psi[primeid]), hC_.primes[primeid], its);
 }
+
+void FIDESlib::Testing::nega_fft2_forPrime32(std::vector<uint64_t>& a, bool invert, int primeid, int its) {
+	FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+	FIDESlib::Global& host_global		= *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
+
+	// nega_fft2 reads four entries of the tables, at a.size() / 4 and a.size() / 2.
+	const size_t n = a.size();
+	std::vector<uint64_t> psi(n / 2 + 1, 0), inv_psi(n / 2 + 1, 0);
+	for (const size_t i : { n >> 2, n >> 1 }) {
+		psi[i]	   = ((uint32_t*)hG_.psi[primeid])[i];
+		inv_psi[i] = ((uint32_t*)hG_.inv_psi[primeid])[i];
+	}
+	nega_fft2(a, invert, psi.data(), inv_psi.data(), hC_.primes[primeid], its);
+}

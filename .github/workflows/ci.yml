@@ -132,6 +132,15 @@ jobs:
         if: steps.cpu-build.outputs.present == 'true'
         run: cmake --build build -j "$(nproc)" --target fideslib-cpu-test
 
+      # Tests are registered per backend, so one can end up registered on none, and a not-applicable list
+      # can leave out the last backend that ran one. Listing the tests starts no backend.
+      - name: Check that every test runs on some backend
+        if: steps.cpu-build.outputs.present == 'true'
+        working-directory: build
+        run: |
+          python3 ../.github/scripts/check_coverage.py --binary ./fideslib-cpu-test \
+            --sources ../test/Api*.cpp ../test/ReducedNoiseTests.cpp --lists ../.github/tests-not-applicable
+
       - name: Test
         if: steps.cpu-build.outputs.present == 'true'
         working-directory: build

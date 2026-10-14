@@ -17,6 +17,9 @@ void nega_fft_forPrime(std::vector<uint64_t>& a, bool invert, int primeid, int i
 
 void nega_fft2_forPrime(std::vector<uint64_t>& a, bool invert, int primeid, int its = 1000);
 
+/// Like nega_fft2_forPrime for a context whose constants of the prime are stored as 32-bit words.
+void nega_fft2_forPrime32(std::vector<uint64_t>& a, bool invert, int primeid, int its = 1000);
+
 template <typename T> void nega_fft_2d(std::vector<T>& a, int sqrtN, int primeid);
 } // namespace FIDESlib::Testing
 

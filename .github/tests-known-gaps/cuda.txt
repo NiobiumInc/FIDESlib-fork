@@ -1,0 +1,7 @@
+# Tests that should pass on the CUDA backend and do not yet, one `PATTERN | REASON` per line (see
+# haze.txt in this directory). They are left out of the default pass of the GPU suite and counted as
+# known gaps in the test report. Remove the line when the gap closes.
+#
+# A pattern that matches no test is an error (see .github/scripts/run_gtest.py).
+
+NTTTests32/NTTTest32.TestLimbNTTSecondHalf32/*:NTTTests32/NTTTest32.TestLimbNTT32/* | The NTT of a limb with a 32-bit prime does not invert: at the parameters of these tests (a 30-bit prime) a forward NTT followed by the inverse does not return the input, and the forward result matches neither the cyclic nor the negacyclic CPU reference. Contexts built from OpenFHE use 64-bit primes, so the library's API does not reach this path; whether the kernel or the parameters are at fault is not determined
