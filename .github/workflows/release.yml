@@ -194,6 +194,10 @@ jobs:
       contains(fromJSON('["success", "skipped"]'), needs.gpu-tests.result)
     name: build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    # A build takes 4 to 10 minutes with the dependency caches warm; an hour leaves room for a cold
+    # cache and stops a hung step (a package download, a runner that stalls) from holding the
+    # release for the six hours a job may run by default.
+    timeout-minutes: 60
     # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) and ships gcc-toolset-14 -- the
     # pairing this build needs: a C++23 compiler (haze uses std::println) on a glibc
     # old enough to run everywhere, with libstdc++_nonshared.a absorbing the newer
@@ -237,14 +241,16 @@ jobs:
         if: startsWith(matrix.name, 'macos')
         run: |
           # Apple Clang's libc++ predates <print>, which haze needs. Homebrew LLVM 19
-          # supplies it. std::print's runtime support requires macOS 13.3, so the
-          # deployment target cannot go below that.
+          # supplies it. The package says macOS 14 or newer, and that is the floor of what it
+          # bundles (Homebrew's libomp is built for the runner's macOS 14) and of the only runner
+          # that tests it, so the deployment target is 14.0; std::print's runtime support alone
+          # would allow 13.3.
           brew install llvm@19 libomp cmake ninja
           llvm="$(brew --prefix llvm@19)"
           {
             echo "CC=$llvm/bin/clang"
             echo "CXX=$llvm/bin/clang++"
-            echo "MACOSX_DEPLOYMENT_TARGET=13.3"
+            echo "MACOSX_DEPLOYMENT_TARGET=14.0"
           } >> "$GITHUB_ENV"
 
       - name: Build release package
