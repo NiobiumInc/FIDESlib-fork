@@ -2,20 +2,13 @@ THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 ============================================================
 
 Project: FIDESlib-fork
-Generated: 2026-10-11
+Generated: 2026-10-14
 Tool: SCANOSS (snippet detection with License dataset)
 Components: 63
 
 This file lists all third-party software components detected
 in this repository, along with their licenses and copyright
 notices as required by those licenses.
-
-------------------------------------------------------------
-
-WARNING: The following component(s) have no license information.
-These require manual review to determine licensing terms.
-
-  - pkcs11_solid (https://github.com/AndreanIvan/pkcs11_solid)
 
 ------------------------------------------------------------
 
@@ -26,7 +19,7 @@ LICENSE SUMMARY
   Apache-2.0 WITH LLVM-exception AND NCSA: 1 component(s)
   Apache-2.0 WITH LLVM-exception AND NCSA AND NCSA OR MIT AND NCSA AND MIT: 1 component(s)
   BSD-2-Clause: 5 component(s)
-  BSD-3-Clause: 29 component(s)
+  BSD-3-Clause: 30 component(s)
   BSD-3-Clause-LBNL: 1 component(s)
   BSL-1.0: 1 component(s)
   EPL-2.0 [COPYLEFT]: 1 component(s)
@@ -791,7 +784,7 @@ COMPONENT ATTRIBUTIONS
   PURL: pkg:github/andreanivan/pkcs11_solid
   Copyright:
     Copyright 2007; Google Inc.
-  License: UNKNOWN — requires manual review
+  License: BSD-3-Clause
 
   platform.external.googletest
   Version: android-14.0.0_r32
