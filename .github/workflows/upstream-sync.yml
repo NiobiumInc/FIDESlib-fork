@@ -1,0 +1,48 @@
+# Reports, every week, how far nb_main has drifted from the upstream project:
+# the commits on each side and what merging upstream would conflict on
+# (.github/scripts/upstream_sync_check.sh). It only tries the merge and never
+# fails on drift: the report is in the job summary and the upload.
+
+name: Upstream sync report
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+  # A pull request that changes the report runs it, so the change shows its output.
+  pull_request:
+    branches: [nb_main]
+    paths:
+      - .github/workflows/upstream-sync.yml
+      - .github/scripts/upstream_sync_check.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Drift from upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge base with upstream is far back in the history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report
+        run: bash .github/scripts/upstream_sync_check.sh upstream-sync
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-sync
+          path: upstream-sync/
+          if-no-files-found: ignore
