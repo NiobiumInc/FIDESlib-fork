@@ -709,13 +709,13 @@ std::vector<uint64_t> ContextData::ElemForEvalMult(int level, const double opera
 	}
 	double approxFactor = pow(2, logApprox);
 
-	// OpenFHE's GetElementForEvalMult computes this as `operand / approxFactor * scFactor + 0.5`, and its
-	// compiler fuses the multiplication and the addition (FMA), so the product is not rounded before 0.5 is added.
-	// For a scaling factor that is not a power of two (every level of the FLEXIBLE techniques) and a result above
-	// 2^53 the two roundings differ by the last bit of the double, which is 1 to 8 for the constants of a Chebyshev
-	// series, and shows up as a difference of about 1e-12 after the double-angle iterations. Fuse explicitly, so
-	// the result does not depend on how this file is compiled.
-	DoubleInteger large     = static_cast<DoubleInteger>(std::fma(operand / approxFactor, scFactor, 0.5));
+	// OpenFHE's GetElementForEvalMult computes this as `operand / approxFactor * scFactor + 0.5`. Built without FMA
+	// (-DWITH_NATIVEOPT=OFF, see deps/build.sh), it rounds the product before adding 0.5, and so does this line.
+	// An OpenFHE built with FMA fuses the two: for a scaling factor that is not a power of two (every level of the
+	// FLEXIBLE techniques) the integer then differs by the last bit of the double, which the double-angle
+	// iterations turn into a difference of about 1e-12. CMakeLists.txt warns when the installed OpenFHE was built
+	// that way.
+	DoubleInteger large     = static_cast<DoubleInteger>(operand / approxFactor * scFactor + 0.5);
 	DoubleInteger large_abs = (large < 0 ? -large : large);
 	DoubleInteger bound     = (uint64_t)1 << 63;
 

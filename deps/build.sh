@@ -27,6 +27,9 @@ echo "Installing into $1"
 # recorder implements that keyswitch/ModDown rounding; see haze's own Makefile, which
 # builds its reference OpenFHE the same way). The default (flag unset) is unchanged
 # and matches what the CUDA backend was verified against.
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$1" ${OPENFHE_EXTRA_CMAKE_FLAGS} ..
+# -DWITH_NATIVEOPT=OFF: the patch above turns it on, and -march=native lets the compiler
+# fuse multiply-adds (FMA), which changes the last bit of the constants the GPU must match.
+# The release build (packaging/build-release.sh) passes the same flag.
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$1" -DWITH_NATIVEOPT=OFF ${OPENFHE_EXTRA_CMAKE_FLAGS} ..
 make -j12
 make install -j12
