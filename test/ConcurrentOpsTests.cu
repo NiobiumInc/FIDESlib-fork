@@ -21,6 +21,7 @@
 //
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -2257,6 +2258,98 @@ TEST_P(ConcurrentOpsTest, PoolsDoNotReuseOnEventDependencies) {
 			EXPECT_EQ(follow, before[i]) << "device " << devices[i] << ": the default mode must leave the pool as it was";
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// PROBE (not for merge): what does the concurrent mode gain on its own?
+//
+// The same fixed amount of work (kUnits independent lanes, each a rotate, a plaintext multiply
+// that uploads its plaintext, a ciphertext multiply and a Chebyshev series, optionally a
+// bootstrap) is issued by K host threads. K = 1 is the library's supported mode: one issuing
+// thread. K > 1 needs FIDESLIB_CONCURRENT_OPS=1, which the library reads once per process, so the
+// default-mode baseline and the concurrent runs are separate processes of this same test.
+// Prints one `[bench]` line per case; the wall time is the best of kReps.
+// ---------------------------------------------------------------------------------------------
+class ConcurrentBenchTest : public ConcurrentOpsTest {};
+
+TEST_P(ConcurrentBenchTest, ThroughputByIssuingThreads) {
+	const std::vector<int> rot_index{ 1, 2, 3, 4 };
+	int numSlots = 0;
+	FIDESlib::CKKS::Context GPUcc_ = Prepare(rot_index, numSlots);
+
+	constexpr int kUnits = 8;
+	constexpr int kReps	 = 3;
+	std::vector<FIDESlib::CKKS::RawCipherText> raw_in;
+	std::vector<FIDESlib::CKKS::RawPlainText> raw_pt;
+	for (int lane = 0; lane < kUnits; ++lane) {
+		std::vector<double> x(8), y(8);
+		for (int i = 0; i < 8; ++i) {
+			x[i] = 0.1 * (lane + 1) * (i + 1);
+			y[i] = 0.05 * (lane + 2) * (i + 2);
+		}
+		raw_in.push_back(FIDESlib::CKKS::GetRawCipherText(cc, cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(x, 1, 0, nullptr, numSlots))));
+		raw_pt.push_back(FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots)));
+	}
+	const std::vector<double> cheb_coeffs{ 0.5, 0.25, 0.125, 0.0625, 0.03125 };
+
+	auto unit = [&](int lane, bool do_boot) {
+		FIDESlib::CKKS::Ciphertext ct(GPUcc_, raw_in[lane]);
+		FIDESlib::CKKS::Ciphertext other(GPUcc_, raw_in[(lane + 1) % kUnits]);
+		FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[lane]);
+		ct.rotate(rot_index[lane % rot_index.size()]);
+		ct.multPt(pt, true);
+		ct.mult(other, true);
+		std::vector<double> coeffs = cheb_coeffs;
+		evalChebyshevSeries(ct, coeffs, -1.0, 1.0);
+		if (do_boot) {
+			DepleteForBootstrap(ct);
+			Bootstrap(ct, numSlots, false);
+		}
+		FIDESlib::CKKS::RawCipherText out;
+		ct.store(out);
+	};
+
+	const bool concurrent = FIDESlib::ConcurrentOps();
+	unit(0, true); // warm up kernels, pools and caches
+	cudaDeviceSynchronize();
+
+	for (const bool boot : { false, true }) {
+		for (const int threads : { 1, 2, 4, 8 }) {
+			if (threads > 1 && !concurrent) {
+				std::cout << "[bench] mode=default boot=" << boot << " threads=" << threads << " skipped (needs FIDESLIB_CONCURRENT_OPS=1)" << std::endl;
+				continue;
+			}
+			double best = 1e300;
+			for (int rep = 0; rep < kReps; ++rep) {
+				cudaDeviceSynchronize();
+				const auto t0 = std::chrono::steady_clock::now();
+				std::vector<std::thread> pool;
+				std::atomic<int> failures{ 0 };
+				for (int t = 0; t < threads; ++t)
+					pool.emplace_back([&, t] {
+						try {
+							for (int lane = t; lane < kUnits; lane += threads)
+								unit(lane, boot);
+						} catch (const std::exception& e) {
+							++failures;
+							std::cerr << "thread " << t << " threw: " << e.what() << std::endl;
+						}
+					});
+				for (auto& th : pool)
+					th.join();
+				cudaDeviceSynchronize();
+				const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+				ASSERT_EQ(failures.load(), 0);
+				best = std::min(best, ms);
+			}
+			std::cout << "[bench] mode=" << (concurrent ? "concurrent" : "default") << " boot=" << boot << " threads=" << threads << " units=" << kUnits
+					  << " best_ms=" << best << std::endl;
+		}
+	}
+	CKKS::DeregisterAllContexts();
+	ClearCachedContexts();
+}
+
+INSTANTIATE_TEST_SUITE_P(ConcurrencyBench, ConcurrentBenchTest, testing::Values(TTALL64BOOT));
 
 // The suite has no cases on the backends it does not apply to.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ConcurrentOpsTest);
