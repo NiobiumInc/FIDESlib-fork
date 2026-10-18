@@ -2349,6 +2349,115 @@ TEST_P(ConcurrentBenchTest, ThroughputByIssuingThreads) {
 	ClearCachedContexts();
 }
 
+// PROBE: the producer/consumer shape the concurrent mode was built for. P producer threads build
+// device plaintexts (the host-to-device upload) and queue them; ONE consumer multiplies a
+// ciphertext by each and drops the plaintext on its own thread, so every block is freed on a
+// different thread from the one that took it. P = 0 is the supported mode: one thread does both,
+// one item after the other.
+TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
+	const std::vector<int> rot_index{ 1 };
+	int numSlots = 0;
+	FIDESlib::CKKS::Context GPUcc_ = Prepare(rot_index, numSlots);
+
+	constexpr int kItems = 192;
+	constexpr int kDistinct = 8;
+	constexpr size_t kQueueDepth = 32;
+	constexpr int kReps = 3;
+	std::vector<FIDESlib::CKKS::RawPlainText> raw_pt;
+	for (int k = 0; k < kDistinct; ++k) {
+		std::vector<double> y(8);
+		for (int i = 0; i < 8; ++i)
+			y[i] = 0.05 * (k + 2) * (i + 2);
+		raw_pt.push_back(FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots)));
+	}
+	std::vector<double> x(8);
+	for (int i = 0; i < 8; ++i)
+		x[i] = 0.1 * (i + 1);
+	const FIDESlib::CKKS::RawCipherText raw_in =
+	  FIDESlib::CKKS::GetRawCipherText(cc, cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(x, 1, 0, nullptr, numSlots)));
+
+	auto consume = [&](const FIDESlib::CKKS::Plaintext& pt) {
+		FIDESlib::CKKS::Ciphertext ct(GPUcc_, raw_in);
+		ct.multPt(pt, true);
+	};
+
+	const bool concurrent = FIDESlib::ConcurrentOps();
+	{ // warm up
+		FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[0]);
+		consume(pt);
+		cudaDeviceSynchronize();
+	}
+
+	for (const int producers : { 0, 1, 2, 4, 8, 24 }) {
+		if (producers > 0 && !concurrent) {
+			std::cout << "[bench] prefetch mode=default producers=" << producers << " skipped (needs FIDESLIB_CONCURRENT_OPS=1)" << std::endl;
+			continue;
+		}
+		double best = 1e300;
+		for (int rep = 0; rep < kReps; ++rep) {
+			cudaDeviceSynchronize();
+			const auto t0 = std::chrono::steady_clock::now();
+			std::atomic<int> failures{ 0 };
+			if (producers == 0) {
+				for (int i = 0; i < kItems; ++i) {
+					FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[i % kDistinct]);
+					consume(pt);
+				}
+			} else {
+				std::mutex m;
+				std::condition_variable not_full, not_empty;
+				std::deque<std::unique_ptr<FIDESlib::CKKS::Plaintext>> q;
+				std::atomic<int> next{ 0 };
+				std::vector<std::thread> pool;
+				for (int w = 0; w < producers; ++w)
+					pool.emplace_back([&] {
+						try {
+							for (int i = next++; i < kItems; i = next++) {
+								auto pt = std::make_unique<FIDESlib::CKKS::Plaintext>(GPUcc_, raw_pt[i % kDistinct]);
+								std::unique_lock<std::mutex> lk(m);
+								not_full.wait(lk, [&] { return q.size() < kQueueDepth; });
+								q.push_back(std::move(pt));
+								not_empty.notify_one();
+							}
+						} catch (const std::exception& e) {
+							++failures;
+							std::cerr << "producer threw: " << e.what() << std::endl;
+						}
+					});
+				std::thread consumer([&] {
+					try {
+						for (int done = 0; done < kItems; ++done) {
+							std::unique_ptr<FIDESlib::CKKS::Plaintext> pt;
+							{
+								std::unique_lock<std::mutex> lk(m);
+								not_empty.wait(lk, [&] { return !q.empty(); });
+								pt = std::move(q.front());
+								q.pop_front();
+								not_full.notify_one();
+							}
+							consume(*pt);
+						}
+					} catch (const std::exception& e) {
+						++failures;
+						std::cerr << "consumer threw: " << e.what() << std::endl;
+					}
+				});
+				for (auto& th : pool)
+					th.join();
+				consumer.join();
+			}
+			cudaDeviceSynchronize();
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			ASSERT_EQ(failures.load(), 0);
+			best = std::min(best, ms);
+		}
+		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " producers=" << producers << " items=" << kItems
+				  << " best_ms=" << best << std::endl;
+	}
+	CKKS::DeregisterAllContexts();
+	ClearCachedContexts();
+}
+
 INSTANTIATE_TEST_SUITE_P(ConcurrencyBench, ConcurrentBenchTest, testing::Values(TTALL64BOOT));
 
 // The suite has no cases on the backends it does not apply to.
