@@ -2451,8 +2451,10 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			ASSERT_EQ(failures.load(), 0);
 			best = std::min(best, ms);
 		}
-		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " producers=" << producers << " items=" << kItems
-				  << " best_ms=" << best << std::endl;
+		const double bytes_each = static_cast<double>(raw_pt[0].numRes) * raw_pt[0].N * sizeof(uint64_t);
+		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+				  << " producers=" << producers << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
+				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
 	}
 	CKKS::DeregisterAllContexts();
 	ClearCachedContexts();

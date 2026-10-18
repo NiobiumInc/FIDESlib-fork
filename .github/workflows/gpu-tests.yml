@@ -224,6 +224,27 @@ jobs:
           ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.*' 2>&1 | tee gpu-results/bench-concurrent.log
           grep '^\[bench\]' gpu-results/bench-concurrent.log >> "$GITHUB_STEP_SUMMARY" || true
 
+      - name: Bench prefetch, default mode, pinned staging
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PINNED_STAGING: '1'
+        run: |
+          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.PrefetchPipeline/*' 2>&1 | tee gpu-results/bench-default-pinned.log
+          grep '^\[bench\]' gpu-results/bench-default-pinned.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Bench prefetch, concurrent mode, pinned staging
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_CONCURRENT_OPS: '1'
+          FIDESLIB_PINNED_STAGING: '1'
+        run: |
+          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.PrefetchPipeline/*' 2>&1 | tee gpu-results/bench-concurrent-pinned.log
+          grep '^\[bench\]' gpu-results/bench-concurrent-pinned.log >> "$GITHUB_STEP_SUMMARY" || true
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
