@@ -2456,6 +2456,33 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 				  << " producers=" << producers << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
 				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
 	}
+	// ONE issuing thread that builds the plaintext `lookahead` items ahead of the one it multiplies:
+	// the upload of item i + lookahead is issued while the GPU is still working on item i. This is
+	// the supported mode (no second issuing thread), so it runs with and without the concurrent mode.
+	for (const int lookahead : { 1, 2, 4 }) {
+		double best = 1e300;
+		for (int rep = 0; rep < kReps; ++rep) {
+			cudaDeviceSynchronize();
+			const auto t0 = std::chrono::steady_clock::now();
+			std::deque<std::unique_ptr<FIDESlib::CKKS::Plaintext>> window;
+			int next = 0;
+			for (int i = 0; i < kItems; ++i) {
+				while (static_cast<int>(window.size()) < lookahead + 1 && next < kItems) {
+					window.push_back(std::make_unique<FIDESlib::CKKS::Plaintext>(GPUcc_, raw_pt[next % kDistinct]));
+					++next;
+				}
+				std::unique_ptr<FIDESlib::CKKS::Plaintext> pt = std::move(window.front());
+				window.pop_front();
+				consume(*pt);
+			}
+			cudaDeviceSynchronize();
+			best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+		}
+		const double bytes_each = static_cast<double>(raw_pt[0].numRes) * raw_pt[0].N * sizeof(uint64_t);
+		std::cout << "[bench] prefetch-one-thread mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+				  << " lookahead=" << lookahead << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
+				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
+	}
 	CKKS::DeregisterAllContexts();
 	ClearCachedContexts();
 }
