@@ -2393,15 +2393,28 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			std::cout << "[bench] prefetch mode=default producers=" << producers << " skipped (needs FIDESLIB_CONCURRENT_OPS=1)" << std::endl;
 			continue;
 		}
-		double best = 1e300;
+		double best = 1e300, best_build = 0, best_rest = 0;
 		for (int rep = 0; rep < kReps; ++rep) {
 			cudaDeviceSynchronize();
 			const auto t0 = std::chrono::steady_clock::now();
 			std::atomic<int> failures{ 0 };
+			double host_construct_ms = 0, host_rest_ms = 0;
 			if (producers == 0) {
+				// HOST time of the one thread, split in building the plaintext (the upload) and the rest
+				// (the multiply, and dropping both objects). What the loop does not account for is the
+				// wait for the device at the end.
+				using clk = std::chrono::steady_clock;
+				const auto ms_between = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
 				for (int i = 0; i < kItems; ++i) {
-					FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[i % kDistinct]);
-					consume(pt);
+					const auto a = clk::now();
+					clk::time_point b;
+					{
+						FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[i % kDistinct]);
+						b = clk::now();
+						consume(pt);
+					}
+					host_construct_ms += ms_between(a, b);
+					host_rest_ms += ms_between(b, clk::now());
 				}
 			} else {
 				std::mutex m;
@@ -2449,8 +2462,15 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			cudaDeviceSynchronize();
 			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 			ASSERT_EQ(failures.load(), 0);
-			best = std::min(best, ms);
+			if (ms < best) {
+				best	   = ms;
+				best_build = host_construct_ms;
+				best_rest  = host_rest_ms;
+			}
 		}
+		if (producers == 0)
+			std::cout << "[bench] prefetch-host-time mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+					  << " total_ms=" << best << " host_build_ms=" << best_build << " host_rest_ms=" << best_rest << std::endl;
 		const double bytes_each = static_cast<double>(raw_pt[0].numRes) * raw_pt[0].N * sizeof(uint64_t);
 		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
 				  << " producers=" << producers << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best

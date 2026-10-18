@@ -202,48 +202,33 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # PROBE (not for merge): the throughput of the concurrent mode against one issuing thread.
-      # The mode is read once per process, so the default-mode baseline and the concurrent runs
-      # are separate processes of the same test.
-      - name: Bench, default mode (one issuing thread)
+      # PROBE (not for merge): the prefetch case under single-thread options of the library, to see
+      # how much of the two-thread gain the supported mode can recover on its own. One process per
+      # configuration: the options are read once.
+      - name: Bench prefetch, option matrix
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
         run: |
           mkdir -p gpu-results
-          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.*' 2>&1 | tee gpu-results/bench-default.log
-          grep '^\[bench\]' gpu-results/bench-default.log >> "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Bench, concurrent mode
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-        run: |
-          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.*' 2>&1 | tee gpu-results/bench-concurrent.log
-          grep '^\[bench\]' gpu-results/bench-concurrent.log >> "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Bench prefetch, default mode, pinned staging
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PINNED_STAGING: '1'
-        run: |
-          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.PrefetchPipeline/*' 2>&1 | tee gpu-results/bench-default-pinned.log
-          grep '^\[bench\]' gpu-results/bench-default-pinned.log >> "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Bench prefetch, concurrent mode, pinned staging
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          FIDESLIB_PINNED_STAGING: '1'
-        run: |
-          ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.PrefetchPipeline/*' 2>&1 | tee gpu-results/bench-concurrent-pinned.log
-          grep '^\[bench\]' gpu-results/bench-concurrent-pinned.log >> "$GITHUB_STEP_SUMMARY" || true
+          configs=(
+            "d-base|"
+            "d-arena|FIDESLIB_PT_ARENA=1"
+            "d-poolstream|FIDESLIB_POOL_PER_STREAM=1"
+            "d-pinned|FIDESLIB_PINNED_STAGING=1"
+            "d-pinned-arena|FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1"
+            "d-pinned-poolstream|FIDESLIB_PINNED_STAGING=1 FIDESLIB_POOL_PER_STREAM=1"
+            "d-pinned-arena-poolstream|FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1 FIDESLIB_POOL_PER_STREAM=1"
+            "c-pinned|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_PINNED_STAGING=1"
+            "c-pinned-arena|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1"
+          )
+          for c in "${configs[@]}"; do
+            name=${c%%|*}
+            envs=${c#*|}
+            env $envs ./fideslib-test --gtest_filter='ConcurrencyBench/ConcurrentBenchTest.PrefetchPipeline/*' > "gpu-results/bench-$name.log" 2>&1 || true
+            grep '^\[bench\]' "gpu-results/bench-$name.log" | sed "s/^\[bench\]/[bench] cfg=$name/" >> gpu-results/bench-all.txt || true
+          done
+          cat gpu-results/bench-all.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test reports
         if: always()
