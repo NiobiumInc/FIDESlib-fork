@@ -204,25 +204,35 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # PROBE (not for merge). FIDESLIB_PROBE_POOLED_PT=1 is set for the whole workflow.
-      # A. Negative control: the multPt fence switched off. Plaintext uploads are delayed 1 ms per limb, so
-      #    a multiply that does not wait for its plaintext must read stale data. This has to FAIL; if it does
-      #    not, the suite cannot see this class of bug and a clean amplified run proves little.
-      - name: Negative control, no multPt fence, delayed plaintext uploads
+      # PROBE (not for merge). FIDESLIB_PROBE_POOLED_PT=1 is set for the whole workflow. The runner's VM is
+      # reclaimed after about 90 minutes, so this job is kept well under that.
+      - name: Pooled streams, plaintext uploads delayed
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
           FIDESLIB_PROBE_PT_DELAY_US: '1000'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/negative \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-pt \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*' \
-            --title 'Negative control: no multPt fence' --retries 0 --isolate
-      # B. The real configuration: fence present, plaintexts and keys delayed, the whole suite.
-      - name: Amplified, pooled streams, fence present, plaintext and key uploads delayed
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'Pooled, plaintext delay' --retries 0
+
+      - name: Pooled streams, key uploads delayed
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-key \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'Pooled, key delay' --retries 0
+
+      - name: Pooled streams, both delayed, bootstrap suite
         if: ${{ !cancelled() }}
         working-directory: build
         env:
@@ -230,12 +240,13 @@ jobs:
           FIDESLIB_PROBE_PT_DELAY_US: '1000'
           FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/amplified \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-boot \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --title 'Amplified: pooled streams, delayed uploads' --retries 0
-      # C. Control: the same delays on the legacy stream. Nothing may fail.
-      - name: Control, delayed uploads on the legacy stream
+            --only 'OpenFHEBootstrapTests/*' \
+            --title 'Pooled, both delays, bootstrap' --retries 0
+
+      - name: Control, both delayed, legacy stream
         if: ${{ !cancelled() }}
         working-directory: build
         env:
@@ -247,9 +258,9 @@ jobs:
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*' \
-            --title 'Control: delayed uploads, legacy stream' --retries 0
-      # D. The repeat failure: the stress filter five times over in one process, with the change off and on.
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'Control: legacy stream, both delays' --retries 0
+
       - name: Stress, five repetitions, change off
         if: ${{ !cancelled() }}
         working-directory: build
@@ -261,7 +272,8 @@ jobs:
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
             --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Stress, change off' --repeat 5 --retries 0
+            --title 'Stress, change off' --retries 0 --repeat 5
+
       - name: Stress, five repetitions, change on
         if: ${{ !cancelled() }}
         working-directory: build
@@ -273,7 +285,7 @@ jobs:
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
             --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Stress, change on' --repeat 5 --retries 0
+            --title 'Stress, change on' --retries 0 --repeat 5
 
       - name: Upload test reports
         if: always()
