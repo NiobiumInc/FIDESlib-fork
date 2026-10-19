@@ -155,6 +155,14 @@ void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
 /// `ConcurrentOps()` is one cached bool.
 /// PROBE (not for merge): FIDESLIB_PROBE_POOLED_PT=1 gives a `def_stream` partition a pooled stream in
 /// the default mode too. Read once.
+static bool ProbeNoMultPtFence() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_NO_MULTPT_FENCE");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 static bool ProbePooledPlaintextStreams() {
 	static const bool enabled = [] {
 		const char* env = std::getenv("FIDESLIB_PROBE_POOLED_PT");
@@ -817,7 +825,8 @@ void LimbPartition::multPt(const LimbPartition& p) {
 	// flight (its upload) before reading it, and below make its stream wait for this read before it
 	// can be rewritten or freed. Without the first wait a plaintext loaded just before the call is
 	// read half-written; without the second its blocks can return to the pool under the read.
-	s.wait(p.getS());
+	if (!ProbeNoMultPtFence())
+		s.wait(p.getS());
 
 	constexpr bool capture = false;
 	// thread_local, not a bare function-local static: this is on the ct x pt path -- the hottest
@@ -856,7 +865,8 @@ void LimbPartition::multPt(const LimbPartition& p) {
 		//     limb.pop_back();
 		// }
 	}
-	p.getS().wait(s);
+	if (!ProbeNoMultPtFence())
+		p.getS().wait(s);
 }
 
 void LimbPartition::modup(LimbPartition& aux_partition) {

@@ -2,6 +2,7 @@
 // Created by carlosad on 26/09/24.
 //
 
+#include "ProbeDelay.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
@@ -18,6 +19,7 @@ using sc = std::source_location;
 
 namespace FIDESlib::CKKS {
 void KeySwitchingKey::Initialize(RawKeySwitchKey& rkk) {
+	ProbeDelay::Scope probe_delay(ProbeDelay::KeyCycles());
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc);
 	keyID = rkk.keyid;

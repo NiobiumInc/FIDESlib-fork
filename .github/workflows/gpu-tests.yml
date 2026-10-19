@@ -205,66 +205,75 @@ jobs:
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
       # PROBE (not for merge). FIDESLIB_PROBE_POOLED_PT=1 is set for the whole workflow.
-      # 1. Control: the upload delay without the pooled streams. Plaintexts sit on the legacy stream, which
-      #    orders everything, so nothing may fail.
-      - name: Control, upload delay on the legacy stream (pooled streams off)
+      # A. Negative control: the multPt fence switched off. Plaintext uploads are delayed 1 ms per limb, so
+      #    a multiply that does not wait for its plaintext must read stale data. This has to FAIL; if it does
+      #    not, the suite cannot see this class of bug and a clean amplified run proves little.
+      - name: Negative control, no multPt fence, delayed plaintext uploads
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '0'
-          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
+          FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/negative \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*' \
-            --title 'Control: upload delay, plaintexts on the legacy stream' --retries 0
-
-      # 2. The amplifier: pooled streams plus the upload delay, over the whole default suite.
-      - name: Amplified, pooled streams with an upload delay (whole suite)
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*' \
+            --title 'Negative control: no multPt fence' --retries 0 --isolate
+      # B. The real configuration: fence present, plaintexts and keys delayed, the whole suite.
+      - name: Amplified, pooled streams, fence present, plaintext and key uploads delayed
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
           python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/amplified \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --title 'Amplified: pooled streams, 30 us upload delay' --retries 0
-
-      # 3. The test the stress run could not repeat, without the change.
-      - name: Repeat the context-lifetime tests, pooled streams off
+            --title 'Amplified: pooled streams, delayed uploads' --retries 0
+      # C. Control: the same delays on the legacy stream. Nothing may fail.
+      - name: Control, delayed uploads on the legacy stream
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*' \
+            --title 'Control: delayed uploads, legacy stream' --retries 0
+      # D. The repeat failure: the stress filter five times over in one process, with the change off and on.
+      - name: Stress, five repetitions, change off
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
           FIDESLIB_PROBE_POOLED_PT: '0'
         run: |
-          ./fideslib-test --gtest_filter='ContextLifetimeTest.*' --gtest_repeat=3 2>&1 | tee gpu-results/repeat-off.log || true
-          grep -E 'FAILED  \]|PASSED  \]|Repeating all tests' gpu-results/repeat-off.log >> "$GITHUB_STEP_SUMMARY" || true
-
-      # 4. Loading keys, with and without the change.
-      - name: Key loading, legacy stream
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '0'
-        run: |
-          ./fideslib-test --gtest_filter='KeyLoadProbes/*' 2>&1 | tee gpu-results/keyload-off.log || true
-          grep '^\[bench\]' gpu-results/keyload-off.log >> "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Key loading, pooled streams
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress-off \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'Stress, change off' --repeat 5 --retries 0
+      - name: Stress, five repetitions, change on
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
           FIDESLIB_PROBE_POOLED_PT: '1'
         run: |
-          ./fideslib-test --gtest_filter='KeyLoadProbes/*' 2>&1 | tee gpu-results/keyload-on.log || true
-          grep '^\[bench\]' gpu-results/keyload-on.log >> "$GITHUB_STEP_SUMMARY" || true
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress-on \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'Stress, change on' --repeat 5 --retries 0
 
       - name: Upload test reports
         if: always()
