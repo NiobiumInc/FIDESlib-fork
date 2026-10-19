@@ -77,7 +77,7 @@ jobs:
         run: |
           nvcc -O2 -std=c++17 -arch=sm_120 -o copybench copybench.cu
           ./copybench | tee copybench.log
-          grep '^\[copy\]' copybench.log >> "$GITHUB_STEP_SUMMARY"
+          grep "^\[copy" copybench.log >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report
         if: always()

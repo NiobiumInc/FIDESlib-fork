@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <vector>
 
 #define CK(x)                                                                                              \
@@ -33,21 +34,37 @@ constexpr int kLimbs		= 24;
 constexpr int kItems		= 192;
 constexpr int kSets			= 8;
 
-enum class Mem { Pageable, Registered, PinnedAlloc };
+enum class Mem { Pageable, Registered, PinnedAlloc, RegisteredHuge };
 enum class Strm { Legacy, Blocking, NonBlocking };
 
-static const char* Name(Mem m) { return m == Mem::Pageable ? "pageable" : m == Mem::Registered ? "registered" : "pinned_alloc"; }
+static const char* Name(Mem m) { return m == Mem::Pageable ? "pageable" : m == Mem::Registered ? "registered" : m == Mem::PinnedAlloc ? "pinned_alloc" : "registered_huge"; }
 static const char* Name(Strm s) { return s == Strm::Legacy ? "legacy" : s == Strm::Blocking ? "blocking" : "nonblocking"; }
 
 struct Result {
 	double p50, p90, p99, max, copy_ms, wall_ms;
 };
 
-static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us) {
+static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us, int nstreams = 0) {
 	std::vector<std::vector<void*>> host(kSets, std::vector<void*>(kLimbs)), dev(kSets, std::vector<void*>(kLimbs));
+	std::vector<void*> slabs(kSets, nullptr);
+	constexpr size_t kHuge = 2u << 20;
+	if (mem == Mem::RegisteredHuge)
+		for (int s = 0; s < kSets; ++s) {
+			const size_t bytes = ((kLimbs * kLimbBytes + kHuge - 1) / kHuge) * kHuge;
+			slabs[s]		   = std::aligned_alloc(kHuge, bytes);
+			madvise(slabs[s], bytes, MADV_HUGEPAGE);
+			std::memset(slabs[s], s, bytes); // touch, so the pages exist before they are registered
+			CK(cudaHostRegister(slabs[s], bytes, cudaHostRegisterDefault));
+		}
 	for (int s = 0; s < kSets; ++s)
 		for (int l = 0; l < kLimbs; ++l) {
 			void* h = nullptr;
+			if (mem == Mem::RegisteredHuge) {
+				h = static_cast<char*>(slabs[s]) + l * kLimbBytes;
+				host[s][l] = h;
+				CK(cudaMalloc(&dev[s][l], kLimbBytes));
+				continue;
+			}
 			if (mem == Mem::PinnedAlloc) {
 				CK(cudaHostAlloc(&h, kLimbBytes, cudaHostAllocDefault));
 			} else {
@@ -59,10 +76,13 @@ static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us) {
 			host[s][l] = h;
 			CK(cudaMalloc(&dev[s][l], kLimbBytes));
 		}
+	std::vector<cudaStream_t> many(nstreams > 0 ? nstreams : 0);
+	for (auto& m : many)
+		CK(cudaStreamCreateWithFlags(&m, cudaStreamDefault)); // like the library's pooled streams
 	cudaStream_t copy_stream = nullptr;
-	if (sk == Strm::Blocking)
+	if (nstreams == 0 && sk == Strm::Blocking)
 		CK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamDefault));
-	if (sk == Strm::NonBlocking)
+	if (nstreams == 0 && sk == Strm::NonBlocking)
 		CK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
 	cudaStream_t consume_stream;
 	CK(cudaStreamCreateWithFlags(&consume_stream, cudaStreamDefault)); // like the library's pooled streams
@@ -75,7 +95,7 @@ static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us) {
 		const int s = i % kSets;
 		for (int l = 0; l < kLimbs; ++l) {
 			const auto a = std::chrono::steady_clock::now();
-			CK(cudaMemcpyAsync(dev[s][l], host[s][l], kLimbBytes, cudaMemcpyHostToDevice, copy_stream));
+			CK(cudaMemcpyAsync(dev[s][l], host[s][l], kLimbBytes, cudaMemcpyHostToDevice, nstreams > 0 ? many[i % nstreams] : copy_stream));
 			us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a).count());
 		}
 		if (kernel_us > 0)
@@ -94,7 +114,9 @@ static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us) {
 	for (int s = 0; s < kSets; ++s)
 		for (int l = 0; l < kLimbs; ++l) {
 			CK(cudaFree(dev[s][l]));
-			if (mem == Mem::PinnedAlloc)
+			if (mem == Mem::RegisteredHuge) {
+				// the slab is released below
+			} else if (mem == Mem::PinnedAlloc)
 				CK(cudaFreeHost(host[s][l]));
 			else {
 				if (mem == Mem::Registered)
@@ -102,6 +124,13 @@ static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us) {
 				std::free(host[s][l]);
 			}
 		}
+	if (mem == Mem::RegisteredHuge)
+		for (int s = 0; s < kSets; ++s) {
+			CK(cudaHostUnregister(slabs[s]));
+			std::free(slabs[s]);
+		}
+	for (auto& m : many)
+		CK(cudaStreamDestroy(m));
 	if (copy_stream)
 		CK(cudaStreamDestroy(copy_stream));
 	CK(cudaStreamDestroy(consume_stream));
@@ -145,5 +174,33 @@ int main() {
 				  kernel_us, best.p50, best.p90, best.p99, best.max, best.copy_ms, best.wall_ms);
 				std::fflush(stdout);
 			}
+	// More than one stream: item i goes to stream i % N, as a plaintext's limbs go to the plaintext's stream.
+	for (const Mem mem : { Mem::Registered, Mem::PinnedAlloc })
+		for (const double kernel_us : { 0.0, 50.0 })
+			for (const int n : { 1, 4, 16, 37 }) {
+				Result best{};
+				best.wall_ms = 1e300;
+				for (int rep = 0; rep < 3; ++rep) {
+					const Result r = Run(mem, Strm::Blocking, kernel_us, cycles_per_us, n);
+					if (r.wall_ms < best.wall_ms)
+						best = r;
+				}
+				std::printf("[copy-n] mem=%-12s streams=%-3d pending_kernel_us=%-5g p50_us=%7.2f p90_us=%7.2f p99_us=%8.2f max_us=%8.2f copy_calls_ms=%7.2f wall_ms=%7.2f\n", Name(mem), n,
+				  kernel_us, best.p50, best.p90, best.p99, best.max, best.copy_ms, best.wall_ms);
+				std::fflush(stdout);
+			}
+	// Registered with huge pages, one stream.
+	for (const double kernel_us : { 0.0, 50.0 }) {
+		Result best{};
+		best.wall_ms = 1e300;
+		for (int rep = 0; rep < 3; ++rep) {
+			const Result r = Run(Mem::RegisteredHuge, Strm::Blocking, kernel_us, cycles_per_us, 0);
+			if (r.wall_ms < best.wall_ms)
+				best = r;
+		}
+		std::printf("[copy] mem=%-12s stream=%-11s pending_kernel_us=%-5g p50_us=%7.2f p90_us=%7.2f p99_us=%8.2f max_us=%8.2f copy_calls_ms=%7.2f wall_ms=%7.2f\n", Name(Mem::RegisteredHuge), "blocking",
+		  kernel_us, best.p50, best.p90, best.p99, best.max, best.copy_ms, best.wall_ms);
+		std::fflush(stdout);
+	}
 	return 0;
 }
