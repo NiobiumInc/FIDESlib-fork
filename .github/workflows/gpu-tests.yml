@@ -48,63 +48,10 @@ env:
   OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
 
 jobs:
-  # Lists the files changed by the pull request, or by the push to nb_main, and
-  # decides whether the test jobs need to run (.github/scripts/needs_tests.py).
-  # Only an explicit "false" skips them: if this job fails, they run anyway.
-  changes:
-    name: Decide what to test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      run: ${{ steps.decide.outputs.run }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-
-      - name: Decide
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          PR: ${{ github.event.pull_request.number }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
-          REPO: ${{ github.repository }}
-        run: |
-          case "$EVENT" in
-            pull_request)
-              gh api --paginate "repos/$REPO/pulls/$PR/files" \
-                --jq '.[] | .filename, (.previous_filename // empty)' > changed.txt
-              limit=3000 ;;
-            push)
-              gh api "repos/$REPO/compare/$BEFORE...$AFTER" \
-                --jq '.files[] | .filename, (.previous_filename // empty)' > changed.txt
-              limit=300 ;;
-            *)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              printf '### Test selection\n\n| Item | Value |\n|---|---|\n| Decision | Tests executed |\n| Reason | %s event |\n' "$EVENT" >> "$GITHUB_STEP_SUMMARY"
-              exit 0 ;;
-          esac
-          python3 .github/scripts/needs_tests.py changed.txt .github/no-test-paths.txt --file-limit "$limit" \
-            --always '.github/workflows/gpu-tests.yml' '.github/gpu-tests/**' \
-              '.github/scripts/gpu_suite.py' '.github/scripts/needs_tests.py' '.github/no-test-paths.txt'
-
   gpu:
     name: GPU test suite (RTX PRO 6000)
-    needs: changes
-    # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
-    # and merges whose changes cannot affect a test result. A failed decision
-    # runs it.
-    if: >-
-      ${{ !cancelled() && needs.changes.outputs.run != 'false' &&
-      (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
-    timeout-minutes: 150
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,176 +72,18 @@ jobs:
             echo "toolchain=${ID}${VERSION_ID}-gcc$(gcc -dumpversion)"
           } >> "$GITHUB_OUTPUT"
 
-      # The GPU test suite includes nccl.h. Install the NCCL build for the
-      # runner's CUDA version from NVIDIA's apt repository, after checking the
-      # keyring package's hash. The keyring goes through apt-get, not dpkg -i,
-      # because dpkg does not wait for a lock another process holds.
-      - name: Install NCCL
-        env:
-          CUDA_VERSION: ${{ steps.env.outputs.cuda }}
-          DISTRO: ${{ steps.env.outputs.distro }}
+      # PROBE (not for merge): cost of a host-to-device copy to the calling thread.
+      - name: Copy mechanism
         run: |
-          case "$DISTRO" in
-            ubuntu2404) sum=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba ;;
-            ubuntu2204) sum=d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df ;;
-            *) echo "::error::no known hash for NVIDIA's keyring package on $DISTRO"; exit 1 ;;
-          esac
-          curl -fsSLo cuda-keyring.deb \
-            "https://developer.download.nvidia.com/compute/cuda/repos/$DISTRO/x86_64/cuda-keyring_1.1-1_all.deb"
-          echo "$sum  cuda-keyring.deb" | sha256sum -c -
-          # A fresh VM can still be running apt on its own (unattended upgrades,
-          # first-boot setup). Wait, up to 10 minutes, while a process holds apt's
-          # or dpkg's lock files open; apt itself also waits as long for dpkg's
-          # lock. This checks the locks, not process names: the unattended-upgrades
-          # shutdown daemon runs all the time under the same name without a lock.
-          command -v fuser > /dev/null || echo "::warning::fuser not found: not waiting for apt's and dpkg's locks"
-          waited=0
-          while [ "$waited" -lt 600 ] &&
-            sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock > /dev/null 2>&1; do
-            sleep 5
-            waited=$((waited + 5))
-          done
-          echo "Waited ${waited}s for apt's and dpkg's locks."
-          apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
-          "${apt[@]}" install -y ./cuda-keyring.deb
-          "${apt[@]}" update
-          suffix="+cuda$CUDA_VERSION"
-          ver=$(apt-cache madison libnccl-dev |
-                awk -v s="$suffix" 'substr($3, length($3) - length(s) + 1) == s { print $3; exit }')
-          if [ -z "$ver" ]; then
-            echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION"
-            exit 1
-          fi
-          "${apt[@]}" install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
+          nvcc -O2 -std=c++17 -arch=sm_120 -o copybench copybench.cu
+          ./copybench | tee copybench.log
+          grep '^\[copy\]' copybench.log >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restore OpenFHE
-        id: openfhe
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .ci/openfhe
-          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
-
-      # FIDESlib resolves ../deps relative to the directory CMake runs in, so
-      # configure from build/.
-      - name: Configure
-        env:
-          CUDA_PATH: ${{ steps.env.outputs.cuda_path }}
-        run: |
-          mkdir -p build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCUDA_PATH="$CUDA_PATH" \
-            -DFIDESLIB_ARCH=120-real \
-            -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
-            -DFIDESLIB_INSTALL_OPENFHE=${{ steps.openfhe.outputs.cache-hit == 'true' && 'OFF' || 'ON' }} \
-            -DOPENFHE_INSTALL_PREFIX="$OPENFHE_DIR"
-
-      # Saved before the build and tests, so a failing test does not throw away
-      # a finished OpenFHE build.
-      - name: Save OpenFHE
-        if: steps.openfhe.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .ci/openfhe
-          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
-
-      - name: Build
-        id: build
-        run: cmake --build build -j "$(nproc)" --target fideslib-test
-
-      # The test binary of this job defines the tests of every source file. Each one declared for a
-      # backend (test/TestRegistration.hpp) has to be registered on one of them: a condition no backend
-      # satisfies leaves a test that runs nowhere. Listing the tests starts no backend.
-      - name: Check that every test is registered on some backend
-        working-directory: build
-        run: python3 ../.github/scripts/check_coverage.py --binary ./fideslib-test --sources ../test/*.cpp ../test/*.cu
-
-      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
-      # unless told otherwise; cuda makes them exercise the CUDA engine, which
-      # is what this job is for. The CPU backend has its own job in ci.yml.
-      - name: Test
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt "${args[@]}"
-
-      # The concurrent-operations suite, in a process of its own: the library reads
-      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
-      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
-      # It runs even when the default-mode suite failed, so both results are reported.
-      # Every test gets a process of its own: a CUDA error leaves the context unusable for
-      # the rest of the process, so one crash would otherwise hide every test after it.
-      - name: Test concurrent operations
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
-
-      # The lane tests again, together in ONE process, three times over, with no retry. A race
-      # between the threads of the concurrent mode shows only there: in the pass above every test
-      # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
-      # allocator's cross-stream reuse on event dependencies broke exactly that way (see
-      # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
-      # StagedLanesMatchSerial is the family that showed it most often.
-      # A crash here hides the tests after it in this pass, but the pass above runs each of them.
-      - name: Test concurrent operations in one process
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
-            --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
-
-      # The pool stress suite again with the per-stream device memory pool, which is opt-in
-      # (FIDESLIB_POOL_PER_STREAM=1, read once at the first allocation) and so never runs in the
-      # passes above. The suite's tests share one process, three times over, with no retry: a
-      # failure that depends on what an earlier test left in the pool shows only that way. It runs
-      # even when an earlier pass failed, so every result is reported.
-      - name: Test the per-stream memory pool
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_POOL_PER_STREAM: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pool-per-stream \
-            --only 'PoolStressTest.*' \
-            --title 'GPU test suite, per-stream memory pool' --repeat 3 --retries 0
-
-      # What every pass ran, in one table, with the reasons of the tests that skipped themselves.
-      # The passes above write their own sections; this adds the totals.
-      - name: Test totals
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        run: |
-          python3 -I ../.github/scripts/test_summary.py --strict --title "Test results: GPU backend, totals" \
-            --row "Default suite=gpu-results/gate.xml" \
-            --row "Concurrent operations, one process per test=gpu-results/concurrent/gate/*.xml" \
-            --row "Concurrent lanes together=gpu-results/concurrent-one-process/gate.xml" \
-            --row "Per-stream memory pool=gpu-results/pool-per-stream/gate.xml"
-
-      - name: Upload test reports
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpu-test-reports
-          path: build/gpu-results/
+          name: copybench
+          path: copybench.log
           retention-days: 14
           if-no-files-found: ignore
