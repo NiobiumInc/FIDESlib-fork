@@ -2,6 +2,7 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include <cstdlib>
 #include "AddSub.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
@@ -9,6 +10,22 @@
 #include "ModMult.cuh"
 #include "NTT.cuh"
 #include "Rotation.cuh"
+
+// PROBE (not for merge): FIDESLIB_PROBE_UPLOAD_DELAY_US=N puts an N-microsecond spin kernel on a limb's
+// stream in front of every host-to-device upload, to widen the window in which a plaintext or key is still
+// being written.
+static __global__ void probe_upload_delay_spin(const long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) {
+    }
+}
+static long long ProbeUploadDelayCycles() {
+    static const long long cycles = [] {
+        const char* env = std::getenv("FIDESLIB_PROBE_UPLOAD_DELAY_US");
+        return (env != nullptr && env[0] != '\0') ? std::atoll(env) * 2000LL : 0LL;
+    }();
+    return cycles;
+}
 
 namespace FIDESlib::CKKS {
 template <typename T> uint32_t Limb<T>::GetGridDimX() const {
@@ -116,6 +133,8 @@ template <typename T> template <typename Q> void Limb<T>::load(const std::vector
         dat = dat_;
     }
 
+    if (const long long probe_cycles = ProbeUploadDelayCycles(); probe_cycles > 0)
+        probe_upload_delay_spin<<<1, 1, 0, stream.ptr()>>>(probe_cycles);
     cudaMemcpyAsync(v.data, dat.data(), dat.size() * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
 }
 

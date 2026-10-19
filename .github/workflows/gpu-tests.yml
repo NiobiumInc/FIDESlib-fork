@@ -149,42 +149,40 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # PROBE (not for merge): the same test on upstream's code, with and without each switch.
-      - name: Probe, upstream code as it is
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-        run: |
-          ./fideslib-test --gtest_filter='MultPtFenceProbes/*' 2>&1 | tee probe-u0.log || true
-
-      - name: Probe, plaintexts on pooled streams
-        if: ${{ !cancelled() }}
+      # PROBE (not for merge): which of upstream's operations read a plaintext or a key without waiting
+      # for its stream. Each suite runs in its own process, so one crash does not hide the rest.
+      - name: Amplified suites on upstream, pooled streams, no fence fix
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
           FIDESLIB_PROBE_POOLED_PT: '1'
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
         run: |
-          ./fideslib-test --gtest_filter='MultPtFenceProbes/*' 2>&1 | tee probe-u1.log || true
-
-      - name: Probe, plaintexts on pooled streams and the multPt fence
+          bash ../probe-run-suites.sh u1
+      - name: Amplified suites on upstream, pooled streams, with the multPt fence
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
           FIDESLIB_PROBE_POOLED_PT: '1'
           FIDESLIB_PROBE_MULTPT_FENCE: '1'
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
         run: |
-          ./fideslib-test --gtest_filter='MultPtFenceProbes/*' 2>&1 | tee probe-u2.log || true
-          for f in probe-u0 probe-u1 probe-u2; do
-            echo "== $f" >> "$GITHUB_STEP_SUMMARY"
-            grep -E '^\[probe\]|^\[  (PASSED|FAILED)' $f.log >> "$GITHUB_STEP_SUMMARY" || true
-          done
+          bash ../probe-run-suites.sh u2
+      - name: Control, upload delay on the legacy stream
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
+        run: |
+          bash ../probe-run-suites.sh u0
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: probe-upstream
-          path: build/probe-u*.log
+          path: build/probe-*
           retention-days: 14
           if-no-files-found: ignore
