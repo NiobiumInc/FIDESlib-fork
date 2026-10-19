@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "ProbeTimers.cuh"
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
 #include "CKKS/BootstrapPrecomputation.cuh"
@@ -2417,8 +2418,10 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			continue;
 		}
 		double best = 1e300, best_build = 0, best_rest = 0;
+		std::vector<double> best_phase_ms(ProbeTimers::kCount, 0.0), best_phase_calls(ProbeTimers::kCount, 0.0);
 		for (int rep = 0; rep < kReps; ++rep) {
 			cudaDeviceSynchronize();
+			ProbeTimers::Reset();
 			const auto t0 = std::chrono::steady_clock::now();
 			std::atomic<int> failures{ 0 };
 			double host_construct_ms = 0, host_rest_ms = 0;
@@ -2489,7 +2492,18 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 				best	   = ms;
 				best_build = host_construct_ms;
 				best_rest  = host_rest_ms;
+				for (int k = 0; k < ProbeTimers::kCount; ++k) {
+					best_phase_ms[k]	= ProbeTimers::ns[k].load() / 1e6;
+					best_phase_calls[k] = static_cast<double>(ProbeTimers::calls[k].load());
+				}
 			}
+		}
+		if (producers == 0) {
+			static const char* const names[] = { "pt_load", "grow", "generate", "gpumalloc", "gpufree", "upload_loop", "memcpy_call" };
+			std::cout << "[bench] prefetch-phases mode=" << (concurrent ? "concurrent" : "default") << " total_ms=" << best;
+			for (int k = 0; k < ProbeTimers::kCount; ++k)
+				std::cout << " " << names[k] << "_ms=" << best_phase_ms[k] << " " << names[k] << "_n=" << static_cast<long long>(best_phase_calls[k]);
+			std::cout << std::endl;
 		}
 		if (producers == 0)
 			std::cout << "[bench] prefetch-host-time mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)

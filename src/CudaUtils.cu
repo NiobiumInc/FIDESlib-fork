@@ -2,6 +2,7 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include "ProbeTimers.cuh"
 #include "CudaUtils.cuh"
 #include <atomic>
 #include <deque>
@@ -2190,6 +2191,7 @@ unsigned long long PoolNullStreamEvents() {
 #define MEMPOOL true
 // void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
+	ProbeTimers::Scope probe_scope(ProbeTimers::kGPUmalloc);
 	void* ptr = nullptr;
 
 	uint64_t MBs = 1024;
@@ -2415,6 +2417,7 @@ constexpr size_t kPoolQuarantineBytes = 24ull << 30; // 24 GiB held back before 
 } // namespace
 
 void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
+	ProbeTimers::Scope probe_scope(ProbeTimers::kGPUfree);
 
 	if (bytes < 64 * 1024) {
 		int next_pow2 = 1024;

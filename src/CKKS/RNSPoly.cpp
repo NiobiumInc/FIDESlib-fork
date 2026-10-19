@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 25/04/24.
 //
+#include "ProbeTimers.cuh"
 #include <errno.h>
 #include "CudaUtils.cuh"
 
@@ -961,16 +962,22 @@ void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const
 	}
 
 	assert(limbsize <= cc.L + 1);
-	if (level < limbsize - 1) {
-		grow(limbsize - 1, false, true);
-	} else {
-		dropToLevel(limbsize - 1);
+	{
+		ProbeTimers::Scope probe_scope(ProbeTimers::kGrow);
+		if (level < limbsize - 1) {
+			grow(limbsize - 1, false, true);
+		} else {
+			dropToLevel(limbsize - 1);
+		}
 	}
 	assert(level == limbsize - 1);
-	for (int i = 0; i < limbsize; ++i) {
-		assert(moduli[i] == cc.prime.at(i).p);
-		cudaSetDevice(GPU[cc.limbGPUid[i].x].device);
-		SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y], load_convert(data[i]));
+	{
+		ProbeTimers::Scope probe_scope(ProbeTimers::kUploadLoop);
+		for (int i = 0; i < limbsize; ++i) {
+			assert(moduli[i] == cc.prime.at(i).p);
+			cudaSetDevice(GPU[cc.limbGPUid[i].x].device);
+			SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y], load_convert(data[i]));
+		}
 	}
 
 	if ((int)data.size() > limbsize) {

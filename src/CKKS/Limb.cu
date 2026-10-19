@@ -2,6 +2,7 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include "ProbeTimers.cuh"
 #include "AddSub.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
@@ -133,6 +134,7 @@ template <typename T> template <typename Q> void Limb<T>::load(const std::vector
 	if constexpr (std::is_same_v<T, Q>) {
 		// No conversion needed: no intermediate at all.
 		const size_t bytes = dat_.size() * sizeof(T);
+		ProbeTimers::Scope probe_scope(ProbeTimers::kMemcpyCall);
 		if (!PinnedStagingUpload(v.data, dat_.data(), bytes, v.device, st))
 			cudaMemcpyAsync(v.data, dat_.data(), bytes, cudaMemcpyHostToDevice, st);
 	} else {

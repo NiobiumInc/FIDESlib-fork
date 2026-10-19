@@ -2,6 +2,7 @@
 // Created by carlosad on 25/04/24.
 //
 
+#include "ProbeTimers.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/Plaintext.cuh"
@@ -63,6 +64,7 @@ Plaintext::Plaintext(Context& cc, const RawPlainText& raw)
 }
 
 void Plaintext::load(const RawPlainText& raw) {
+	ProbeTimers::Scope probe_scope(ProbeTimers::kPtLoad);
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	c0.loadConstant(raw.sub_0, raw.moduli);

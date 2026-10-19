@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include "ProbeTimers.cuh"
 #include <algorithm>
 #include "CudaUtils.cuh"
 #include <array>
@@ -1235,7 +1236,10 @@ void LimbPartition::generateLimbConstant() {
 
 	// limb.clear();
 	// generate(meta, limb, limbptr, (int)limbsize - 1, &auxptr, bufferLIMB, 0, nullptr, 0);
-	generate(meta, limb, limbptr, (int)limbsize - 1, nullptr /*&auxptr*/, nullptr, 0, nullptr, 0);
+	{
+		ProbeTimers::Scope probe_scope(ProbeTimers::kGenerate);
+		generate(meta, limb, limbptr, (int)limbsize - 1, nullptr /*&auxptr*/, nullptr, 0, nullptr, 0);
+	}
 }
 
 void LimbPartition::aliasLimbsOf(const LimbPartition& src) {
