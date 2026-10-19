@@ -211,86 +211,18 @@ jobs:
         working-directory: build
         run: python3 ../.github/scripts/check_coverage.py --binary ./fideslib-test --sources ../test/*.cpp ../test/*.cu
 
-      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
-      # unless told otherwise; cuda makes them exercise the CUDA engine, which
-      # is what this job is for. The CPU backend has its own job in ci.yml.
-      - name: Test
+      # PROBE (not for merge): the paths that read plaintexts and key-switching keys, five times over
+      # in one process with no retry, with FIDESLIB_PROBE_POOLED_PT=1 (set for the whole workflow).
+      - name: Stress, plaintext and key paths on pooled streams
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
         run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt "${args[@]}"
-
-      # The concurrent-operations suite, in a process of its own: the library reads
-      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
-      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
-      # It runs even when the default-mode suite failed, so both results are reported.
-      # Every test gets a process of its own: a CUDA error leaves the context unusable for
-      # the rest of the process, so one crash would otherwise hide every test after it.
-      - name: Test concurrent operations
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
-
-      # The lane tests again, together in ONE process, three times over, with no retry. A race
-      # between the threads of the concurrent mode shows only there: in the pass above every test
-      # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
-      # allocator's cross-stream reuse on event dependencies broke exactly that way (see
-      # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
-      # StagedLanesMatchSerial is the family that showed it most often.
-      # A crash here hides the tests after it in this pass, but the pass above runs each of them.
-      - name: Test concurrent operations in one process
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
-            --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
-
-      # The pool stress suite again with the per-stream device memory pool, which is opt-in
-      # (FIDESLIB_POOL_PER_STREAM=1, read once at the first allocation) and so never runs in the
-      # passes above. The suite's tests share one process, three times over, with no retry: a
-      # failure that depends on what an earlier test left in the pool shows only that way. It runs
-      # even when an earlier pass failed, so every result is reported.
-      - name: Test the per-stream memory pool
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_POOL_PER_STREAM: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pool-per-stream \
-            --only 'PoolStressTest.*' \
-            --title 'GPU test suite, per-stream memory pool' --repeat 3 --retries 0
-
-      # What every pass ran, in one table, with the reasons of the tests that skipped themselves.
-      # The passes above write their own sections; this adds the totals.
-      - name: Test totals
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        run: |
-          python3 -I ../.github/scripts/test_summary.py --strict --title "Test results: GPU backend, totals" \
-            --row "Default suite=gpu-results/gate.xml" \
-            --row "Concurrent operations, one process per test=gpu-results/concurrent/gate/*.xml" \
-            --row "Concurrent lanes together=gpu-results/concurrent-one-process/gate.xml" \
-            --row "Per-stream memory pool=gpu-results/pool-per-stream/gate.xml"
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
+            --title 'GPU stress, plaintext and key paths on pooled streams' --repeat 5 --retries 0
 
       - name: Upload test reports
         if: always()
