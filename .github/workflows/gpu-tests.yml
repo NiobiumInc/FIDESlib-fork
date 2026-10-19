@@ -204,25 +204,67 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # The test binary of this job defines the tests of every source file. Each one declared for a
-      # backend (test/TestRegistration.hpp) has to be registered on one of them: a condition no backend
-      # satisfies leaves a test that runs nowhere. Listing the tests starts no backend.
-      - name: Check that every test is registered on some backend
-        working-directory: build
-        run: python3 ../.github/scripts/check_coverage.py --binary ./fideslib-test --sources ../test/*.cpp ../test/*.cu
-
-      # PROBE (not for merge): the paths that read plaintexts and key-switching keys, five times over
-      # in one process with no retry, with FIDESLIB_PROBE_POOLED_PT=1 (set for the whole workflow).
-      - name: Stress, plaintext and key paths on pooled streams
+      # PROBE (not for merge). FIDESLIB_PROBE_POOLED_PT=1 is set for the whole workflow.
+      # 1. Control: the upload delay without the pooled streams. Plaintexts sit on the legacy stream, which
+      #    orders everything, so nothing may fail.
+      - name: Control, upload delay on the legacy stream (pooled streams off)
+        if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'GPU stress, plaintext and key paths on pooled streams' --repeat 5 --retries 0
+            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*' \
+            --title 'Control: upload delay, plaintexts on the legacy stream' --retries 0
+
+      # 2. The amplifier: pooled streams plus the upload delay, over the whole default suite.
+      - name: Amplified, pooled streams with an upload delay (whole suite)
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: '30'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/amplified \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --title 'Amplified: pooled streams, 30 us upload delay' --retries 0
+
+      # 3. The test the stress run could not repeat, without the change.
+      - name: Repeat the context-lifetime tests, pooled streams off
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+        run: |
+          ./fideslib-test --gtest_filter='ContextLifetimeTest.*' --gtest_repeat=3 2>&1 | tee gpu-results/repeat-off.log || true
+          grep -E 'FAILED  \]|PASSED  \]|Repeating all tests' gpu-results/repeat-off.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      # 4. Loading keys, with and without the change.
+      - name: Key loading, legacy stream
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+        run: |
+          ./fideslib-test --gtest_filter='KeyLoadProbes/*' 2>&1 | tee gpu-results/keyload-off.log || true
+          grep '^\[bench\]' gpu-results/keyload-off.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Key loading, pooled streams
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '1'
+        run: |
+          ./fideslib-test --gtest_filter='KeyLoadProbes/*' 2>&1 | tee gpu-results/keyload-on.log || true
+          grep '^\[bench\]' gpu-results/keyload-on.log >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload test reports
         if: always()
