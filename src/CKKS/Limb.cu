@@ -135,8 +135,25 @@ template <typename T> template <typename Q> void Limb<T>::load(const std::vector
 		// No conversion needed: no intermediate at all.
 		const size_t bytes = dat_.size() * sizeof(T);
 		ProbeTimers::Scope probe_scope(ProbeTimers::kMemcpyCall);
+		const auto probe_t0 = std::chrono::steady_clock::now();
 		if (!PinnedStagingUpload(v.data, dat_.data(), bytes, v.device, st))
 			cudaMemcpyAsync(v.data, dat_.data(), bytes, cudaMemcpyHostToDevice, st);
+		ProbeTimers::RecordCopy(reinterpret_cast<void*>(st), std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - probe_t0).count());
+		{
+			// What kind of stream and destination: sampled, to keep the probe cheap.
+			static std::atomic<int> probe_sampled{ 0 };
+			if (probe_sampled.fetch_add(1) % 64 == 0) {
+				unsigned flags = 0;
+				const bool legacy = (st == nullptr || st == cudaStreamLegacy || st == cudaStreamPerThread);
+				const bool ok = !legacy && cudaStreamGetFlags(st, &flags) == cudaSuccess;
+				ProbeTimers::RecordStreamKind(legacy, ok && (flags & cudaStreamNonBlocking));
+				cudaPointerAttributes att{};
+				if (cudaPointerGetAttributes(&att, v.data) == cudaSuccess)
+					ProbeTimers::RecordDstType(static_cast<int>(att.type));
+				else
+					cudaGetLastError();
+			}
+		}
 	} else {
 		// Widths differ, so a converted staging vector is unavoidable. It is sized to the full limb
 		// and zero-filled, so a short input leaves the tail zeroed; the previous version looped to

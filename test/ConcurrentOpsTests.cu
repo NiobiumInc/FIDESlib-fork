@@ -2417,6 +2417,7 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			std::cout << "[bench] prefetch mode=default producers=" << producers << " skipped (needs FIDESLIB_CONCURRENT_OPS=1)" << std::endl;
 			continue;
 		}
+		std::string best_copy_line;
 		double best = 1e300, best_build = 0, best_rest = 0;
 		std::vector<double> best_phase_ms(ProbeTimers::kCount, 0.0), best_phase_calls(ProbeTimers::kCount, 0.0);
 		for (int rep = 0; rep < kReps; ++rep) {
@@ -2492,6 +2493,7 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 				best	   = ms;
 				best_build = host_construct_ms;
 				best_rest  = host_rest_ms;
+				best_copy_line = ProbeTimers::CopyStatsLine();
 				for (int k = 0; k < ProbeTimers::kCount; ++k) {
 					best_phase_ms[k]	= ProbeTimers::ns[k].load() / 1e6;
 					best_phase_calls[k] = static_cast<double>(ProbeTimers::calls[k].load());
@@ -2504,6 +2506,7 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			for (int k = 0; k < ProbeTimers::kCount; ++k)
 				std::cout << " " << names[k] << "_ms=" << best_phase_ms[k] << " " << names[k] << "_n=" << static_cast<long long>(best_phase_calls[k]);
 			std::cout << std::endl;
+			std::cout << "[bench] prefetch-copies mode=" << (concurrent ? "concurrent" : "default") << " " << best_copy_line << std::endl;
 		}
 		if (producers == 0)
 			std::cout << "[bench] prefetch-host-time mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
