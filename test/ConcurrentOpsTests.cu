@@ -2412,6 +2412,29 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 		cudaDeviceSynchronize();
 	}
 
+	// PROBE: in the supported mode a plaintext's limbs live on the legacy default stream. Let them live on
+	// pooled streams instead (as the concurrent mode does) and check, first, that the result is
+	// bit-identical to the legacy-stream one.
+	if (!concurrent) {
+		std::vector<FIDESlib::CKKS::RawCipherText> ref(kDistinct), alt(kDistinct);
+		for (const bool pooled : { false, true }) {
+			ProbeTimers::pooled_plaintext_streams = pooled;
+			for (int k = 0; k < kDistinct; ++k) {
+				FIDESlib::CKKS::Plaintext pt(GPUcc_, raw_pt[k]);
+				FIDESlib::CKKS::Ciphertext ct(GPUcc_);
+				ct.copy(shared_src);
+				ct.multPt(pt, true);
+				ct.store(pooled ? alt[k] : ref[k]);
+			}
+		}
+		for (int k = 0; k < kDistinct; ++k)
+			ExpectRawEqual(ref[k], alt[k], "plaintext " + std::to_string(k) + " on pooled streams");
+		std::cout << "[bench] pooled-plaintext-streams correctness checked on " << kDistinct << " plaintexts" << std::endl;
+		ProbeTimers::pooled_plaintext_streams = false;
+	}
+
+	for (int pooled_pt = 0; pooled_pt <= (concurrent ? 0 : 1); ++pooled_pt) {
+	ProbeTimers::pooled_plaintext_streams = pooled_pt != 0;
 	for (const int producers : { 0, 1, 2, 4, 8, 24 }) {
 		if (producers > 0 && !concurrent) {
 			std::cout << "[bench] prefetch mode=default producers=" << producers << " skipped (needs FIDESLIB_CONCURRENT_OPS=1)" << std::endl;
@@ -2502,17 +2525,17 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 		}
 		if (producers == 0) {
 			static const char* const names[] = { "pt_load", "grow", "generate", "gpumalloc", "gpufree", "upload_loop", "memcpy_call" };
-			std::cout << "[bench] prefetch-phases mode=" << (concurrent ? "concurrent" : "default") << " total_ms=" << best;
+			std::cout << "[bench] prefetch-phases mode=" << (concurrent ? "concurrent" : "default") << " pooled_pt=" << pooled_pt << " total_ms=" << best;
 			for (int k = 0; k < ProbeTimers::kCount; ++k)
 				std::cout << " " << names[k] << "_ms=" << best_phase_ms[k] << " " << names[k] << "_n=" << static_cast<long long>(best_phase_calls[k]);
 			std::cout << std::endl;
-			std::cout << "[bench] prefetch-copies mode=" << (concurrent ? "concurrent" : "default") << " " << best_copy_line << std::endl;
+			std::cout << "[bench] prefetch-copies mode=" << (concurrent ? "concurrent" : "default") << " pooled_pt=" << pooled_pt << " " << best_copy_line << std::endl;
 		}
 		if (producers == 0)
-			std::cout << "[bench] prefetch-host-time mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+			std::cout << "[bench] prefetch-host-time mode=" << (concurrent ? "concurrent" : "default") << " pooled_pt=" << pooled_pt << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
 					  << " total_ms=" << best << " host_build_ms=" << best_build << " host_rest_ms=" << best_rest << std::endl;
 		const double bytes_each = static_cast<double>(raw_pt[0].numRes) * raw_pt[0].N * sizeof(uint64_t);
-		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+		std::cout << "[bench] prefetch mode=" << (concurrent ? "concurrent" : "default") << " pooled_pt=" << pooled_pt << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
 				  << " producers=" << producers << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
 				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
 	}
@@ -2539,10 +2562,12 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 		}
 		const double bytes_each = static_cast<double>(raw_pt[0].numRes) * raw_pt[0].N * sizeof(uint64_t);
-		std::cout << "[bench] prefetch-one-thread mode=" << (concurrent ? "concurrent" : "default") << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
+		std::cout << "[bench] prefetch-one-thread mode=" << (concurrent ? "concurrent" : "default") << " pooled_pt=" << pooled_pt << " pinned=" << (FIDESlib::PinnedStagingEnabled() ? 1 : 0)
 				  << " lookahead=" << lookahead << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
 				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
 	}
+	} // pooled_pt
+	ProbeTimers::pooled_plaintext_streams = false;
 	cudaDeviceSynchronize();
 	for (void* ptr : registered)
 		cudaHostUnregister(ptr);

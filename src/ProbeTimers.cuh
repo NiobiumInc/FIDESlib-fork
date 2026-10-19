@@ -67,6 +67,8 @@ inline std::string CopyStatsLine() {
 	return o.str();
 }
 
+inline std::atomic<bool> pooled_plaintext_streams{ false };
+
 inline void Reset() {
 	{
 		std::lock_guard<std::mutex> lk(copy_mutex);

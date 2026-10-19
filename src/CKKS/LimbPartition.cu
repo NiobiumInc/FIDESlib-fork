@@ -155,7 +155,7 @@ void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
 /// `ConcurrentOps()` is one cached bool.
 Stream initStream(bool default_) {
 	Stream s;
-	if (default_ && !ConcurrentOps()) {
+	if (default_ && !ConcurrentOps() && !ProbeTimers::pooled_plaintext_streams.load()) {
 		s.initDefault();
 	} else {
 		s.init(50);
