@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -89,9 +90,23 @@ void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
     return malloc;
 }
 
+// PROBE (not for merge): environment switches, read once.
+static bool ProbeFlag(const char* name) {
+    const char* env = std::getenv(name);
+    return env != nullptr && env[0] == '1';
+}
+static bool ProbePooledPlaintextStreams() {
+    static const bool enabled = ProbeFlag("FIDESLIB_PROBE_POOLED_PT");
+    return enabled;
+}
+static bool ProbeMultPtFence() {
+    static const bool enabled = ProbeFlag("FIDESLIB_PROBE_MULTPT_FENCE");
+    return enabled;
+}
+
 Stream initStream(bool default_) {
     Stream s;
-    if (default_) {
+    if (default_ && !ProbePooledPlaintextStreams()) {
         s.initDefault();
     } else {
         s.init(50);
@@ -784,6 +799,10 @@ void LimbPartition::multPt(const LimbPartition& p, int slots) {
     assert(limbsize <= p.limb.size());
     assert(limbsize > 1);
     cudaSetDevice(device);
+    // PROBE: the fork's fix, switchable. Wait for the plaintext's stream before reading it, and below
+    // make its stream wait for this read.
+    if (ProbeMultPtFence())
+        s.wait(p.getS());
 
     constexpr bool capture = false;
     static std::map<int, cudaGraphExec_t> exec_map;
@@ -815,6 +834,8 @@ void LimbPartition::multPt(const LimbPartition& p, int slots) {
         //     limb.pop_back();
         // }
     }
+    if (ProbeMultPtFence())
+        p.getS().wait(s);
 }
 
 void LimbPartition::modup(LimbPartition& aux_partition) {
