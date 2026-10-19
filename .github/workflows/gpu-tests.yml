@@ -213,14 +213,9 @@ jobs:
           mkdir -p gpu-results
           configs=(
             "d-base|"
-            "d-arena|FIDESLIB_PT_ARENA=1"
-            "d-poolstream|FIDESLIB_POOL_PER_STREAM=1"
-            "d-pinned|FIDESLIB_PINNED_STAGING=1"
-            "d-pinned-arena|FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1"
-            "d-pinned-poolstream|FIDESLIB_PINNED_STAGING=1 FIDESLIB_POOL_PER_STREAM=1"
-            "d-pinned-arena-poolstream|FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1 FIDESLIB_POOL_PER_STREAM=1"
+            "d-registered|FIDESLIB_BENCH_REGISTER=1"
             "c-pinned|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_PINNED_STAGING=1"
-            "c-pinned-arena|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_PINNED_STAGING=1 FIDESLIB_PT_ARENA=1"
+            "c-registered|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_BENCH_REGISTER=1"
           )
           for c in "${configs[@]}"; do
             name=${c%%|*}

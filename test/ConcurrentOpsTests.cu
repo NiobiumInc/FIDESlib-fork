@@ -2370,6 +2370,23 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 			y[i] = 0.05 * (k + 2) * (i + 2);
 		raw_pt.push_back(FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots)));
 	}
+	// FIDESLIB_BENCH_REGISTER=1: pin the plaintexts' host limbs in place with cudaHostRegister. The
+	// same-width load path hands those very buffers to cudaMemcpyAsync, so with pinned sources the
+	// copy is a plain DMA the calling thread does not perform. The buffers outlive every upload below.
+	std::vector<void*> registered;
+	if (const char* env = std::getenv("FIDESLIB_BENCH_REGISTER"); env != nullptr && env[0] == '1') {
+		for (auto& pt : raw_pt)
+			for (auto& limb : pt.sub_0) {
+				const cudaError_t err = cudaHostRegister(limb.data(), limb.size() * sizeof(uint64_t), cudaHostRegisterDefault);
+				if (err != cudaSuccess) {
+					std::cout << "[bench] cudaHostRegister failed: " << cudaGetErrorString(err) << std::endl;
+					cudaGetLastError();
+					break;
+				}
+				registered.push_back(limb.data());
+			}
+		std::cout << "[bench] registered " << registered.size() << " host limbs" << std::endl;
+	}
 	std::vector<double> x(8);
 	for (int i = 0; i < 8; ++i)
 		x[i] = 0.1 * (i + 1);
@@ -2509,6 +2526,9 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 				  << " lookahead=" << lookahead << " items=" << kItems << " plaintext_MiB=" << bytes_each / (1024.0 * 1024.0) << " best_ms=" << best
 				  << " upload_GBps=" << (bytes_each * kItems / 1e9) / (best / 1e3) << std::endl;
 	}
+	cudaDeviceSynchronize();
+	for (void* ptr : registered)
+		cudaHostUnregister(ptr);
 	CKKS::DeregisterAllContexts();
 	ClearCachedContexts();
 }
