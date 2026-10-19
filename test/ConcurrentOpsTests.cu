@@ -2376,8 +2376,14 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 	const FIDESlib::CKKS::RawCipherText raw_in =
 	  FIDESlib::CKKS::GetRawCipherText(cc, cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(x, 1, 0, nullptr, numSlots)));
 
+	// The source ciphertext lives on the device, as in a real circuit: each item copies it there and
+	// does not upload it again. (An earlier version of this probe rebuilt it from the host every
+	// time, which added a large pageable upload to the consumer.)
+	FIDESlib::CKKS::Ciphertext shared_src(GPUcc_, raw_in);
+	cudaDeviceSynchronize();
 	auto consume = [&](const FIDESlib::CKKS::Plaintext& pt) {
-		FIDESlib::CKKS::Ciphertext ct(GPUcc_, raw_in);
+		FIDESlib::CKKS::Ciphertext ct(GPUcc_);
+		ct.copy(shared_src);
 		ct.multPt(pt, true);
 	};
 
