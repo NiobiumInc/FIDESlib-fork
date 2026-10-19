@@ -2356,7 +2356,7 @@ TEST_P(ConcurrentBenchTest, ThroughputByIssuingThreads) {
 // different thread from the one that took it. P = 0 is the supported mode: one thread does both,
 // one item after the other.
 TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
-	const std::vector<int> rot_index{ 1 };
+	const std::vector<int> rot_index{ 1, 2, 3, 4 };
 	int numSlots = 0;
 	FIDESlib::CKKS::Context GPUcc_ = Prepare(rot_index, numSlots);
 
@@ -2399,10 +2399,29 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 	// time, which added a large pageable upload to the consumer.)
 	FIDESlib::CKKS::Ciphertext shared_src(GPUcc_, raw_in);
 	cudaDeviceSynchronize();
+	// FIDESLIB_BENCH_WORK=matvec: the consumer does what one diagonal of a matrix-vector product does,
+	// a rotation (key switch), the multiply by the plaintext and an accumulation. Otherwise just the multiply.
+	const bool matvec = [] {
+		const char* env = std::getenv("FIDESLIB_BENCH_WORK");
+		return env != nullptr && std::string(env) == "matvec";
+	}();
+	FIDESlib::CKKS::Ciphertext acc(GPUcc_);
+	std::atomic<int> work_counter{ 0 };
 	auto consume = [&](const FIDESlib::CKKS::Plaintext& pt) {
 		FIDESlib::CKKS::Ciphertext ct(GPUcc_);
 		ct.copy(shared_src);
+		int n = 0;
+		if (matvec) {
+			n = work_counter++;
+			ct.rotate(rot_index[n % rot_index.size()]);
+		}
 		ct.multPt(pt, true);
+		if (matvec) {
+			if (n % 16 == 0)
+				acc.copy(ct);
+			else
+				acc.add(ct);
+		}
 	};
 
 	const bool concurrent = FIDESlib::ConcurrentOps();

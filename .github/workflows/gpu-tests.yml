@@ -212,9 +212,10 @@ jobs:
         run: |
           mkdir -p gpu-results
           configs=(
-            "d-base|"
-            "d-registered|FIDESLIB_BENCH_REGISTER=1"
-            "c-registered|FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_BENCH_REGISTER=1"
+            "m-d-base|FIDESLIB_BENCH_WORK=matvec"
+            "m-d-registered|FIDESLIB_BENCH_WORK=matvec FIDESLIB_BENCH_REGISTER=1"
+            "m-c-registered|FIDESLIB_BENCH_WORK=matvec FIDESLIB_BENCH_REGISTER=1 FIDESLIB_CONCURRENT_OPS=1"
+            "m-c-pinned|FIDESLIB_BENCH_WORK=matvec FIDESLIB_CONCURRENT_OPS=1 FIDESLIB_PINNED_STAGING=1"
           )
           for c in "${configs[@]}"; do
             name=${c%%|*}
