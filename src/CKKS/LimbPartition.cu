@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include <cstdlib>
 #include <algorithm>
 #include "CudaUtils.cuh"
 #include <array>
@@ -152,9 +153,19 @@ void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
 /// priority as every other partition, and the fences the surrounding code already asks for become
 /// real ones. Nothing is locked, no atomic is added and nothing is synchronized to do it:
 /// `ConcurrentOps()` is one cached bool.
+/// PROBE (not for merge): FIDESLIB_PROBE_POOLED_PT=1 gives a `def_stream` partition a pooled stream in
+/// the default mode too. Read once.
+static bool ProbePooledPlaintextStreams() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_POOLED_PT");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 Stream initStream(bool default_) {
 	Stream s;
-	if (default_ && !ConcurrentOps()) {
+	if (default_ && !ConcurrentOps() && !ProbePooledPlaintextStreams()) {
 		s.initDefault();
 	} else {
 		s.init(50);

@@ -43,6 +43,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # PROBE (not for merge): plaintexts and key-switching keys on pooled streams in every pass.
+  FIDESLIB_PROBE_POOLED_PT: '1'
   # Patched OpenFHE, installed by deps/build.sh when CMake runs with
   # FIDESLIB_INSTALL_OPENFHE=ON, and cached per OS and compiler.
   OPENFHE_DIR: ${{ github.workspace }}/.ci/openfhe
