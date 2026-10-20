@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 1/10/25.
 //
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,6 +16,15 @@
 #include "NTT.cuh"
 #include "Rotation.cuh"
 #include "VectorGPU.cuh"
+
+// PROBE (not for merge): FIDESLIB_PROBE_FIX_PT_FENCES=1 waits for every plaintext's stream, not just the first.
+static bool ProbeFixPlaintextFences() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_FIX_PT_FENCES");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
 
 namespace FIDESlib::CKKS {
 
@@ -438,7 +448,15 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 	// cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
 	UploadH2D(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, in[0]->device, s.ptr());
 	s.wait(out[0]->s);
-	s.wait(pt[0]->s);
+	if (ProbeFixPlaintextFences()) {
+		// PROBE: every diagonal has a stream of its own once plaintexts sit on pooled streams, so the
+		// kernels below have to wait for all of them, not only the first.
+		for (LimbPartition* p : pt)
+			if (p != nullptr)
+				s.wait(p->s);
+	} else {
+		s.wait(pt[0]->s);
+	}
 
 	// The diagonal bases the kernels read: the resident table when there is one, otherwise the
 	// slice of the per-call table we just filled. Nothing downstream can tell the difference.
@@ -518,7 +536,13 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 		}
 	}
 	out[0]->s.wait(s);
-	pt[0]->s.wait(s);
+	if (ProbeFixPlaintextFences()) {
+		for (LimbPartition* p : pt)
+			if (p != nullptr)
+				p->s.wait(s);
+	} else {
+		pt[0]->s.wait(s);
+	}
 	if (!persist_tables)
 		FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }

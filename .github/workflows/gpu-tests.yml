@@ -204,30 +204,87 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      - name: Whole suite, GPU suite, pooled streams and both delays
+      - name: LT, plaintext delay only, fix off
+        if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '1'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/lt-pt \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'CKKSTest.LinearTransform*:CKKSTest.ConvolutionTransform*:PreparedLtTest.*' \
+            --title 'LT plaintext delay' --retries 0
+
+      - name: LT, key delay only, fix off
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/lt-key \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'CKKSTest.LinearTransform*:CKKSTest.ConvolutionTransform*:PreparedLtTest.*' \
+            --title 'LT key delay' --retries 0
+
+      - name: LT, both delays, fix off
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
           FIDESLIB_PROBE_PT_DELAY_US: '1000'
           FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pooled \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/lt-both \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --title 'GPU suite, pooled streams and both delays' --retries 0
+            --only 'CKKSTest.LinearTransform*:CKKSTest.ConvolutionTransform*:PreparedLtTest.*' \
+            --title 'LT both delays' --retries 0
+
+      - name: LT, both delays, fix on
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+          FIDESLIB_PROBE_FIX_PT_FENCES: '1'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/lt-fixed \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'CKKSTest.LinearTransform*:CKKSTest.ConvolutionTransform*:PreparedLtTest.*' \
+            --title 'LT both delays, fixed' --retries 0
+
+      - name: LT, legacy stream, both delays
+        if: ${{ !cancelled() }}
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/lt-control \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --only 'CKKSTest.LinearTransform*:CKKSTest.ConvolutionTransform*:PreparedLtTest.*' \
+            --title 'LT control' --retries 0
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: reports-pooled
+          name: reports-lt
           path: build/gpu-results/
           retention-days: 14
           if-no-files-found: ignore
 
-  gpu_control:
-    name: GPU suite, legacy stream and both delays
+  gpu_whole:
+    name: GPU suite, pooled streams and both delays
     needs: changes
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
@@ -334,24 +391,24 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      - name: Whole suite, GPU suite, legacy stream and both delays
+      - name: Whole suite, fix on, pooled streams, both delays
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '0'
           FIDESLIB_PROBE_PT_DELAY_US: '1000'
           FIDESLIB_PROBE_KEY_DELAY_US: '200'
+          FIDESLIB_PROBE_FIX_PT_FENCES: '1'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/whole-fixed \
             --not-applicable ../.github/tests-not-applicable/cuda.txt \
             --gaps ../.github/tests-known-gaps/cuda.txt \
-            --title 'GPU suite, legacy stream and both delays' --retries 0
+            --title 'Whole suite, fixed fences, delays' --retries 0
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: reports-control
+          name: reports-whole
           path: build/gpu-results/
           retention-days: 14
           if-no-files-found: ignore
