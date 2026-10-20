@@ -137,6 +137,69 @@ static Result Run(Mem mem, Strm sk, double kernel_us, long long cycles_per_us, i
 	return r;
 }
 
+// What registering host memory costs: allocate and touch `total` bytes, register them (one call per limb
+// or one call for the whole block), unregister, free. Times in milliseconds.
+static void RegisterCost(const char* kind, bool huge, bool per_limb, size_t total) {
+	using clk = std::chrono::steady_clock;
+	const auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	const size_t align = huge ? (size_t(2) << 20) : size_t(4096);
+	const auto t0	   = clk::now();
+	void* base		   = std::aligned_alloc(align, total);
+	if (base == nullptr) {
+		std::printf("[copy-reg] kind=%s total_MiB=%zu allocation failed\n", kind, total >> 20);
+		return;
+	}
+	if (huge)
+		madvise(base, total, MADV_HUGEPAGE);
+	std::memset(base, 1, total);
+	const auto t1 = clk::now();
+	size_t calls  = 0;
+	cudaError_t err = cudaSuccess;
+	if (per_limb) {
+		for (size_t off = 0; off < total && err == cudaSuccess; off += kLimbBytes, ++calls)
+			err = cudaHostRegister(static_cast<char*>(base) + off, kLimbBytes, cudaHostRegisterDefault);
+	} else {
+		err = cudaHostRegister(base, total, cudaHostRegisterDefault);
+		calls = 1;
+	}
+	const auto t2 = clk::now();
+	if (err != cudaSuccess) {
+		std::printf("[copy-reg] kind=%s total_MiB=%zu register failed after %zu calls: %s\n", kind, total >> 20, calls, cudaGetErrorString(err));
+		cudaGetLastError();
+	}
+	if (per_limb) {
+		for (size_t off = 0, n = 0; n < calls && off < total; off += kLimbBytes, ++n)
+			cudaHostUnregister(static_cast<char*>(base) + off);
+	} else if (err == cudaSuccess) {
+		cudaHostUnregister(base);
+	}
+	const auto t3 = clk::now();
+	std::free(base);
+	const auto t4 = clk::now();
+	const double gib = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
+	std::printf("[copy-reg] kind=%-22s total_MiB=%-5zu calls=%-6zu alloc_touch_ms=%8.1f register_ms=%8.1f unregister_ms=%8.1f free_ms=%7.1f register_ms_per_GiB=%7.1f register_us_per_call=%8.1f\n", kind, total >> 20, calls, ms(t0, t1), ms(t1, t2),
+	  ms(t2, t3), ms(t3, t4), ms(t1, t2) / gib, ms(t1, t2) * 1000.0 / static_cast<double>(calls));
+	std::fflush(stdout);
+}
+
+static void PinnedAllocCost(size_t total) {
+	using clk = std::chrono::steady_clock;
+	const auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	void* p		  = nullptr;
+	const auto t0 = clk::now();
+	cudaError_t err = cudaHostAlloc(&p, total, cudaHostAllocDefault);
+	if (err == cudaSuccess)
+		std::memset(p, 1, total);
+	const auto t1 = clk::now();
+	if (err == cudaSuccess)
+		cudaFreeHost(p);
+	const auto t2 = clk::now();
+	if (err != cudaSuccess)
+		cudaGetLastError();
+	std::printf("[copy-reg] kind=%-22s total_MiB=%-5zu alloc_touch_ms=%8.1f free_ms=%7.1f %s\n", "cudaHostAlloc", total >> 20, ms(t0, t1), ms(t1, t2), err == cudaSuccess ? "" : cudaGetErrorString(err));
+	std::fflush(stdout);
+}
+
 int main() {
 	int dev = 0;
 	CK(cudaSetDevice(dev));
@@ -201,6 +264,15 @@ int main() {
 		std::printf("[copy] mem=%-12s stream=%-11s pending_kernel_us=%-5g p50_us=%7.2f p90_us=%7.2f p99_us=%8.2f max_us=%8.2f copy_calls_ms=%7.2f wall_ms=%7.2f\n", Name(Mem::RegisteredHuge), "blocking",
 		  kernel_us, best.p50, best.p90, best.p99, best.max, best.copy_ms, best.wall_ms);
 		std::fflush(stdout);
+	}
+	// The price of registering the host buffers, which the runs above did not include.
+	for (const size_t mib : { size_t(256), size_t(1024), size_t(4096) }) {
+		const size_t total = mib << 20;
+		RegisterCost("normal, per limb", false, true, total);
+		RegisterCost("normal, one block", false, false, total);
+		RegisterCost("huge pages, per limb", true, true, total);
+		RegisterCost("huge pages, one block", true, false, total);
+		PinnedAllocCost(total);
 	}
 	return 0;
 }
