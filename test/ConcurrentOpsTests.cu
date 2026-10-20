@@ -52,6 +52,36 @@
 
 using namespace FIDESlib::CKKS;
 
+// PROBE (not for merge): while ProbeHugeAllocScope is alive, every allocation of 256 KiB or more comes from
+// a 2 MiB-aligned block that is advised to use huge pages. Used to build host buffers that
+// cudaHostRegister can pin on huge pages.
+#include <sys/mman.h>
+#include <atomic>
+#include <cstdlib>
+#include <new>
+std::atomic<bool> g_probe_huge_alloc{ false };
+void* operator new(std::size_t size) {
+	void* p = nullptr;
+	if (g_probe_huge_alloc.load(std::memory_order_relaxed) && size >= (256u << 10)) {
+		const std::size_t huge = std::size_t(2) << 20;
+		const std::size_t rounded = ((size + huge - 1) / huge) * huge;
+		p = std::aligned_alloc(huge, rounded);
+		if (p != nullptr)
+			madvise(p, rounded, MADV_HUGEPAGE);
+	} else {
+		p = std::malloc(size == 0 ? 1 : size);
+	}
+	if (p == nullptr)
+		throw std::bad_alloc();
+	return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+struct ProbeHugeAllocScope {
+	explicit ProbeHugeAllocScope(bool on) { g_probe_huge_alloc.store(on); }
+	~ProbeHugeAllocScope() { g_probe_huge_alloc.store(false); }
+};
+
 namespace FIDESlib::Testing {
 
 namespace {
@@ -2365,17 +2395,33 @@ TEST_P(ConcurrentBenchTest, PrefetchPipeline) {
 	constexpr size_t kQueueDepth = 32;
 	constexpr int kReps = 3;
 	std::vector<FIDESlib::CKKS::RawPlainText> raw_pt;
+	const bool bench_huge = [] {
+		const char* env = std::getenv("FIDESLIB_BENCH_REGISTER");
+		return env != nullptr && std::string(env) == "huge";
+	}();
 	for (int k = 0; k < kDistinct; ++k) {
 		std::vector<double> y(8);
 		for (int i = 0; i < 8; ++i)
 			y[i] = 0.05 * (k + 2) * (i + 2);
-		raw_pt.push_back(FIDESlib::CKKS::GetRawPlainText(cc, cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots)));
+		auto pt_host = cc->MakeCKKSPackedPlaintext(y, 1, 0, nullptr, numSlots);
+		ProbeHugeAllocScope huge_scope(bench_huge);
+		raw_pt.push_back(FIDESlib::CKKS::GetRawPlainText(cc, pt_host));
 	}
-	// FIDESLIB_BENCH_REGISTER=1: pin the plaintexts' host limbs in place with cudaHostRegister. The
+	if (bench_huge) {
+		size_t aligned = 0, total = 0;
+		for (auto& pt : raw_pt)
+			for (auto& limb : pt.sub_0) {
+				++total;
+				if (reinterpret_cast<uintptr_t>(limb.data()) % (2u << 20) == 0)
+					++aligned;
+			}
+		std::cout << "[bench] huge-page host limbs: " << aligned << " of " << total << " are 2 MiB aligned" << std::endl;
+	}
+	// FIDESLIB_BENCH_REGISTER=1 or huge: pin the plaintexts' host limbs in place with cudaHostRegister. The
 	// same-width load path hands those very buffers to cudaMemcpyAsync, so with pinned sources the
 	// copy is a plain DMA the calling thread does not perform. The buffers outlive every upload below.
 	std::vector<void*> registered;
-	if (const char* env = std::getenv("FIDESLIB_BENCH_REGISTER"); env != nullptr && env[0] == '1') {
+	if (const char* env = std::getenv("FIDESLIB_BENCH_REGISTER"); env != nullptr && (env[0] == '1' || std::string(env) == "huge")) {
 		for (auto& pt : raw_pt)
 			for (auto& limb : pt.sub_0) {
 				const cudaError_t err = cudaHostRegister(limb.data(), limb.size() * sizeof(uint64_t), cudaHostRegisterDefault);
