@@ -204,94 +204,47 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # PROBE (not for merge). FIDESLIB_PROBE_POOLED_PT=1 is set for the whole workflow. The runner's VM is
-      # reclaimed after about 90 minutes, so this job is kept well under that.
-      - name: Pooled streams, plaintext uploads delayed
+      # PROBE (not for merge): why the repeated stress run did not finish with the change off.
+      - name: Stress off-1
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_PT_DELAY_US: '1000'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-pt \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Pooled, plaintext delay' --retries 0
+          bash ../probe-stress.sh off-1 1 0 900
 
-      - name: Pooled streams, key uploads delayed
+      - name: Stress on-1
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-key \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Pooled, key delay' --retries 0
+          bash ../probe-stress.sh on-1 1 1 900
 
-      - name: Pooled streams, both delayed, bootstrap suite
+      - name: Stress off-3
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_PT_DELAY_US: '1000'
-          FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/b-boot \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEBootstrapTests/*' \
-            --title 'Pooled, both delays, bootstrap' --retries 0
+          bash ../probe-stress.sh off-3 3 0 1200
 
-      - name: Control, both delayed, legacy stream
+      - name: Stress on-3
         if: ${{ !cancelled() }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '0'
-          FIDESLIB_PROBE_PT_DELAY_US: '1000'
-          FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Control: legacy stream, both delays' --retries 0
-
-      - name: Stress, five repetitions, change off
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '0'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress-off \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Stress, change off' --retries 0 --repeat 5
-
-      - name: Stress, five repetitions, change on
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_PROBE_POOLED_PT: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/stress-on \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt \
-            --only 'OpenFHEInterfaceTests/OpenFHEInterfaceTest.*:*ApiParity*:*CKKSRotateMany*:*AccumulateBroadcast*:*ChebyshevFixedManualCoworker*:*ContextLifetime*' \
-            --title 'Stress, change on' --retries 0 --repeat 5
+          bash ../probe-stress.sh on-3 3 1 1200
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gpu-test-reports
-          path: build/gpu-results/
+          path: |
+            build/gpu-results/
+            build/stress-*.log
+            build/probe-stress.summary
           retention-days: 14
           if-no-files-found: ignore
