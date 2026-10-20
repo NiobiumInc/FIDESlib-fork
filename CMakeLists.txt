@@ -735,6 +735,8 @@ if (FIDESLIB_COMPILE_TESTS)
             list(FILTER TEST_SOURCE EXCLUDE REGEX "/(Microbench|PeerUtilsTests)\\.(cu|cpp)$")
         endif ()
         set_source_files_properties(${TEST_SOURCE} PROPERTIES LANGUAGE CUDA)
+        # PROBE (not for merge): the operator new replacement is host-only code.
+        set_source_files_properties(${TEST_SOURCE_DIR}/ProbeHugeAlloc.cpp PROPERTIES LANGUAGE CXX)
 
         add_executable(fideslib-test)
 
