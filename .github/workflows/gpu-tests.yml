@@ -97,7 +97,7 @@ jobs:
               '.github/scripts/gpu_suite.py' '.github/scripts/needs_tests.py' '.github/no-test-paths.txt'
 
   gpu:
-    name: GPU test suite (RTX PRO 6000)
+    name: GPU suite, pooled streams and both delays
     needs: changes
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
@@ -204,47 +204,155 @@ jobs:
         id: build
         run: cmake --build build -j "$(nproc)" --target fideslib-test
 
-      # PROBE (not for merge): why the repeated stress run did not finish with the change off.
-      - name: Stress off-1
-        if: ${{ !cancelled() }}
+      - name: Whole suite, GPU suite, pooled streams and both delays
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '1'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
         run: |
-          bash ../probe-stress.sh off-1 1 0 900
-
-      - name: Stress on-1
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-        run: |
-          bash ../probe-stress.sh on-1 1 1 900
-
-      - name: Stress off-3
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-        run: |
-          bash ../probe-stress.sh off-3 3 0 1200
-
-      - name: Stress on-3
-        if: ${{ !cancelled() }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-        run: |
-          bash ../probe-stress.sh on-3 3 1 1200
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pooled \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --title 'GPU suite, pooled streams and both delays' --retries 0
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpu-test-reports
-          path: |
-            build/gpu-results/
-            build/stress-*.log
-            build/probe-stress.summary
+          name: reports-pooled
+          path: build/gpu-results/
           retention-days: 14
           if-no-files-found: ignore
+
+  gpu_control:
+    name: GPU suite, legacy stream and both delays
+    needs: changes
+    # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
+    # and merges whose changes cannot affect a test result. A failed decision
+    # runs it.
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.run != 'false' &&
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain and GPU
+        id: env
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+          nvcc --version | tail -2
+          gcc --version | head -1
+          cmake --version | head -1
+          . /etc/os-release
+          {
+            echo "cuda=$(nvcc --version | sed -nE 's/.*release ([0-9]+\.[0-9]+).*/\1/p')"
+            echo "cuda_path=$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+            echo "distro=ubuntu${VERSION_ID//./}"
+            echo "toolchain=${ID}${VERSION_ID}-gcc$(gcc -dumpversion)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The GPU test suite includes nccl.h. Install the NCCL build for the
+      # runner's CUDA version from NVIDIA's apt repository, after checking the
+      # keyring package's hash. The keyring goes through apt-get, not dpkg -i,
+      # because dpkg does not wait for a lock another process holds.
+      - name: Install NCCL
+        env:
+          CUDA_VERSION: ${{ steps.env.outputs.cuda }}
+          DISTRO: ${{ steps.env.outputs.distro }}
+        run: |
+          case "$DISTRO" in
+            ubuntu2404) sum=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba ;;
+            ubuntu2204) sum=d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df ;;
+            *) echo "::error::no known hash for NVIDIA's keyring package on $DISTRO"; exit 1 ;;
+          esac
+          curl -fsSLo cuda-keyring.deb \
+            "https://developer.download.nvidia.com/compute/cuda/repos/$DISTRO/x86_64/cuda-keyring_1.1-1_all.deb"
+          echo "$sum  cuda-keyring.deb" | sha256sum -c -
+          # A fresh VM can still be running apt on its own (unattended upgrades,
+          # first-boot setup). Wait, up to 10 minutes, while a process holds apt's
+          # or dpkg's lock files open; apt itself also waits as long for dpkg's
+          # lock. This checks the locks, not process names: the unattended-upgrades
+          # shutdown daemon runs all the time under the same name without a lock.
+          command -v fuser > /dev/null || echo "::warning::fuser not found: not waiting for apt's and dpkg's locks"
+          waited=0
+          while [ "$waited" -lt 600 ] &&
+            sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock > /dev/null 2>&1; do
+            sleep 5
+            waited=$((waited + 5))
+          done
+          echo "Waited ${waited}s for apt's and dpkg's locks."
+          apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
+          "${apt[@]}" install -y ./cuda-keyring.deb
+          "${apt[@]}" update
+          suffix="+cuda$CUDA_VERSION"
+          ver=$(apt-cache madison libnccl-dev |
+                awk -v s="$suffix" 'substr($3, length($3) - length(s) + 1) == s { print $3; exit }')
+          if [ -z "$ver" ]; then
+            echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION"
+            exit 1
+          fi
+          "${apt[@]}" install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
+
+      - name: Restore OpenFHE
+        id: openfhe
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      # FIDESlib resolves ../deps relative to the directory CMake runs in, so
+      # configure from build/.
+      - name: Configure
+        env:
+          CUDA_PATH: ${{ steps.env.outputs.cuda_path }}
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_PATH="$CUDA_PATH" \
+            -DFIDESLIB_ARCH=120-real \
+            -DFIDESLIB_COMPILE_BENCHMARKS=OFF \
+            -DFIDESLIB_INSTALL_OPENFHE=${{ steps.openfhe.outputs.cache-hit == 'true' && 'OFF' || 'ON' }} \
+            -DOPENFHE_INSTALL_PREFIX="$OPENFHE_DIR"
+
+      # Saved before the build and tests, so a failing test does not throw away
+      # a finished OpenFHE build.
+      - name: Save OpenFHE
+        if: steps.openfhe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci/openfhe
+          key: openfhe-${{ steps.env.outputs.toolchain }}-${{ hashFiles('deps/build.sh', 'deps/*.patch') }}
+
+      - name: Build
+        id: build
+        run: cmake --build build -j "$(nproc)" --target fideslib-test
+
+      - name: Whole suite, GPU suite, legacy stream and both delays
+        working-directory: build
+        env:
+          FIDESLIB_TEST_BACKEND: cuda
+          FIDESLIB_PROBE_POOLED_PT: '0'
+          FIDESLIB_PROBE_PT_DELAY_US: '1000'
+          FIDESLIB_PROBE_KEY_DELAY_US: '200'
+        run: |
+          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/control \
+            --not-applicable ../.github/tests-not-applicable/cuda.txt \
+            --gaps ../.github/tests-known-gaps/cuda.txt \
+            --title 'GPU suite, legacy stream and both delays' --retries 0
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reports-control
+          path: build/gpu-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
