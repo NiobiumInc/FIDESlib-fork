@@ -2,13 +2,20 @@ THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 ============================================================
 
 Project: FIDESlib-fork
-Generated: 2026-10-18
+Generated: 2026-10-24
 Tool: SCANOSS (snippet detection with License dataset)
-Components: 63
+Components: 64
 
 This file lists all third-party software components detected
 in this repository, along with their licenses and copyright
 notices as required by those licenses.
+
+------------------------------------------------------------
+
+WARNING: The following component(s) have no license information.
+These require manual review to determine licensing terms.
+
+  - goog-coredumper/google-perftools (https://sourceforge.net/projects/goog-coredumper/google-perftools)
 
 ------------------------------------------------------------
 
@@ -223,14 +230,84 @@ COMPONENT ATTRIBUTIONS
   Source: https://github.com/kirya23/fall_semester_programing
   PURL: pkg:github/kirya23/fall_semester_programing
   Copyright:
+    Copyright 1963-1965 Jane Doe Joe Blow John Coe
+    Copyright 1995-2003 Jean-loup Gailly and Mark Adler
+    Copyright 1995-2003 by Jean-loup Gailly
+    Copyright 1995-2010 Geodan Amsterdam  the Netherlands
+    Copyright 1995-2017 Jean-loup Gailly and Mark Adler
+    Copyright 1995-2022 Jean-loup Gailly and Mark Adler
+    Copyright 1996-2019 Julian R Seward. All
+    Copyright 1996-2019 Julian Seward  jseward@acm.org
+    Copyright 1998 by Bob Dellaca
+    Copyright 1998 by Jacques Nomssi Nzali
     Copyright 2000-2001 ; University of Notre Dame.
+    Copyright 2000-2011 Joerg Walter Mathias Koch David Bellot
+    Copyright 2001-2006 CrystalClear Software Inc
+    Copyright 2001-2014 Gennadiy Rozental. br
+    Copyright 2002 Vladimir Prus
     Copyright 2002-2003 ; Trustees of Indiana University.
+    Copyright 2002-2006 CrystalClear Software Inc
+    Copyright 2002-2006 Marcin Kalicinski br
+    Copyright 2003 Jeremy B. Maitin-Shepard
+    Copyright 2003 Vladimir Prus
+    Copyright 2003 by Cosmin Truta
+    Copyright 2003-2017 Beman Dawes
+    Copyright 2003-2024 Christopher M. Kohlhoff  chris at kohlhoff dot com
+    Copyright 2004 Vladimir Prus
+    Copyright 2005 Vladimir Prus
+    Copyright 2005-2008 Daniel James
+    Copyright 2006 Andy Tompkins
+    Copyright 2006 Marcin Kalicinski
+    Copyright 2006 Vladimir Prus
+    Copyright 2006-2010 John Maddock and Paul A. Bristow
+    Copyright 2006-2021 Emil Dotchevski. Distributed under the [Boost Software License Version 1.0] http:  www.boost.org LICENSE_1_0.txt
+    Copyright 2007 Vladimir Prus
+    Copyright 2007-2011 Barend Gehrels Amsterdam  the Netherlands
+    Copyright 2007-2013 Barend Gehrels Amsterdam  the Netherlands
     Copyright 2008 Google Inc
+    Copyright 2008 Jurko Gospodnetic
+    Copyright 2008 Paul A. Bristow John Maddock
+    Copyright 2008-2011 Bruno Lalande Paris  France
+    Copyright 2008-2013 Bruno Lalande Paris  France
+    Copyright 2008-2023 Emil Dotchevski and Reverge Studios Inc. Distributed under the [Boost Software License Version 1.0] http:  www.boost.
+    Copyright 2009 Sebastian Redl
+    Copyright 2009-2011 Mateusz Loskot London  UK
+    Copyright 2009-2013 Mateusz Loskot London  UK
+    Copyright 2010-2001 Timequake man
+    Copyright 2013 Christian Henning
+    Copyright 2013-2020 Boost.Test team
+    Copyright 2013-2022 Niels Lohmann
     Copyright 2014 Grav
     Copyright 2014 fqiang
+    Copyright 2015 John Maddock and Paul A. Bristow
     Copyright 2015-2016 Barrett Adair
+    Copyright 2016 John Maddock. Distributed under the Boost
     Copyright 2016 MATHIEU CORNIC
+    Copyright 2016 Nicolas Seriot
+    Copyright 2017 James E. King III
+    Copyright 2017 Rene Rivera
     Copyright 2017 Valere JEANTET
+    Copyright 2018 Joe Blow John Coe
+    Copyright 2018 John Maddock. Distributed under the Boost
+    Copyright 2018 Paul Fultz II
+    Copyright 2018 Peter Dimov
+    Copyright 2018-2021 Peter Dimov
+    Copyright 2018-2022 Peter Dimov
+    Copyright 2018-2023 Emil Dotchevski and Reverge Studios Inc. Distributed under the http:  www.boost.org LICENSE_1_0.txt[Boost Software Li
+    Copyright 2019 Damian Jarek
+    Copyright 2020 Peter Dimov
+    Copyright 2022 Christian Mazakas
+    Copyright 2022 Peter Dimov
+    Copyright 2022-2023 Christian Mazakas
+    Copyright 2022-2023 Peter Dimov
+    Copyright 2022-2023 Peter Dimov and Matt Borland and is distributed under
+    Copyright 2022-2024 Joaqu iacute;n M L oacute;pez Mu ntilde;oz
+    Copyright 2023 Alan de Freitas  alandefreitas@gmail.com)
+    Copyright 2023 Peter Dimov
+    Copyright 2023 Ren   Ferdinand Rivera Morell; Copyright Vladimir Prus; Copyright Jurko Gospodnetic
+    Copyright 2024 Braden Ganetsky
+    Copyright 2024 Christian Mazakas
+    Copyright 2024 Peter Dimov
     Copyright 2007; Google Inc.
   License: Apache-2.0, BSD-3-Clause
 
@@ -365,6 +442,12 @@ COMPONENT ATTRIBUTIONS
   Copyright:
     Copyright (c) 2014; Randolph Voorhies; Shane Grant
   License: BSD-3-Clause, BSL-1.0, MIT
+
+  goog-coredumper/google-perftools
+  Version: 0.1
+  Source: https://sourceforge.net/projects/goog-coredumper/google-perftools
+  PURL: pkg:sourceforge/goog-coredumper/google-perftools
+  License: UNKNOWN — requires manual review
 
   google-testmock
   Version: 1.14.0
@@ -561,9 +644,12 @@ COMPONENT ATTRIBUTIONS
     Copyright 1995-2024 Jean-loup Gailly and Mark Adler
     Copyright 1995-2026 Jean-loup Gailly and Mark Adler
     Copyright 1996-1997 Andreas Dilger
+    Copyright 1996-1997 Andreas Dilger are derived from libpng-0.88
     Copyright 1996-2010 the NASM Authors - All rights reserved
     Copyright 1998 Todd C. Miller  lt;Todd.Miller@courtesan.com gt;
+    Copyright 1998-2000 Glenn Randers-Pehrson are derived from
     Copyright 1998-2011 The OpenSSL Project.  All rights reserved.
+    Copyright 1999 Pai-Hsiang Hsiao
     Copyright 1999-2000 Ross Bencina and Phil Burk
     Copyright 2000 Dug Song  lt;dugsong@monkey.org gt;
     Copyright 2000-2007 Niels Provos  lt;provos@citi.umich.edu gt;
@@ -575,6 +661,7 @@ COMPONENT ATTRIBUTIONS
     Copyright 2003 Michael A. Davis  lt;mike@datanerds.net gt;
     Copyright 2003-2004 ; Mark Borgerding
     Copyright 2004 the University Corporation for Atmospheric
+    Copyright 2005 David Turner
     Copyright 2005 Steve Underwood
     Copyright 2005-2008 ; The Android Open Source Project
     Copyright 2005-2017 ; Xiph.Org Foundation
@@ -611,12 +698,14 @@ COMPONENT ATTRIBUTIONS
     Copyright 2017 ; The Android Open Source Project
     Copyright 2017 ; The CRC32C Authors.
     Copyright 2017 Roman Lebedev. All rights reserved
+    Copyright 2018-2019 Cosmin Truta
     Copyright 2019 Yibo Cai
     Copyright 2019 Zenichi Amano
     Copyright 2022 ; Google Inc.
     Copyright 2022 Google LLC
     Copyright 2023 The Chromium Authors
     Copyright 2024 The Bazel Authors
+    Copyright 2025 The syntaqlite Authors. All rights reserved
     Copyright 2016 Ismael Jimenez Martinez
     Copyright copyright owner or entity authorized by
   License: Apache-2.0
