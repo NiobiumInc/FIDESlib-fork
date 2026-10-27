@@ -102,11 +102,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arm: A-legacy,           pooled: '0', before: '1', after: '1', delay: '2000', key: '300000', keyb: '300000',  war: '1', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
-          - { arm: C-both-fences,      pooled: '1', before: '1', after: '1', delay: '2000', key: '300000', keyb: '300000',  war: '1', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
-          - { arm: D-no-amplifier,     pooled: '1', before: '1', after: '1', delay: '0',    key: '0',      keyb: '0',       war: '0', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
-          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', filter: '*RotateManyTest.*' }
-          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', filter: '*RotateManyTest.*' }
+          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
@@ -234,6 +231,7 @@ jobs:
           FIDESLIB_PROBE_KEY_B_DELAY_US: ${{ matrix.keyb }}
           FIDESLIB_PROBE_BATCH_KSKB_FENCE: ${{ matrix.kskb }}
           FILTER: ${{ matrix.filter }}
+          EACH: ${{ matrix.each }}
           FIDESLIB_PROBE_WAR: ${{ matrix.war }}
           # multPt's own fences off in every arm: upstream's multPt has none.
           FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
@@ -245,8 +243,20 @@ jobs:
           mkdir -p gpu-results
           log=gpu-results/arm-$ARM.log
           start=$(date +%s)
-          timeout 2700 ./fideslib-test --gtest_filter="$filter" --gtest_output=xml:gpu-results/arm-$ARM.xml > "$log" 2>&1
-          rc=$?
+          if [ "$EACH" = 1 ]; then
+            # One process per test: the fixture builds its context and keys once per suite, so only
+            # a process's first test runs inside the key amplifier's window.
+            ./fideslib-test --gtest_filter="$filter" --gtest_list_tests |
+              awk '/^[^ ]/{suite=$1} /^  /{print suite $1}' > gpu-results/cases.txt
+            rc=0; : > "$log"; n=0
+            while read -r t; do
+              n=$((n+1))
+              timeout 300 ./fideslib-test --gtest_filter="$t" --gtest_output=xml:gpu-results/case-$n.xml >> "$log" 2>&1 || rc=1
+            done < gpu-results/cases.txt
+          else
+            timeout 2700 ./fideslib-test --gtest_filter="$filter" --gtest_output=xml:gpu-results/arm-$ARM.xml > "$log" 2>&1
+            rc=$?
+          fi
           end=$(date +%s)
           {
             echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
