@@ -760,6 +760,9 @@ class Event;
 
 extern std::map<void*, int> free;
 
+/// PROBE (not for merge): Stream::init(kProbeOwnStreamPriority) gives the object a private stream.
+constexpr int kProbeOwnStreamPriority = -1000;
+
 class Stream {
   private:
 	cudaStream_t ptr_ = nullptr;

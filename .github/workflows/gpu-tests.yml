@@ -232,6 +232,7 @@ jobs:
           FIDESLIB_PROBE_BATCH_KSKB_FENCE: ${{ matrix.kskb }}
           FILTER: ${{ matrix.filter }}
           EACH: ${{ matrix.each }}
+          FIDESLIB_PROBE_KEY_B_OWN_STREAM: '1'
           FIDESLIB_PROBE_WAR: ${{ matrix.war }}
           # multPt's own fences off in every arm: upstream's multPt has none.
           FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
@@ -259,7 +260,7 @@ jobs:
           fi
           end=$(date +%s)
           {
-            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
+            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE kskb_own_stream=$FIDESLIB_PROBE_KEY_B_OWN_STREAM war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
             echo
             echo "ran: $(grep -c '^\[ RUN      \]' "$log"), ok: $(grep -c '^\[       OK \]' "$log"), skipped: $(grep -c '^\[  SKIPPED \]' "$log")"
             grep -E '^\[  (PASSED|FAILED) +\] [0-9]+' "$log"

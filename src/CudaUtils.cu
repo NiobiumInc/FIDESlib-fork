@@ -1447,7 +1447,12 @@ void Stream::init(int priority) {
 	cudaGetDevice(&dev);
 	// DIAGNOSTIC (privstreams): a stream of this object's own, blocking like the pool's, instead
 	// of one of the POOL_SIZE shared handles. See ConcurrentOpsDiag::kPrivStreams.
-	if (ConcurrentOpsDiagOn(ConcurrentOpsDiag::kPrivStreams) && PrivStreamsPrioAllowed(priority)) {
+	if (priority == kProbeOwnStreamPriority) {
+		// PROBE (not for merge): a non-blocking stream of this object's own, outside the shared
+		// pool, so no other polynomial's stream can order work against it by accident.
+		cudaStreamCreateWithFlags(&ptr_, cudaStreamNonBlocking);
+		owned_ = true;
+	} else if (ConcurrentOpsDiagOn(ConcurrentOpsDiag::kPrivStreams) && PrivStreamsPrioAllowed(priority)) {
 		cudaStreamCreateWithPriority(&ptr_, 0, priority);
 		owned_ = true;
 	} else if (ConcurrentOpsDiagOn(ConcurrentOpsDiag::kLanePool) && (ptr_ = lanePoolStream(dev, MemPoolLane())) != nullptr) {

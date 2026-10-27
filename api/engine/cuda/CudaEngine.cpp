@@ -96,6 +96,28 @@ void usePooledStreams(FIDESlib::CKKS::RNSPoly& poly) {
 	cudaSetDevice(current);
 }
 
+/// PROBE (not for merge): FIDESLIB_PROBE_KEY_B_OWN_STREAM=1 puts the b half of every key on a
+/// private stream (CudaUtils.cuh kProbeOwnStreamPriority), so only a reader that waits on ksk.b's
+/// own stream is ordered after its upload: the 37 shared pool streams otherwise chain unrelated
+/// polynomials together and hide a missing wait.
+void useOwnStreams(FIDESlib::CKKS::RNSPoly& poly) {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_KEY_B_OWN_STREAM");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (!enabled) {
+		usePooledStreams(poly);
+		return;
+	}
+	int current = 0;
+	cudaGetDevice(&current);
+	for (auto& part : poly.GPU) {
+		cudaSetDevice(part.device);
+		part.s.init(FIDESlib::kProbeOwnStreamPriority);
+	}
+	cudaSetDevice(current);
+}
+
 /// PROBE (not for merge): race amplifier over every limb of a polynomial just loaded (ProbeSpin.cuh).
 void probeScramble(FIDESlib::CKKS::RNSPoly& poly, long long cycles = FIDESlib::ProbeUploadDelayCycles()) {
 	if (cycles <= 0)
@@ -1664,7 +1686,7 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		auto raw_eval_ksk = FIDESlib::CKKS::GetEvalKeySwitchKey(pkImpl);
 		FIDESlib::CKKS::KeySwitchingKey eval_ksk(c);
 		usePooledStreams(eval_ksk.a);
-		usePooledStreams(eval_ksk.b);
+		useOwnStreams(eval_ksk.b);
 		eval_ksk.Initialize(raw_eval_ksk);
 		probeScramble(eval_ksk.a, FIDESlib::ProbeKeyDelayCycles());
 		probeScramble(eval_ksk.b, FIDESlib::ProbeKeyBDelayCycles());
@@ -1675,7 +1697,7 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		auto raw_rot_ksk = FIDESlib::CKKS::GetRotationKeySwitchKey(pkImpl, step);
 		FIDESlib::CKKS::KeySwitchingKey rot_ksk(c);
 		usePooledStreams(rot_ksk.a);
-		usePooledStreams(rot_ksk.b);
+		useOwnStreams(rot_ksk.b);
 		rot_ksk.Initialize(raw_rot_ksk);
 		probeScramble(rot_ksk.a, FIDESlib::ProbeKeyDelayCycles());
 		probeScramble(rot_ksk.b, FIDESlib::ProbeKeyBDelayCycles());
