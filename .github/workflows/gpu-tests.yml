@@ -102,8 +102,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
-          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '0',      keyb: '25000000', war: '0', kskb: '0', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '0',      keyb: '25000000', war: '0', kskb: '1', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
