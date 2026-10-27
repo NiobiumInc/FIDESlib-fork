@@ -20,6 +20,7 @@
 #include "CKKS/forwardDefs.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "CudaUtils.cuh"
+#include "ProbeSpin.cuh" // PROBE (not for merge)
 
 #include <algorithm>
 #include <any>
@@ -46,6 +47,83 @@ std::shared_ptr<FIDESlib::CKKS::Ciphertext> deviceCt(const Ciphertext<DCRTPoly>&
 std::shared_ptr<FIDESlib::CKKS::Plaintext> devicePt(const Plaintext& pt) {
 	return std::any_cast<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(pt->device);
 }
+
+/// @brief Whether plaintexts and key-switching keys this engine builds go on pooled streams.
+///
+/// The library builds both with `def_stream`, i.e. on the legacy default stream, whose implicit
+/// synchronization orders their uploads against everything else. FIDESLIB_ADAPTER_POOLED_STREAMS=1
+/// moves the ones this engine constructs onto ordinary pooled streams instead (the partition's
+/// stream is public and `Stream::init` re-initializes a default one), so their uploads overlap with
+/// other work. The library code is untouched; the ordering the legacy stream gave for free is then
+/// supplied by the fences below.
+bool adapterPooledStreams() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_ADAPTER_POOLED_STREAMS");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
+/// @brief FIDESLIB_ADAPTER_FENCES=0 drops the fences while keeping the pooled streams (the
+/// probe's negative control: it must fail, or the amplified runs prove nothing).
+bool adapterFences() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_ADAPTER_FENCES");
+		return !(env != nullptr && env[0] == '0');
+	}();
+	return adapterPooledStreams() && enabled;
+}
+
+/// @brief Puts every partition of a freshly constructed, still empty polynomial on a pooled stream.
+void usePooledStreams(FIDESlib::CKKS::RNSPoly& poly) {
+	int current = 0;
+	cudaGetDevice(&current);
+	for (auto& part : poly.GPU) {
+		cudaSetDevice(part.device);
+		if (adapterPooledStreams())
+			part.s.init(50);
+		FIDESlib::ProbeUploadDelay(part.s.ptr());
+	}
+	cudaSetDevice(current);
+}
+
+/// @brief Orders device work on ciphertexts against the plaintexts it reads.
+///
+/// Construction makes every ciphertext partition wait for the plaintexts' partitions on the same
+/// GPU (their uploads must land first); destruction makes every plaintext partition wait for the
+/// ciphertexts' (their memory must not be rewritten or freed under a read still in flight). The
+/// library's operations launch on, or join into, the ciphertext's streams, so these two edges
+/// bracket every read of the plaintexts. A no-op unless the plaintexts are on pooled streams.
+class PlaintextFence {
+  public:
+	PlaintextFence(std::vector<FIDESlib::CKKS::Ciphertext*> cts, std::vector<FIDESlib::CKKS::Plaintext*> pts)
+	: cts_(std::move(cts)), pts_(std::move(pts)) {
+		if (!adapterFences())
+			return;
+		for (auto* ct : cts_)
+			for (auto* pt : pts_)
+				for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
+					ct->c0.GPU[g].s.wait(pt->c0.GPU[g].s);
+					ct->c1.GPU[g].s.wait(pt->c0.GPU[g].s);
+				}
+	}
+	~PlaintextFence() {
+		if (!adapterFences())
+			return;
+		for (auto* pt : pts_)
+			for (auto* ct : cts_)
+				for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
+					pt->c0.GPU[g].s.wait(ct->c0.GPU[g].s);
+					pt->c0.GPU[g].s.wait(ct->c1.GPU[g].s);
+				}
+	}
+	PlaintextFence(const PlaintextFence&)			 = delete;
+	PlaintextFence& operator=(const PlaintextFence&) = delete;
+
+  private:
+	std::vector<FIDESlib::CKKS::Ciphertext*> cts_;
+	std::vector<FIDESlib::CKKS::Plaintext*> pts_;
+};
 
 /// @brief Widest EvalRotateMany batch the CUDA engine issues in one launch (0 = never batch).
 ///
@@ -255,6 +333,7 @@ Ciphertext<DCRTPoly> CudaEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
 	auto res_gpu				= deviceCt(result);
 	auto pt_gpu					= devicePt(pt);
+	PlaintextFence fence({ res_gpu.get() }, { pt_gpu.get() });
 	res_gpu->addPt(*pt_gpu);
 	return result;
 }
@@ -272,6 +351,7 @@ void CudaEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	ctx.LoadPlaintext(pt);
 	auto res_gpu = deviceCt(ct1);
 	auto pt_gpu	 = devicePt(pt);
+	PlaintextFence fence({ res_gpu.get() }, { pt_gpu.get() });
 	res_gpu->addPt(*pt_gpu);
 }
 
@@ -368,6 +448,7 @@ Ciphertext<DCRTPoly> CudaEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
 	auto res_gpu				= deviceCt(result);
 	auto pt_gpu					= devicePt(pt);
+	PlaintextFence fence({ res_gpu.get() }, { pt_gpu.get() });
 	res_gpu->subPt(*pt_gpu);
 	return result;
 }
@@ -378,6 +459,7 @@ Ciphertext<DCRTPoly> CudaEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plain
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
 	auto res_gpu				= deviceCt(result);
 	auto pt_gpu					= devicePt(pt);
+	PlaintextFence fence({ res_gpu.get() }, { pt_gpu.get() });
 	res_gpu->multScalar(-1.0);
 	res_gpu->addPt(*pt_gpu);
 	return result;
@@ -448,7 +530,10 @@ Ciphertext<DCRTPoly> CudaEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, cons
 	auto ct1_gpu				= deviceCt(ct1);
 	auto pt_gpu					= devicePt(pt);
 	auto res_gpu				= std::make_shared<FIDESlib::CKKS::Ciphertext>(*context_);
-	res_gpu->multPt(*ct1_gpu, *pt_gpu);
+	{
+		PlaintextFence fence({ res_gpu.get(), ct1_gpu.get() }, { pt_gpu.get() });
+		res_gpu->multPt(*ct1_gpu, *pt_gpu);
+	}
 	result->device = std::make_any<std::shared_ptr<FIDESlib::CKKS::Ciphertext>>(std::move(res_gpu));
 	return result;
 }
@@ -466,6 +551,7 @@ void CudaEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	ctx.LoadPlaintext(pt);
 	auto res_gpu = deviceCt(ct1);
 	auto pt_gpu	 = devicePt(pt);
+	PlaintextFence fence({ res_gpu.get() }, { pt_gpu.get() });
 	res_gpu->multPt(*pt_gpu);
 }
 
@@ -1211,6 +1297,7 @@ void CudaEngine::linearTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipher
 		pts_gpu.push_back(pt_gpu.get());
 	}
 
+	PlaintextFence fence({ ct_gpu.get() }, pts_gpu);
 	FIDESlib::CKKS::LinearTransform(*ct_gpu, rowSize, bStep, pts_gpu, stride, offset);
 }
 
@@ -1266,7 +1353,15 @@ std::vector<Ciphertext<DCRTPoly>> CudaEngine::linearTransformMany(CryptoContextI
 		}
 	}
 
-	FIDESlib::CKKS::LinearTransformMany(*src_gpu, results_gpu, rowSize, bStep, pts_gpu, stride, offset);
+	{
+		std::vector<FIDESlib::CKKS::Plaintext*> all;
+		for (auto& set : pts_gpu)
+			all.insert(all.end(), set.begin(), set.end());
+		std::vector<FIDESlib::CKKS::Ciphertext*> cts = results_gpu;
+		cts.push_back(src_gpu.get());
+		PlaintextFence fence(cts, all);
+		FIDESlib::CKKS::LinearTransformMany(*src_gpu, results_gpu, rowSize, bStep, pts_gpu, stride, offset);
+	}
 	return results;
 }
 
@@ -1389,6 +1484,7 @@ void CudaEngine::linearTransformInPlacePrepared(CryptoContextImpl<DCRTPoly>& ctx
 	// the per-call assembly and pageable upload of their POINTERS, nothing else — which is why this
 	// is the same call with one more argument and not a second implementation of the transform.
 	auto pts_gpu = deviceDiagonals(ctx, prepared.Diagonals(), s.rowSize, s.ext, "LinearTransformInPlace", -1);
+	PlaintextFence fence({ ct_gpu.get() }, pts_gpu);
 	FIDESlib::CKKS::LinearTransform(*ct_gpu, s.rowSize, s.bStep, pts_gpu, s.stride, s.offset, deviceTable(prepared, "LinearTransformInPlace"));
 }
 
@@ -1423,8 +1519,16 @@ CudaEngine::linearTransformManyPrepared(CryptoContextImpl<DCRTPoly>& ctx, const 
 	for (size_t t = 0; t < sets.size(); ++t)
 		pts_gpu.push_back(deviceDiagonals(ctx, sets[t], s.rowSize, s.ext, "LinearTransformMany", static_cast<int>(t)));
 
-	FIDESlib::CKKS::LinearTransformMany(
-	  *src_gpu, results_gpu, s.rowSize, s.bStep, pts_gpu, s.stride, s.offset, deviceTable(prepared, "LinearTransformMany"));
+	{
+		std::vector<FIDESlib::CKKS::Plaintext*> all;
+		for (auto& set : pts_gpu)
+			all.insert(all.end(), set.begin(), set.end());
+		std::vector<FIDESlib::CKKS::Ciphertext*> cts = results_gpu;
+		cts.push_back(src_gpu.get());
+		PlaintextFence fence(cts, all);
+		FIDESlib::CKKS::LinearTransformMany(
+		  *src_gpu, results_gpu, s.rowSize, s.bStep, pts_gpu, s.stride, s.offset, deviceTable(prepared, "LinearTransformMany"));
+	}
 	return results;
 }
 
@@ -1454,6 +1558,7 @@ void CudaEngine::convolutionTransformInPlace(CryptoContextImpl<DCRTPoly>& ctx,
 		rowSize = bStep * gStep;
 	}
 
+	PlaintextFence fence({ ct_gpu.get() }, pts_gpu);
 	FIDESlib::CKKS::ConvolutionTransform(*ct_gpu, rowSize, bStep, pts_gpu, stride, indexes, gStep);
 }
 
@@ -1485,6 +1590,9 @@ void CudaEngine::specialConvolutionTransformInPlace(CryptoContextImpl<DCRTPoly>&
 		rowSize = bStep * gStep;
 	}
 
+	std::vector<FIDESlib::CKKS::Plaintext*> fenced = pts_gpu;
+	fenced.push_back(mask_gpu.get());
+	PlaintextFence fence({ ct_gpu.get() }, fenced);
 	FIDESlib::CKKS::SpecialConvolutionTransform(*ct_gpu, rowSize, bStep, pts_gpu, *mask_gpu, stride, maskRotationStride, indexes, gStep);
 }
 
@@ -1518,6 +1626,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	if (keyMap.find(pkImpl->GetKeyTag()) != keyMap.end()) {
 		auto raw_eval_ksk = FIDESlib::CKKS::GetEvalKeySwitchKey(pkImpl);
 		FIDESlib::CKKS::KeySwitchingKey eval_ksk(c);
+		usePooledStreams(eval_ksk.a);
+		usePooledStreams(eval_ksk.b);
 		eval_ksk.Initialize(raw_eval_ksk);
 		c->AddEvalKey(std::move(eval_ksk));
 	}
@@ -1525,12 +1635,26 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	for (const auto& step : ctx.rotation_indexes) {
 		auto raw_rot_ksk = FIDESlib::CKKS::GetRotationKeySwitchKey(pkImpl, step);
 		FIDESlib::CKKS::KeySwitchingKey rot_ksk(c);
+		usePooledStreams(rot_ksk.a);
+		usePooledStreams(rot_ksk.b);
 		rot_ksk.Initialize(raw_rot_ksk);
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
 	// Bootstrapping keys.
 	for (const auto& slot : ctx.slots_bootstrap) {
 		FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
+	}
+
+	// Keys are uploaded once, here, and read by every later key switch from whatever stream that
+	// runs on: one wait for the uploads to land is cheaper than a fence at every reader.
+	if (adapterFences()) {
+		int current = 0;
+		cudaGetDevice(&current);
+		for (const int gpu : c->GPUid) {
+			cudaSetDevice(gpu);
+			cudaDeviceSynchronize();
+		}
+		cudaSetDevice(current);
 	}
 
 	context_ = std::make_unique<FIDESlib::CKKS::Context>(std::move(c));
@@ -1564,6 +1688,7 @@ void CudaEngine::encodeDevice(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt, c
 	// Level metadata is carried on the RNSPoly by the modulus count, exactly as in the load path:
 	// RNSPoly::loadCoefficients grows/drops to moduli.size()-1.
 	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
+	usePooledStreams(gpu_pt->c0);
 	gpu_pt->loadCoefficients(enc.coefficients, enc.moduli, enc.bigBound, enc.scalingFactor, static_cast<int>(enc.noiseScaleDeg), static_cast<int>(enc.slots));
 
 	pt->device = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pt));
@@ -1608,6 +1733,7 @@ void CudaEngine::encodeDeviceSlotsMany(CryptoContextImpl<DCRTPoly>& ctx, std::ve
 	raw_pts.reserve(pts.size());
 	for (size_t i = 0; i < pts.size(); ++i) {
 		gpu_pts.push_back(std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu));
+		usePooledStreams(gpu_pts.back()->c0);
 		raw_pts.push_back(gpu_pts.back().get());
 	}
 	FIDESlib::CKKS::Plaintext::loadSlotsBatch(raw_pts, enc.values, static_cast<int>(enc.slots), enc.scalingFactor, enc.moduli, enc.bigBound, enc.scalingFactor, static_cast<int>(enc.noiseScaleDeg));
@@ -1675,6 +1801,7 @@ void CudaEngine::encodeDeviceMany(CryptoContextImpl<DCRTPoly>& ctx, std::vector<
 	coeffs.reserve(pts.size());
 	for (size_t i = 0; i < pts.size(); ++i) {
 		gpu_pts.push_back(std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu));
+		usePooledStreams(gpu_pts.back()->c0);
 		raw_pts.push_back(gpu_pts.back().get());
 		coeffs.push_back(&encs[i].coefficients);
 	}
@@ -1719,7 +1846,9 @@ void CudaEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt) 
 	auto& context									  = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(ctx.host);
 	const auto& ptImpl								  = std::any_cast<const lbcrypto::Plaintext&>(pt->host);
 	FIDESlib::CKKS::RawPlainText raw_pt				  = FIDESlib::CKKS::GetRawPlainText(context, ptImpl);
-	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, raw_pt);
+	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
+	usePooledStreams(gpu_pt->c0);
+	gpu_pt->load(raw_pt);
 	pt->device										  = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pt));
 }
 
