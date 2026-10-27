@@ -102,11 +102,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arm: A-legacy,          pooled: '0', before: '1', after: '1', delay: '2000', key: '300000', war: '1' }
-          - { arm: B1-no-before-fence, pooled: '1', before: '0', after: '1', delay: '2000', key: '300000', war: '1' }
-          - { arm: B2-no-after-fence,  pooled: '1', before: '1', after: '0', delay: '2000', key: '300000', war: '1' }
-          - { arm: C-both-fences,      pooled: '1', before: '1', after: '1', delay: '2000', key: '300000', war: '1' }
-          - { arm: D-no-amplifier,     pooled: '1', before: '1', after: '1', delay: '0',    key: '0',      war: '0' }
+          - { arm: A-legacy,           pooled: '0', before: '1', after: '1', delay: '2000', key: '300000', keyb: '300000',  war: '1', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
+          - { arm: C-both-fences,      pooled: '1', before: '1', after: '1', delay: '2000', key: '300000', keyb: '300000',  war: '1', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
+          - { arm: D-no-amplifier,     pooled: '1', before: '1', after: '1', delay: '0',    key: '0',      keyb: '0',       war: '0', kskb: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*' }
+          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', filter: '*RotateManyTest.*' }
+          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', filter: '*RotateManyTest.*' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
@@ -219,6 +219,9 @@ jobs:
       # amplifiers (control: they alone must break nothing). B1/B2: pooled streams without the
       # "before" / the "after" half of the engine's fences (negative controls: each must fail).
       # C: both halves, all amplifiers (the claim). D: both halves, no amplifier (as it would ship).
+      # kskb-unfenced / kskb-fenced: only the batched rotate-many tests, without the engine's key wait, with the b half of
+      # every key held back longer than the a half: fusedHoistedRotateBatch fences only ksk_a, so
+      # the first must fail; the second adds the ksk_b wait in the library and must pass.
       - name: Arm ${{ matrix.arm }}
         working-directory: build
         env:
@@ -228,12 +231,17 @@ jobs:
           FIDESLIB_ADAPTER_FENCE_AFTER: ${{ matrix.after }}
           FIDESLIB_PROBE_UPLOAD_DELAY_US: ${{ matrix.delay }}
           FIDESLIB_PROBE_KEY_DELAY_US: ${{ matrix.key }}
+          FIDESLIB_PROBE_KEY_B_DELAY_US: ${{ matrix.keyb }}
+          FIDESLIB_PROBE_BATCH_KSKB_FENCE: ${{ matrix.kskb }}
+          FILTER: ${{ matrix.filter }}
           FIDESLIB_PROBE_WAR: ${{ matrix.war }}
           # multPt's own fences off in every arm: upstream's multPt has none.
           FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
           ARM: ${{ matrix.arm }}
         run: |
-          filter='CKKSTest.*:CKKSRotateManyTest.*:PreparedLtTest.*:ApiParity*:CKKSBootstrapTest.*:CKKSFlexBootstrapTest.*:BootstrapToLevelTest.*:ReducedNoise*:KeyAccessTest.*:ContextLifetimeTest.*:NoEvalMultKeyTest.*:SparseSecretModEval*:ChebyshevFixedManualCoworker*'
+          # Leading '*': a parameterized test's name starts with its instantiation prefix
+          # (BatchWidthsAndIndices/CKKSRotateManyTest...), which a bare 'Suite.*' does not match.
+          filter="$FILTER"
           mkdir -p gpu-results
           log=gpu-results/arm-$ARM.log
           start=$(date +%s)
@@ -241,7 +249,7 @@ jobs:
           rc=$?
           end=$(date +%s)
           {
-            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
+            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
             echo
             echo "ran: $(grep -c '^\[ RUN      \]' "$log"), ok: $(grep -c '^\[       OK \]' "$log"), skipped: $(grep -c '^\[  SKIPPED \]' "$log")"
             grep -E '^\[  (PASSED|FAILED) +\] [0-9]+' "$log"

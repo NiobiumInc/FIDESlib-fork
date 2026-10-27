@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <variant>
 #include <vector>
 
@@ -523,6 +524,16 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out,
 		FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 
+// PROBE (not for merge): FIDESLIB_PROBE_BATCH_KSKB_FENCE=1 adds the ksk_b waits this function lacks
+// (it fences only ksk_a), so the probe can show that exactly that edge closes the race.
+static bool ProbeBatchKskbFence() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_BATCH_KSKB_FENCE");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
   const std::vector<LimbPartition*>& in,
   const std::vector<LimbPartition*>& ksk_a,
@@ -637,6 +648,10 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 		if (p)
 			s.wait(p->s);
 	s.wait(ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s);
+	if (ProbeBatchKskbFence())
+		for (auto* p : ksk_b)
+			if (p)
+				s.wait(p->s);
 
 	if (limbsize + slimbsize > 0)
 		hoistedRotateDotKSKBatched___<<<grid, block, shmem_bytes, s.ptr()>>>(data_ptrs_d + offset_in_c1,
@@ -663,6 +678,10 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 		if (p)
 			p->s.wait(s);
 	(ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s).wait(s);
+	if (ProbeBatchKskbFence())
+		for (auto* p : ksk_b)
+			if (p)
+				p->s.wait(s);
 	FIDESlib::OpFreeAsync(data_ptrs_d, s.ptr());
 }
 

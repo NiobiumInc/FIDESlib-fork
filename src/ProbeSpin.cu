@@ -27,6 +27,14 @@ long long ProbeKeyDelayCycles() {
 	return cycles;
 }
 
+long long ProbeKeyBDelayCycles() {
+	static const long long cycles = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_KEY_B_DELAY_US");
+		return (env != nullptr && env[0] != '\0') ? EnvCycles("FIDESLIB_PROBE_KEY_B_DELAY_US") : ProbeKeyDelayCycles();
+	}();
+	return cycles;
+}
+
 bool ProbeWar() {
 	static const bool enabled = [] {
 		const char* env = std::getenv("FIDESLIB_PROBE_WAR");

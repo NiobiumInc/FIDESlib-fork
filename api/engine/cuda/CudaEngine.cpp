@@ -1667,7 +1667,7 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(eval_ksk.b);
 		eval_ksk.Initialize(raw_eval_ksk);
 		probeScramble(eval_ksk.a, FIDESlib::ProbeKeyDelayCycles());
-		probeScramble(eval_ksk.b, FIDESlib::ProbeKeyDelayCycles());
+		probeScramble(eval_ksk.b, FIDESlib::ProbeKeyBDelayCycles());
 		c->AddEvalKey(std::move(eval_ksk));
 	}
 	// Rotational key switching keys.
@@ -1678,7 +1678,7 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(rot_ksk.b);
 		rot_ksk.Initialize(raw_rot_ksk);
 		probeScramble(rot_ksk.a, FIDESlib::ProbeKeyDelayCycles());
-		probeScramble(rot_ksk.b, FIDESlib::ProbeKeyDelayCycles());
+		probeScramble(rot_ksk.b, FIDESlib::ProbeKeyBDelayCycles());
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
 	// Bootstrapping keys.

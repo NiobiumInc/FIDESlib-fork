@@ -6,6 +6,8 @@
 // not reads zeros. This amplifies the "before" edge (read after write).
 // FIDESLIB_PROBE_KEY_DELAY_US=N: the same for the key-switching keys, with its own (longer) delay,
 // because the first key switch can come long after the upload.
+// FIDESLIB_PROBE_KEY_B_DELAY_US=N: the delay for the b half of every key (default: the key delay).
+// Longer than the a half, it opens a window that only a reader waiting on ksk.b's own stream closes.
 // FIDESLIB_PROBE_WAR=1: amplifies the "after" edge (write after read): the reader is delayed by a spin
 // on its own stream, and the plaintext is scrambled on its stream as soon as the call returns. Unless
 // the plaintext's stream waits for the reader, the scramble lands under the read.
@@ -16,6 +18,7 @@
 namespace FIDESlib {
 long long ProbeUploadDelayCycles();
 long long ProbeKeyDelayCycles();
+long long ProbeKeyBDelayCycles();
 bool ProbeWar();
 void ProbeSpin(cudaStream_t stream, long long cycles);
 void ProbeScramble(cudaStream_t stream, void* data, size_t bytes, long long cycles);
