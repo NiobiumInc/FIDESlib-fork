@@ -104,7 +104,6 @@ jobs:
         include:
           - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
           - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
-          - { arm: no-key-sync,     pooled: '1', before: '1', after: '1', delay: '2000', key: '300000', keyb: '1500000', war: '1', kskb: '1', keysync: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*', each: '1' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
@@ -271,6 +270,7 @@ jobs:
             echo
             echo "failed tests:"
             grep -E '^\[  FAILED  \] [A-Za-z0-9_/]+\.[A-Za-z0-9_/]+' "$log" | sed -E 's/ \([0-9]+ ms\)//; s/, where.*//' | sort -u | head -40
+            echo "probe reports:"; grep '^PROBE' "$log" | head -12
             echo "last RUN line: $(grep '^\[ RUN      \]' "$log" | tail -1)"
             echo "last lines:"; tail -3 "$log" | cut -c1-200
           } >> "$GITHUB_STEP_SUMMARY"

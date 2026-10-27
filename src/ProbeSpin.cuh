@@ -12,6 +12,7 @@
 // on its own stream, and the plaintext is scrambled on its stream as soon as the call returns. Unless
 // the plaintext's stream waits for the reader, the scramble lands under the read.
 #pragma once
+#include <chrono>
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <utility>
@@ -23,5 +24,7 @@ long long ProbeKeyDelayCycles();
 long long ProbeKeyBDelayCycles();
 bool ProbeWar();
 void ProbeSpin(cudaStream_t stream, long long cycles);
+/// When the last ProbeScramble was enqueued (host clock).
+std::chrono::steady_clock::time_point& ProbeLastScrambleTime();
 void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles);
 } // namespace FIDESlib

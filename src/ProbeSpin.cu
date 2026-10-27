@@ -1,6 +1,7 @@
 // PROBE (not for merge): see ProbeSpin.cuh.
 #include "ProbeSpin.cuh"
 
+#include <chrono>
 #include <cstdlib>
 
 namespace FIDESlib {
@@ -48,9 +49,15 @@ void ProbeSpin(cudaStream_t stream, long long cycles) {
 		probe_spin<<<1, 1, 0, stream>>>(cycles);
 }
 
+std::chrono::steady_clock::time_point& ProbeLastScrambleTime() {
+	static std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+	return t;
+}
+
 void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles) {
 	if (cycles <= 0 || buffers.empty())
 		return;
+	ProbeLastScrambleTime() = std::chrono::steady_clock::now();
 	// Every buffer saved and zeroed first, then ONE spin, then every buffer restored: a spin per
 	// buffer would serialize on the stream and multiply the window by the limb count.
 	std::vector<void*> saved(buffers.size(), nullptr);

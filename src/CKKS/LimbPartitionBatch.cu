@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <variant>
 #include <vector>
@@ -16,6 +18,7 @@
 #include "NTT.cuh"
 #include "Rotation.cuh"
 #include "VectorGPU.cuh"
+#include "ProbeSpin.cuh"
 
 namespace FIDESlib::CKKS {
 
@@ -652,6 +655,33 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 		for (auto* p : ksk_b)
 			if (p)
 				s.wait(p->s);
+	// PROBE (not for merge): what the batched kernel is about to read, for the first calls of a
+	// process. Stream states from cudaStreamQuery (0 = idle, 600 = work pending); the first word of
+	// the first key digit, read on a stream of its own so that it orders after nothing.
+	{
+		static std::atomic<int> reported{ 0 };
+		if (reported.fetch_add(1) < 2) {
+			auto first_word = [](LimbPartition* k) -> unsigned long long {
+				if (k == nullptr || k->DIGITlimb.empty() || k->DIGITlimb[0].empty())
+					return ~0ull;
+				void* src = nullptr;
+				std::visit([&](auto& l) { src = l.v.data; }, k->DIGITlimb[0][0]);
+				cudaStream_t side;
+				cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking);
+				unsigned long long w = ~0ull;
+				cudaMemcpyAsync(&w, src, sizeof(w), cudaMemcpyDeviceToHost, side);
+				cudaStreamSynchronize(side);
+				cudaStreamDestroy(side);
+				return w;
+			};
+			LimbPartition* ka = ksk_a[0] ? ksk_a[0] : ksk_a[1];
+			LimbPartition* kb = ksk_b[0] ? ksk_b[0] : ksk_b[1];
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ProbeLastScrambleTime()).count();
+			std::fprintf(stderr, "PROBE fusedHoistedRotateBatch: ms_since_last_scramble=%.1f q_s=%d q_ksk_a=%d q_ksk_b=%d same_ab=%d ksk_a_word=%llu ksk_b_word=%llu\n", ms,
+			  (int)cudaStreamQuery(s.ptr()), (int)cudaStreamQuery(ka->s.ptr()), (int)cudaStreamQuery(kb->s.ptr()), (int)(ka->s.ptr() == kb->s.ptr()), first_word(ka),
+			  first_word(kb));
+		}
+	}
 
 	if (limbsize + slimbsize > 0)
 		hoistedRotateDotKSKBatched___<<<grid, block, shmem_bytes, s.ptr()>>>(data_ptrs_d + offset_in_c1,
