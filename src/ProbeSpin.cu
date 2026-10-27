@@ -5,7 +5,7 @@
 
 namespace FIDESlib {
 namespace {
-__global__ void probe_upload_delay_spin(const long long cycles) {
+__global__ void probe_spin(const long long cycles) {
 	const long long t0 = clock64();
 	while (clock64() - t0 < cycles) {
 	}
@@ -20,8 +20,16 @@ long long ProbeUploadDelayCycles() {
 	return cycles;
 }
 
-void ProbeUploadDelay(cudaStream_t stream) {
-	if (const long long cycles = ProbeUploadDelayCycles(); cycles > 0)
-		probe_upload_delay_spin<<<1, 1, 0, stream>>>(cycles);
+void ProbeScramble(cudaStream_t stream, void* data, size_t bytes) {
+	const long long cycles = ProbeUploadDelayCycles();
+	if (cycles <= 0 || data == nullptr || bytes == 0)
+		return;
+	void* saved = nullptr;
+	cudaMallocAsync(&saved, bytes, stream);
+	cudaMemcpyAsync(saved, data, bytes, cudaMemcpyDeviceToDevice, stream);
+	cudaMemsetAsync(data, 0, bytes, stream);
+	probe_spin<<<1, 1, 0, stream>>>(cycles);
+	cudaMemcpyAsync(data, saved, bytes, cudaMemcpyDeviceToDevice, stream);
+	cudaFreeAsync(saved, stream);
 }
 } // namespace FIDESlib

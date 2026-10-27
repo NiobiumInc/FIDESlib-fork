@@ -29,6 +29,7 @@
 #include <mutex>
 #include <openfhe.h> // OPENFHE_THROW in shared precondition checks
 #include <string>
+#include <variant>
 
 namespace fideslib {
 
@@ -82,7 +83,25 @@ void usePooledStreams(FIDESlib::CKKS::RNSPoly& poly) {
 		cudaSetDevice(part.device);
 		if (adapterPooledStreams())
 			part.s.init(50);
-		FIDESlib::ProbeUploadDelay(part.s.ptr());
+	}
+	cudaSetDevice(current);
+}
+
+/// PROBE (not for merge): race amplifier over every limb of a polynomial just loaded (ProbeSpin.cuh).
+void probeScramble(FIDESlib::CKKS::RNSPoly& poly) {
+	if (FIDESlib::ProbeUploadDelayCycles() <= 0)
+		return;
+	int current = 0;
+	cudaGetDevice(&current);
+	for (auto& part : poly.GPU) {
+		cudaSetDevice(part.device);
+		auto one = [&](auto& limb) {
+			std::visit([&](auto& l) { FIDESlib::ProbeScramble(part.s.ptr(), l.v.data, static_cast<size_t>(l.v.size) * sizeof(*l.v.data)); }, limb);
+		};
+		for (auto& limb : part.limb)
+			one(limb);
+		for (auto& limb : part.SPECIALlimb)
+			one(limb);
 	}
 	cudaSetDevice(current);
 }
@@ -1629,6 +1648,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(eval_ksk.a);
 		usePooledStreams(eval_ksk.b);
 		eval_ksk.Initialize(raw_eval_ksk);
+		probeScramble(eval_ksk.a);
+		probeScramble(eval_ksk.b);
 		c->AddEvalKey(std::move(eval_ksk));
 	}
 	// Rotational key switching keys.
@@ -1638,6 +1659,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(rot_ksk.a);
 		usePooledStreams(rot_ksk.b);
 		rot_ksk.Initialize(raw_rot_ksk);
+		probeScramble(rot_ksk.a);
+		probeScramble(rot_ksk.b);
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
 	// Bootstrapping keys.
@@ -1690,6 +1713,7 @@ void CudaEngine::encodeDevice(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt, c
 	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
 	usePooledStreams(gpu_pt->c0);
 	gpu_pt->loadCoefficients(enc.coefficients, enc.moduli, enc.bigBound, enc.scalingFactor, static_cast<int>(enc.noiseScaleDeg), static_cast<int>(enc.slots));
+	probeScramble(gpu_pt->c0);
 
 	pt->device = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pt));
 }
@@ -1737,6 +1761,8 @@ void CudaEngine::encodeDeviceSlotsMany(CryptoContextImpl<DCRTPoly>& ctx, std::ve
 		raw_pts.push_back(gpu_pts.back().get());
 	}
 	FIDESlib::CKKS::Plaintext::loadSlotsBatch(raw_pts, enc.values, static_cast<int>(enc.slots), enc.scalingFactor, enc.moduli, enc.bigBound, enc.scalingFactor, static_cast<int>(enc.noiseScaleDeg));
+	for (auto* p : raw_pts)
+		probeScramble(p->c0);
 	for (size_t i = 0; i < pts.size(); ++i) {
 		pts[i]->device = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pts[i]));
 	}
@@ -1809,6 +1835,8 @@ void CudaEngine::encodeDeviceMany(CryptoContextImpl<DCRTPoly>& ctx, std::vector<
 	// Level metadata is carried on the RNSPoly by the modulus count, exactly as in encodeDevice.
 	FIDESlib::CKKS::Plaintext::loadCoefficientsBatch(
 	  raw_pts, coeffs, head.moduli, head.bigBound, head.scalingFactor, static_cast<int>(head.noiseScaleDeg), static_cast<int>(head.slots));
+	for (auto* p : raw_pts)
+		probeScramble(p->c0);
 
 	for (size_t i = 0; i < pts.size(); ++i) {
 		pts[i]->device = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pts[i]));
@@ -1849,6 +1877,7 @@ void CudaEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& ctx, Plaintext& pt) 
 	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
 	usePooledStreams(gpu_pt->c0);
 	gpu_pt->load(raw_pt);
+	probeScramble(gpu_pt->c0);
 	pt->device										  = std::make_any<std::shared_ptr<FIDESlib::CKKS::Plaintext>>(std::move(gpu_pt));
 }
 
