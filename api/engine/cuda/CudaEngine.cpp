@@ -126,8 +126,9 @@ void probeScramble(FIDESlib::CKKS::RNSPoly& poly, long long cycles = FIDESlib::P
 	cudaGetDevice(&current);
 	for (auto& part : poly.GPU) {
 		cudaSetDevice(part.device);
+		std::vector<std::pair<void*, size_t>> buffers;
 		auto one = [&](auto& limb) {
-			std::visit([&](auto& l) { FIDESlib::ProbeScramble(part.s.ptr(), l.v.data, static_cast<size_t>(l.v.size) * sizeof(*l.v.data), cycles); }, limb);
+			std::visit([&](auto& l) { buffers.emplace_back(l.v.data, static_cast<size_t>(l.v.size) * sizeof(*l.v.data)); }, limb);
 		};
 		for (auto& limb : part.limb)
 			one(limb);
@@ -137,6 +138,7 @@ void probeScramble(FIDESlib::CKKS::RNSPoly& poly, long long cycles = FIDESlib::P
 		for (auto& digit : part.DIGITlimb)
 			for (auto& limb : digit)
 				one(limb);
+		FIDESlib::ProbeScramble(part.s.ptr(), buffers, cycles);
 	}
 	cudaSetDevice(current);
 }

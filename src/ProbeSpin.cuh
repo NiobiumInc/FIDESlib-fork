@@ -14,6 +14,8 @@
 #pragma once
 #include <cstddef>
 #include <cuda_runtime.h>
+#include <utility>
+#include <vector>
 
 namespace FIDESlib {
 long long ProbeUploadDelayCycles();
@@ -21,5 +23,5 @@ long long ProbeKeyDelayCycles();
 long long ProbeKeyBDelayCycles();
 bool ProbeWar();
 void ProbeSpin(cudaStream_t stream, long long cycles);
-void ProbeScramble(cudaStream_t stream, void* data, size_t bytes, long long cycles);
+void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles);
 } // namespace FIDESlib

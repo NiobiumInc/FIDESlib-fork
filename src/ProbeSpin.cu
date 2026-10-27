@@ -48,15 +48,26 @@ void ProbeSpin(cudaStream_t stream, long long cycles) {
 		probe_spin<<<1, 1, 0, stream>>>(cycles);
 }
 
-void ProbeScramble(cudaStream_t stream, void* data, size_t bytes, long long cycles) {
-	if (cycles <= 0 || data == nullptr || bytes == 0)
+void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles) {
+	if (cycles <= 0 || buffers.empty())
 		return;
-	void* saved = nullptr;
-	cudaMallocAsync(&saved, bytes, stream);
-	cudaMemcpyAsync(saved, data, bytes, cudaMemcpyDeviceToDevice, stream);
-	cudaMemsetAsync(data, 0, bytes, stream);
+	// Every buffer saved and zeroed first, then ONE spin, then every buffer restored: a spin per
+	// buffer would serialize on the stream and multiply the window by the limb count.
+	std::vector<void*> saved(buffers.size(), nullptr);
+	for (size_t i = 0; i < buffers.size(); ++i) {
+		const auto& [data, bytes] = buffers[i];
+		if (data == nullptr || bytes == 0)
+			continue;
+		cudaMallocAsync(&saved[i], bytes, stream);
+		cudaMemcpyAsync(saved[i], data, bytes, cudaMemcpyDeviceToDevice, stream);
+		cudaMemsetAsync(data, 0, bytes, stream);
+	}
 	probe_spin<<<1, 1, 0, stream>>>(cycles);
-	cudaMemcpyAsync(data, saved, bytes, cudaMemcpyDeviceToDevice, stream);
-	cudaFreeAsync(saved, stream);
+	for (size_t i = 0; i < buffers.size(); ++i) {
+		if (saved[i] == nullptr)
+			continue;
+		cudaMemcpyAsync(buffers[i].first, saved[i], buffers[i].second, cudaMemcpyDeviceToDevice, stream);
+		cudaFreeAsync(saved[i], stream);
+	}
 }
 } // namespace FIDESlib
