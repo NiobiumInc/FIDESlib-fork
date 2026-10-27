@@ -49,6 +49,11 @@ void ProbeSpin(cudaStream_t stream, long long cycles) {
 		probe_spin<<<1, 1, 0, stream>>>(cycles);
 }
 
+ProbeSpinStats& ProbeLastSpin() {
+	static ProbeSpinStats st;
+	return st;
+}
+
 std::chrono::steady_clock::time_point& ProbeLastScrambleTime() {
 	static std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
 	return t;
@@ -69,7 +74,17 @@ void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_
 		cudaMemcpyAsync(saved[i], data, bytes, cudaMemcpyDeviceToDevice, stream);
 		cudaMemsetAsync(data, 0, bytes, stream);
 	}
+	// Measured: events around the spin, and the launch status, for ProbeReportSpin.
+	ProbeSpinStats& st = ProbeLastSpin();
+	if (st.start == nullptr) {
+		cudaEventCreate(&st.start);
+		cudaEventCreate(&st.end);
+	}
+	cudaEventRecord(st.start, stream);
 	probe_spin<<<1, 1, 0, stream>>>(cycles);
+	st.launch = static_cast<int>(cudaGetLastError());
+	cudaEventRecord(st.end, stream);
+	st.cycles = cycles;
 	for (size_t i = 0; i < buffers.size(); ++i) {
 		if (saved[i] == nullptr)
 			continue;

@@ -24,6 +24,13 @@ long long ProbeKeyDelayCycles();
 long long ProbeKeyBDelayCycles();
 bool ProbeWar();
 void ProbeSpin(cudaStream_t stream, long long cycles);
+/// The last scramble's spin: requested cycles, launch status, and events around it.
+struct ProbeSpinStats {
+	long long cycles = 0;
+	int launch		 = 0;
+	cudaEvent_t start = nullptr, end = nullptr;
+};
+ProbeSpinStats& ProbeLastSpin();
 /// When the last ProbeScramble was enqueued (host clock).
 std::chrono::steady_clock::time_point& ProbeLastScrambleTime();
 void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles);
