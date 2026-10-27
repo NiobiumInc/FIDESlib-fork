@@ -1,14 +1,22 @@
-// PROBE (not for merge): race amplifier for the adapter-side stream experiment.
-// FIDESLIB_PROBE_UPLOAD_DELAY_US=N makes ProbeScramble, once a buffer has been loaded, enqueue on the
-// buffer's own stream: save it, zero it, spin N microseconds, restore it. All four are device work, so
-// the host is not held back (a pageable upload would block the host on an earlier spin instead of
-// opening a window). A reader that waits for the buffer's stream sees the restored data; a reader that
-// does not reads zeros for N microseconds.
+// PROBE (not for merge): race amplifiers for the adapter-side stream experiment.
+//
+// FIDESLIB_PROBE_UPLOAD_DELAY_US=N: once a plaintext has been loaded, ProbeScramble enqueues on the
+// buffer's own stream: save it, zero it, spin N microseconds, restore it. All device work, so the host
+// is not held back. A reader that waits for the buffer's stream sees the restored data; one that does
+// not reads zeros. This amplifies the "before" edge (read after write).
+// FIDESLIB_PROBE_KEY_DELAY_US=N: the same for the key-switching keys, with its own (longer) delay,
+// because the first key switch can come long after the upload.
+// FIDESLIB_PROBE_WAR=1: amplifies the "after" edge (write after read): the reader is delayed by a spin
+// on its own stream, and the plaintext is scrambled on its stream as soon as the call returns. Unless
+// the plaintext's stream waits for the reader, the scramble lands under the read.
 #pragma once
 #include <cstddef>
 #include <cuda_runtime.h>
 
 namespace FIDESlib {
 long long ProbeUploadDelayCycles();
-void ProbeScramble(cudaStream_t stream, void* data, size_t bytes);
+long long ProbeKeyDelayCycles();
+bool ProbeWar();
+void ProbeSpin(cudaStream_t stream, long long cycles);
+void ProbeScramble(cudaStream_t stream, void* data, size_t bytes, long long cycles);
 } // namespace FIDESlib

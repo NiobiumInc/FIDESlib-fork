@@ -1,3 +1,4 @@
+#include <cstdlib>
 //
 // Created by carlosad on 27/04/24.
 //
@@ -796,6 +797,16 @@ void LimbPartition::rescale() {
 	// }
 }
 
+// PROBE (not for merge): FIDESLIB_PROBE_NO_MULTPT_FENCE=1 drops multPt's own plaintext-stream waits,
+// as upstream's multPt has none, so the probe tests the engine's fences on that path.
+static bool ProbeNoMultPtFence() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("FIDESLIB_PROBE_NO_MULTPT_FENCE");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 void LimbPartition::multPt(const LimbPartition& p) {
 	const int limbsize = getLimbSize(*level);
 	// assert(SPECIALlimb.size() == 0 && p.SPECIALlimb.size() == 0);
@@ -806,7 +817,8 @@ void LimbPartition::multPt(const LimbPartition& p) {
 	// flight (its upload) before reading it, and below make its stream wait for this read before it
 	// can be rewritten or freed. Without the first wait a plaintext loaded just before the call is
 	// read half-written; without the second its blocks can return to the pool under the read.
-	s.wait(p.getS());
+	if (!ProbeNoMultPtFence())
+		s.wait(p.getS());
 
 	constexpr bool capture = false;
 	// thread_local, not a bare function-local static: this is on the ct x pt path -- the hottest
@@ -845,7 +857,8 @@ void LimbPartition::multPt(const LimbPartition& p) {
 		//     limb.pop_back();
 		// }
 	}
-	p.getS().wait(s);
+	if (!ProbeNoMultPtFence())
+		p.getS().wait(s);
 }
 
 void LimbPartition::modup(LimbPartition& aux_partition) {

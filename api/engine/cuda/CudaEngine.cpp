@@ -65,13 +65,22 @@ bool adapterPooledStreams() {
 	return enabled;
 }
 
-/// @brief FIDESLIB_ADAPTER_FENCES=0 drops the fences while keeping the pooled streams (the
-/// probe's negative control: it must fail, or the amplified runs prove nothing).
-bool adapterFences() {
-	static const bool enabled = [] {
-		const char* env = std::getenv("FIDESLIB_ADAPTER_FENCES");
-		return !(env != nullptr && env[0] == '0');
-	}();
+/// @brief The two halves of the fences, each switchable for the probe's negative controls (it
+/// must fail without either, or the amplified runs prove nothing): FIDESLIB_ADAPTER_FENCE_BEFORE=0
+/// drops "the reader waits for the upload" (and the wait after the key uploads),
+/// FIDESLIB_ADAPTER_FENCE_AFTER=0 drops "the plaintext waits for its readers".
+bool envOn(const char* name) {
+	const char* env = std::getenv(name);
+	return !(env != nullptr && env[0] == '0');
+}
+
+bool adapterFenceBefore() {
+	static const bool enabled = envOn("FIDESLIB_ADAPTER_FENCE_BEFORE");
+	return adapterPooledStreams() && enabled;
+}
+
+bool adapterFenceAfter() {
+	static const bool enabled = envOn("FIDESLIB_ADAPTER_FENCE_AFTER");
 	return adapterPooledStreams() && enabled;
 }
 
@@ -88,15 +97,15 @@ void usePooledStreams(FIDESlib::CKKS::RNSPoly& poly) {
 }
 
 /// PROBE (not for merge): race amplifier over every limb of a polynomial just loaded (ProbeSpin.cuh).
-void probeScramble(FIDESlib::CKKS::RNSPoly& poly) {
-	if (FIDESlib::ProbeUploadDelayCycles() <= 0)
+void probeScramble(FIDESlib::CKKS::RNSPoly& poly, long long cycles = FIDESlib::ProbeUploadDelayCycles()) {
+	if (cycles <= 0)
 		return;
 	int current = 0;
 	cudaGetDevice(&current);
 	for (auto& part : poly.GPU) {
 		cudaSetDevice(part.device);
 		auto one = [&](auto& limb) {
-			std::visit([&](auto& l) { FIDESlib::ProbeScramble(part.s.ptr(), l.v.data, static_cast<size_t>(l.v.size) * sizeof(*l.v.data)); }, limb);
+			std::visit([&](auto& l) { FIDESlib::ProbeScramble(part.s.ptr(), l.v.data, static_cast<size_t>(l.v.size) * sizeof(*l.v.data), cycles); }, limb);
 		};
 		for (auto& limb : part.limb)
 			one(limb);
@@ -117,24 +126,33 @@ class PlaintextFence {
   public:
 	PlaintextFence(std::vector<FIDESlib::CKKS::Ciphertext*> cts, std::vector<FIDESlib::CKKS::Plaintext*> pts)
 	: cts_(std::move(cts)), pts_(std::move(pts)) {
-		if (!adapterFences())
-			return;
-		for (auto* ct : cts_)
-			for (auto* pt : pts_)
-				for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
-					ct->c0.GPU[g].s.wait(pt->c0.GPU[g].s);
-					ct->c1.GPU[g].s.wait(pt->c0.GPU[g].s);
+		if (adapterFenceBefore())
+			for (auto* ct : cts_)
+				for (auto* pt : pts_)
+					for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
+						ct->c0.GPU[g].s.wait(pt->c0.GPU[g].s);
+						ct->c1.GPU[g].s.wait(pt->c0.GPU[g].s);
+					}
+		// PROBE (not for merge): delay the readers so a missing "after" edge lets the scramble below
+		// land under their reads.
+		if (FIDESlib::ProbeWar())
+			for (auto* ct : cts_)
+				for (size_t g = 0; g < ct->c0.GPU.size(); ++g) {
+					FIDESlib::ProbeSpin(ct->c0.GPU[g].s.ptr(), FIDESlib::ProbeUploadDelayCycles());
+					FIDESlib::ProbeSpin(ct->c1.GPU[g].s.ptr(), FIDESlib::ProbeUploadDelayCycles());
 				}
 	}
 	~PlaintextFence() {
-		if (!adapterFences())
-			return;
-		for (auto* pt : pts_)
-			for (auto* ct : cts_)
-				for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
-					pt->c0.GPU[g].s.wait(ct->c0.GPU[g].s);
-					pt->c0.GPU[g].s.wait(ct->c1.GPU[g].s);
-				}
+		if (adapterFenceAfter())
+			for (auto* pt : pts_)
+				for (auto* ct : cts_)
+					for (size_t g = 0; g < pt->c0.GPU.size(); ++g) {
+						pt->c0.GPU[g].s.wait(ct->c0.GPU[g].s);
+						pt->c0.GPU[g].s.wait(ct->c1.GPU[g].s);
+					}
+		if (FIDESlib::ProbeWar())
+			for (auto* pt : pts_)
+				probeScramble(pt->c0);
 	}
 	PlaintextFence(const PlaintextFence&)			 = delete;
 	PlaintextFence& operator=(const PlaintextFence&) = delete;
@@ -1648,8 +1666,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(eval_ksk.a);
 		usePooledStreams(eval_ksk.b);
 		eval_ksk.Initialize(raw_eval_ksk);
-		probeScramble(eval_ksk.a);
-		probeScramble(eval_ksk.b);
+		probeScramble(eval_ksk.a, FIDESlib::ProbeKeyDelayCycles());
+		probeScramble(eval_ksk.b, FIDESlib::ProbeKeyDelayCycles());
 		c->AddEvalKey(std::move(eval_ksk));
 	}
 	// Rotational key switching keys.
@@ -1659,8 +1677,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		usePooledStreams(rot_ksk.a);
 		usePooledStreams(rot_ksk.b);
 		rot_ksk.Initialize(raw_rot_ksk);
-		probeScramble(rot_ksk.a);
-		probeScramble(rot_ksk.b);
+		probeScramble(rot_ksk.a, FIDESlib::ProbeKeyDelayCycles());
+		probeScramble(rot_ksk.b, FIDESlib::ProbeKeyDelayCycles());
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
 	// Bootstrapping keys.
@@ -1670,7 +1688,7 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 	// Keys are uploaded once, here, and read by every later key switch from whatever stream that
 	// runs on: one wait for the uploads to land is cheaper than a fence at every reader.
-	if (adapterFences()) {
+	if (adapterFenceBefore()) {
 		int current = 0;
 		cudaGetDevice(&current);
 		for (const int gpu : c->GPUid) {
