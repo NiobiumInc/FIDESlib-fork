@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 
 namespace FIDESlib {
 namespace {
@@ -54,6 +56,21 @@ ProbeSpinStats& ProbeLastSpin() {
 	return st;
 }
 
+namespace {
+std::mutex scrambled_lock;
+std::map<const void*, std::pair<std::chrono::steady_clock::time_point, long long>> scrambled; // buffer -> (when, cycles)
+} // namespace
+
+double ProbeMsSinceScrambled(const void* buffer, long long* cycles) {
+	std::lock_guard<std::mutex> g(scrambled_lock);
+	auto it = scrambled.find(buffer);
+	if (it == scrambled.end())
+		return -1.0;
+	if (cycles)
+		*cycles = it->second.second;
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second.first).count();
+}
+
 std::chrono::steady_clock::time_point& ProbeLastScrambleTime() {
 	static std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
 	return t;
@@ -63,6 +80,11 @@ void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_
 	if (cycles <= 0 || buffers.empty())
 		return;
 	ProbeLastScrambleTime() = std::chrono::steady_clock::now();
+	{
+		std::lock_guard<std::mutex> g(scrambled_lock);
+		for (const auto& b : buffers)
+			scrambled[b.first] = { ProbeLastScrambleTime(), cycles };
+	}
 	// Every buffer saved and zeroed first, then ONE spin, then every buffer restored: a spin per
 	// buffer would serialize on the stream and multiply the window by the limb count.
 	std::vector<void*> saved(buffers.size(), nullptr);

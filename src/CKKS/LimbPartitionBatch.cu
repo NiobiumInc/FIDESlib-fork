@@ -661,6 +661,13 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 	{
 		static std::atomic<int> reported{ 0 };
 		if (reported.fetch_add(1) < 2) {
+			auto since = [](LimbPartition* k, long long* cycles) -> double {
+				if (k == nullptr || k->DIGITlimb.empty() || k->DIGITlimb[0].empty())
+					return -2.0;
+				void* p = nullptr;
+				std::visit([&](auto& l) { p = l.v.data; }, k->DIGITlimb[0][0]);
+				return ProbeMsSinceScrambled(p, cycles);
+			};
 			auto first_word = [](LimbPartition* k) -> unsigned long long {
 				if (k == nullptr || k->DIGITlimb.empty() || k->DIGITlimb[0].empty())
 					return ~0ull;
@@ -682,6 +689,11 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out,
 			const int q_end		= st.end ? (int)cudaEventQuery(st.end) : -1;
 			if (q_end == 0)
 				cudaEventElapsedTime(&spin_ms, st.start, st.end);
+			{
+				long long ca = 0, cb = 0;
+				const double ma = since(ksk_a[0] ? ksk_a[0] : ksk_a[1], &ca), mb = since(ksk_b[0] ? ksk_b[0] : ksk_b[1], &cb);
+				std::fprintf(stderr, "PROBE this key: ksk_a scrambled %.1f ms ago (cycles=%lld), ksk_b scrambled %.1f ms ago (cycles=%lld)\n", ma, ca, mb, cb);
+			}
 			std::fprintf(stderr, "PROBE last spin: cycles=%lld launch=%d end_query=%d spin_ms=%.1f\n", st.cycles, st.launch, q_end, spin_ms);
 			std::fprintf(stderr, "PROBE fusedHoistedRotateBatch: ms_since_last_scramble=%.1f q_s=%d q_ksk_a=%d q_ksk_b=%d same_ab=%d ksk_a_word=%llu ksk_b_word=%llu\n", ms,
 			  (int)cudaStreamQuery(s.ptr()), (int)cudaStreamQuery(ka->s.ptr()), (int)cudaStreamQuery(kb->s.ptr()), (int)(ka->s.ptr() == kb->s.ptr()), first_word(ka),

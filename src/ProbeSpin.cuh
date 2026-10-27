@@ -31,6 +31,8 @@ struct ProbeSpinStats {
 	cudaEvent_t start = nullptr, end = nullptr;
 };
 ProbeSpinStats& ProbeLastSpin();
+/// Milliseconds since `buffer` was last scrambled (-1: never), and that scramble's cycles.
+double ProbeMsSinceScrambled(const void* buffer, long long* cycles);
 /// When the last ProbeScramble was enqueued (host clock).
 std::chrono::steady_clock::time_point& ProbeLastScrambleTime();
 void ProbeScramble(cudaStream_t stream, const std::vector<std::pair<void*, size_t>>& buffers, long long cycles);
