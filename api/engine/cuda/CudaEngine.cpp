@@ -1727,6 +1727,17 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		cudaSetDevice(current);
 	}
 
+	// PROBE (not for merge): FIDESLIB_PROBE_KEY_B_LATE_US=N scrambles the b half of every rotation
+	// key AFTER the load, so the window is still open at the first key switch: the load itself
+	// waits for earlier uploads (measured: its duration grows with the in-load delay), which closes
+	// any window opened inside it. Models a key upload still in flight at first use.
+	if (const char* late = std::getenv("FIDESLIB_PROBE_KEY_B_LATE_US"); late != nullptr && late[0] != '\0' && late[0] != '0') {
+		const long long cycles = std::atoll(late) * 2000LL;
+		for (auto& [tag, keys] : c->precom.keys)
+			for (auto& [index, ksk] : keys.rot_keys)
+				probeScramble(ksk.b, cycles);
+	}
+
 	context_ = std::make_unique<FIDESlib::CKKS::Context>(std::move(c));
 }
 
