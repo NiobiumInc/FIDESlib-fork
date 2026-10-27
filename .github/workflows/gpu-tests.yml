@@ -95,8 +95,17 @@ jobs:
               '.github/scripts/gpu_suite.py' '.github/scripts/needs_tests.py' '.github/no-test-paths.txt'
 
   gpu:
-    name: GPU test suite (RTX PRO 6000)
+    name: Adapter streams probe, arm ${{ matrix.arm }}
     needs: changes
+    # PROBE (not for merge): one VM per arm, so each stays well under the runner's lifetime.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arm: A-legacy-delay,   pooled: '0', fences: '1', delay: '2000' }
+          - { arm: B-pooled-nofence, pooled: '1', fences: '0', delay: '2000' }
+          - { arm: C-pooled-fenced,  pooled: '1', fences: '1', delay: '2000' }
+          - { arm: D-pooled-nodelay, pooled: '1', fences: '1', delay: '0' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
@@ -104,7 +113,7 @@ jobs:
       ${{ !cancelled() && needs.changes.outputs.run != 'false' &&
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: [self-hosted, Linux, X64, gcp-ephemeral, g4-standard-48, "run-${{ github.run_id }}"]
-    timeout-minutes: 150
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -204,97 +213,44 @@ jobs:
 
       # The test binary of this job defines the tests of every source file. Each one declared for a
       # backend (test/TestRegistration.hpp) has to be registered on one of them: a condition no backend
-      # satisfies leaves a test that runs nowhere. Listing the tests starts no backend.
-      - name: Check that every test is registered on some backend
-        working-directory: build
-        run: python3 ../.github/scripts/check_coverage.py --binary ./fideslib-test --sources ../test/*.cpp ../test/*.cu
-
-      # The public-API tests (ApiTests, ApiParityTest) run on the CPU backend
-      # unless told otherwise; cuda makes them exercise the CUDA engine, which
-      # is what this job is for. The CPU backend has its own job in ci.yml.
-      - name: Test
+      # PROBE (not for merge): every public-API fixture on the CUDA engine, the only code the
+      # adapter change touches. A: plaintexts/keys on the legacy stream with the upload delay
+      # (control: the delay alone must break nothing). B: pooled streams, no adapter fences
+      # (negative control: must fail, or B-C prove nothing). C: pooled + fences + delay (the claim).
+      # D: pooled + fences, no delay (the configuration as it would ship).
+      - name: Arm ${{ matrix.arm }}
         working-directory: build
         env:
           FIDESLIB_TEST_BACKEND: cuda
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
+          FIDESLIB_ADAPTER_POOLED_STREAMS: ${{ matrix.pooled }}
+          FIDESLIB_ADAPTER_FENCES: ${{ matrix.fences }}
+          FIDESLIB_PROBE_UPLOAD_DELAY_US: ${{ matrix.delay }}
+          ARM: ${{ matrix.arm }}
         run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results \
-            --not-applicable ../.github/tests-not-applicable/cuda.txt \
-            --gaps ../.github/tests-known-gaps/cuda.txt "${args[@]}"
+          filter='CKKSTest.*:CKKSRotateManyTest.*:PreparedLtTest.*:ApiParity*:CKKSBootstrapTest.*:CKKSFlexBootstrapTest.*:BootstrapToLevelTest.*:ReducedNoise*:KeyAccessTest.*:ContextLifetimeTest.*:NoEvalMultKeyTest.*:SparseSecretModEval*:ChebyshevFixedManualCoworker*'
+          mkdir -p gpu-results
+          log=gpu-results/arm-$ARM.log
+          start=$(date +%s)
+          timeout 2700 ./fideslib-test --gtest_filter="$filter" --gtest_output=xml:gpu-results/arm-$ARM.xml > "$log" 2>&1
+          rc=$?
+          end=$(date +%s)
+          {
+            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS fences=$FIDESLIB_ADAPTER_FENCES delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US): exit=$rc, $((end-start)) s"
+            echo
+            echo "ran: $(grep -c '^\[ RUN      \]' "$log"), ok: $(grep -c '^\[       OK \]' "$log"), skipped: $(grep -c '^\[  SKIPPED \]' "$log")"
+            grep -E '^\[  (PASSED|FAILED) +\] [0-9]+' "$log"
+            echo
+            echo "failed tests:"
+            grep -E '^\[  FAILED  \] [A-Za-z0-9_/]+\.[A-Za-z0-9_/]+' "$log" | sed -E 's/ \([0-9]+ ms\)//; s/, where.*//' | sort -u | head -40
+            echo "last RUN line: $(grep '^\[ RUN      \]' "$log" | tail -1)"
+            echo "last lines:"; tail -3 "$log" | cut -c1-200
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # The concurrent-operations suite, in a process of its own: the library reads
-      # FIDESLIB_CONCURRENT_OPS once, at its first use, and the suite above has to run
-      # without it. Same retries and report; its lists are in .github/gpu-tests/concurrent/.
-      # It runs even when the default-mode suite failed, so both results are reported.
-      # Every test gets a process of its own: a CUDA error leaves the context unusable for
-      # the rest of the process, so one crash would otherwise hide every test after it.
-      - name: Test concurrent operations
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-          KNOWN_FAILURES: ${{ inputs.known_failures }}
-        run: |
-          args=()
-          if [ "$KNOWN_FAILURES" = true ]; then args+=(--known-failures); fi
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.*:ConcurrentOpsFence.*:ConcurrentOpsPoolDrainTest.*:CKKSTest.ConcurrentHostShadowCopyOnWrite' \
-            --title 'GPU test suite, concurrent operations' --isolate "${args[@]}"
-
-      # The lane tests again, together in ONE process, three times over, with no retry. A race
-      # between the threads of the concurrent mode shows only there: in the pass above every test
-      # starts a fresh process, and a failure that a retry clears passes as flaky. The stream-ordered
-      # allocator's cross-stream reuse on event dependencies broke exactly that way (see
-      # ConfigurePoolForConcurrentOps in src/CudaUtils.cuh), and the isolated pass stayed green.
-      # StagedLanesMatchSerial is the family that showed it most often.
-      # A crash here hides the tests after it in this pass, but the pass above runs each of them.
-      - name: Test concurrent operations in one process
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_CONCURRENT_OPS: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests/concurrent gpu-results/concurrent-one-process \
-            --only 'ConcurrencyTests/ConcurrentOpsTest.StagedLanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.LanesMatchSerial/*:ConcurrencyTests/ConcurrentOpsTest.SharedOperandsMatchSerial/*' \
-            --title 'GPU test suite, concurrent lanes in one process' --repeat 3 --retries 0
-
-      # The pool stress suite again with the per-stream device memory pool, which is opt-in
-      # (FIDESLIB_POOL_PER_STREAM=1, read once at the first allocation) and so never runs in the
-      # passes above. The suite's tests share one process, three times over, with no retry: a
-      # failure that depends on what an earlier test left in the pool shows only that way. It runs
-      # even when an earlier pass failed, so every result is reported.
-      - name: Test the per-stream memory pool
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        env:
-          FIDESLIB_TEST_BACKEND: cuda
-          FIDESLIB_POOL_PER_STREAM: '1'
-        run: |
-          python3 ../.github/scripts/gpu_suite.py ./fideslib-test ../.github/gpu-tests gpu-results/pool-per-stream \
-            --only 'PoolStressTest.*' \
-            --title 'GPU test suite, per-stream memory pool' --repeat 3 --retries 0
-
-      # What every pass ran, in one table, with the reasons of the tests that skipped themselves.
-      # The passes above write their own sections; this adds the totals.
-      - name: Test totals
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: build
-        run: |
-          python3 -I ../.github/scripts/test_summary.py --strict --title "Test results: GPU backend, totals" \
-            --row "Default suite=gpu-results/gate.xml" \
-            --row "Concurrent operations, one process per test=gpu-results/concurrent/gate/*.xml" \
-            --row "Concurrent lanes together=gpu-results/concurrent-one-process/gate.xml" \
-            --row "Per-stream memory pool=gpu-results/pool-per-stream/gate.xml"
-
-      - name: Upload test reports
+      - name: Upload arm report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gpu-test-reports
+          name: arm-${{ matrix.arm }}
           path: build/gpu-results/
           retention-days: 14
           if-no-files-found: ignore
