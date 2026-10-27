@@ -102,8 +102,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
-          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: kskb-unfenced,   pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '0', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: kskb-fenced,     pooled: '1', before: '0', after: '1', delay: '0',    key: '300000', keyb: '1500000', war: '0', kskb: '1', keysync: '1', filter: '*RotateManyTest.*/B2_*:*RotateManyTest.*/B7_*:*RotateManyTest.*/B32_*', each: '1' }
+          - { arm: no-key-sync,     pooled: '1', before: '1', after: '1', delay: '2000', key: '300000', keyb: '1500000', war: '1', kskb: '1', keysync: '0', filter: '*CKKSTest.*:*CKKSRotateManyTest.*:*PreparedLtTest.*:*ApiParity*:*CKKSBootstrapTest.*:*CKKSFlexBootstrapTest.*:*BootstrapToLevelTest.*:*ReducedNoise*:*KeyAccessTest.*:*ContextLifetimeTest.*:*NoEvalMultKeyTest.*:*SparseSecretModEval*:*ChebyshevFixedManualCoworker*', each: '1' }
     # Each run rents a GPU VM, so it skips draft pull requests, and pull requests
     # and merges whose changes cannot affect a test result. A failed decision
     # runs it.
@@ -219,6 +220,8 @@ jobs:
       # kskb-unfenced / kskb-fenced: only the batched rotate-many tests, without the engine's key wait, with the b half of
       # every key held back longer than the a half: fusedHoistedRotateBatch fences only ksk_a, so
       # the first must fail; the second adds the ksk_b wait in the library and must pass.
+      # no-key-sync: every test, one per process (fresh keys inside the amplifier's window), with the
+      # plaintext fences and the ksk_b wait but without the engine's wait after the key uploads.
       - name: Arm ${{ matrix.arm }}
         working-directory: build
         env:
@@ -233,6 +236,7 @@ jobs:
           FILTER: ${{ matrix.filter }}
           EACH: ${{ matrix.each }}
           FIDESLIB_PROBE_KEY_B_OWN_STREAM: '1'
+          FIDESLIB_ADAPTER_KEY_SYNC: ${{ matrix.keysync }}
           FIDESLIB_PROBE_WAR: ${{ matrix.war }}
           # multPt's own fences off in every arm: upstream's multPt has none.
           FIDESLIB_PROBE_NO_MULTPT_FENCE: '1'
@@ -260,7 +264,7 @@ jobs:
           fi
           end=$(date +%s)
           {
-            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE kskb_own_stream=$FIDESLIB_PROBE_KEY_B_OWN_STREAM war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
+            echo "### Arm $ARM (pooled=$FIDESLIB_ADAPTER_POOLED_STREAMS before=$FIDESLIB_ADAPTER_FENCE_BEFORE after=$FIDESLIB_ADAPTER_FENCE_AFTER delay_us=$FIDESLIB_PROBE_UPLOAD_DELAY_US key_us=$FIDESLIB_PROBE_KEY_DELAY_US key_b_us=$FIDESLIB_PROBE_KEY_B_DELAY_US kskb_fence=$FIDESLIB_PROBE_BATCH_KSKB_FENCE kskb_own_stream=$FIDESLIB_PROBE_KEY_B_OWN_STREAM key_sync=$FIDESLIB_ADAPTER_KEY_SYNC war=$FIDESLIB_PROBE_WAR): exit=$rc, $((end-start)) s"
             echo
             echo "ran: $(grep -c '^\[ RUN      \]' "$log"), ok: $(grep -c '^\[       OK \]' "$log"), skipped: $(grep -c '^\[  SKIPPED \]' "$log")"
             grep -E '^\[  (PASSED|FAILED) +\] [0-9]+' "$log"

@@ -133,6 +133,10 @@ void probeScramble(FIDESlib::CKKS::RNSPoly& poly, long long cycles = FIDESlib::P
 			one(limb);
 		for (auto& limb : part.SPECIALlimb)
 			one(limb);
+		// Key-switching keys keep their digits here (KeySwitchingKey::Initialize, loadDecompDigit).
+		for (auto& digit : part.DIGITlimb)
+			for (auto& limb : digit)
+				one(limb);
 	}
 	cudaSetDevice(current);
 }
@@ -1710,7 +1714,8 @@ void CudaEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 	// Keys are uploaded once, here, and read by every later key switch from whatever stream that
 	// runs on: one wait for the uploads to land is cheaper than a fence at every reader.
-	if (adapterFenceBefore()) {
+	// FIDESLIB_ADAPTER_KEY_SYNC=0 (probe) drops this wait alone, keeping the plaintext fences.
+	if (adapterFenceBefore() && envOn("FIDESLIB_ADAPTER_KEY_SYNC")) {
 		int current = 0;
 		cudaGetDevice(&current);
 		for (const int gpu : c->GPUid) {
