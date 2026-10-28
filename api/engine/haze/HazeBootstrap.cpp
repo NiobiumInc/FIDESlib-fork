@@ -1262,8 +1262,78 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 }
 
 Ciphertext<DCRTPoly>
-HazeEngine::evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t /*numIterations*/, uint32_t /*precision*/, bool /*prescaled*/) {
-	return bootstrapStaged(ctx, ciphertext);
+HazeEngine::evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool /*prescaled*/) {
+	if (numIterations <= 1) {
+		return bootstrapStaged(ctx, ciphertext);
+	}
+	if (numIterations != 2) {
+		throw std::runtime_error("haze backend: CKKS bootstrapping supports 1 or 2 iterations");
+	}
+	// Meta-BTS (iterated bootstrapping): OpenFHE's EvalBootstrap for numIterations == 2
+	// (ckksrns-fhe.cpp; the step numbers below are the oracle's), in the order
+	// CudaEngine::evalBootstrapMetaDevice runs it on the device. The two bootstraps are recorded
+	// like any single one and the glue -- the exact scale-ups by 2^precision, the error
+	// subtraction, the recombination and the scale-down -- runs on the recorded operands, so
+	// nothing is read back. Until here the two parameters were ignored and a caller asking for
+	// two iterations got one refresh, with its precision, silently (BITCOMPAT O11).
+	auto& context			= hostContext(ctx);
+	const auto cryptoParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters());
+	const auto st			= cryptoParams->GetScalingTechnique();
+	const uint64_t pow2		= uint64_t{ 1 } << precision;
+
+	auto rescaleHard = [&](Ciphertext<DCRTPoly>& c) { // ModReduceInternalInPlace(1)
+		auto p	  = devicePayload(c);
+		Operand r = rescaleCore(asOperand(p));
+		rebindPayload(*p, std::move(r.p->components), r);
+	};
+	auto toDepthOne = [&](Ciphertext<DCRTPoly>& c) { // ModReduceInternalInPlace(NSD-1)
+		while (devicePayload(c)->noiseScaleDeg > 1) {
+			rescaleHard(c);
+		}
+	};
+	auto multInt = [&](Ciphertext<DCRTPoly>& c, uint64_t s) { // MultByIntegerInPlace: exact, scale metadata unchanged
+		auto p	  = devicePayload(c);
+		Operand r = multIntCore(asOperand(p), s);
+		rebindPayload(*p, std::move(r.p->components), r);
+	};
+
+	auto pIn			  = ensureCt(ctx, ciphertext);
+	const size_t inTowers = pIn->towers;
+
+	// Step 3: the initial bootstrap. bootstrapStaged works on a copy, the input stays intact.
+	Ciphertext<DCRTPoly> b1 = bootstrapStaged(ctx, ciphertext);
+	toDepthOne(b1);
+	if (devicePayload(b1)->towers <= inTowers) {
+		// Bootstrapping gained no towers: the oracle returns the input (ckksrns-fhe.cpp :835).
+		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	}
+	// Step 4: scale the bootstrapped ciphertext up by 2^precision.
+	multInt(b1, pow2);
+	// Step 2: scale the ORIGINAL input up by 2^precision (the copy constructor clones the payload).
+	Ciphertext<DCRTPoly> up = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	if (st == lbcrypto::FIXEDMANUAL) {
+		toDepthOne(up);
+	}
+	multInt(up, pow2);
+	// Steps 5-7: the bootstrapping error. Under FIXEDAUTO the oracle drops the bootstrapped
+	// ciphertext to the input's towers first (DropLastElements, a pure truncation); under the
+	// FLEXIBLE techniques the subtraction's own level-and-scale adjustment brings it down.
+	Ciphertext<DCRTPoly> err = std::make_shared<CiphertextImpl<DCRTPoly>>(*b1);
+	if (st == lbcrypto::FIXEDAUTO) {
+		auto p = devicePayload(err);
+		for (auto& comp : p->components) {
+			comp.truncate(inTowers);
+		}
+		p->towers = inTowers;
+	}
+	ctx.EvalSubInPlace(err, up);
+	// Step 8: bootstrap the error.
+	Ciphertext<DCRTPoly> b2 = bootstrapStaged(ctx, err);
+	toDepthOne(b2);
+	// Steps 9-10: subtract the bootstrapped error, scale back down by 2^precision.
+	ctx.EvalSubInPlace(b1, b2);
+	ctx.EvalMultInPlace(b1, 1.0 / static_cast<double>(pow2));
+	return b1;
 }
 
 void HazeEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
