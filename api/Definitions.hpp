@@ -60,6 +60,12 @@ enum ScalingTechnique {
 	FLEXIBLEAUTOEXT,
 };
 
+/// @brief Enumeration of CKKS data types, as OpenFHE CKKSDataType.
+enum CKKSDataType {
+	REAL = 0,
+	COMPLEX,
+};
+
 /// @brief Enumeration of supported key switching techniques.
 enum KeySwitchTechnique {
 	INVALID_KS_TECH = 0,

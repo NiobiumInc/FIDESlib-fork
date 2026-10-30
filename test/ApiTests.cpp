@@ -36,6 +36,7 @@ using FIDESlib::Testing::GetTestBackend;
 using FIDESlib::Testing::TestBackend;
 using FIDESlib::Testing::OnHaze;
 using FIDESlib::Testing::OnCuda;
+using FIDESlib::Testing::OnDevice;
 using FIDESlib::Testing::OnHostBackend;
 using FIDESlib::Testing::InConcurrentOpsMode;
 using FIDESlib::Testing::OnlyIf;
@@ -2690,3 +2691,67 @@ TEST(SparseSecretModEval, SparseTernaryBootstrapIsCorrect) {
 }
 
 
+// ---- CKKSDataType ----
+
+namespace {
+// A small FIXEDAUTO context of the given data type and its keys; device backends load it later.
+struct DataTypeContext {
+	CryptoContext<DCRTPoly> cc;
+	KeyPair<DCRTPoly> keys;
+};
+DataTypeContext MakeDataTypeContext(CKKSDataType type) {
+	CCParams<CryptoContextCKKSRNS> params;
+	params.SetMultiplicativeDepth(1);
+	params.SetScalingModSize(50);
+	params.SetBatchSize(8);
+	params.SetRingDim(1u << 16);
+	params.SetScalingTechnique(FIXEDAUTO);
+	params.SetCKKSDataType(type);
+	ConfigureTestEngine(params);
+	auto cc = GenCryptoContext(params);
+	cc->Enable(PKE);
+	cc->Enable(KEYSWITCH);
+	cc->Enable(LEVELEDSHE);
+	cc->Enable(ADVANCEDSHE);
+	cc->Enable(FHE);
+	auto keys = cc->KeyGen();
+	return { cc, std::move(keys) };
+}
+} // namespace
+
+// The getter reports what the parameters set, REAL by default.
+TEST(CKKSDataTypeTest, GetCKKSDataType) {
+	EXPECT_EQ(MakeDataTypeContext(REAL).cc->GetCKKSDataType(), REAL);
+	EXPECT_EQ(MakeDataTypeContext(COMPLEX).cc->GetCKKSDataType(), COMPLEX);
+}
+
+// Under COMPLEX, imaginary parts survive encrypt, an addition and decrypt.
+TEST(CKKSDataTypeTest, ComplexKeepsImaginaryParts) {
+	auto [cc, keys] = MakeDataTypeContext(COMPLEX);
+	if (TestUseDevice())
+		cc->LoadContext(keys.publicKey);
+	std::vector<std::complex<double>> cv = { { 1.0, -2.0 }, { 0.5, 3.0 }, { -4.0, 0.25 }, { 2.0, 2.0 }, { 0.0, -1.0 }, { 7.0, 0.0 }, { -0.5, -0.5 }, { 3.0, 8.0 } };
+	auto pc = cc->MakeCKKSPackedPlaintext(cv);
+	auto ct = cc->Encrypt(pc, keys.publicKey);
+	auto r	= cc->EvalAdd(ct, ct);
+	Plaintext pt;
+	cc->Decrypt(r, keys.secretKey, &pt);
+	pt->SetLength(cv.size());
+	auto out = pt->GetCKKSPackedValue();
+	for (size_t i = 0; i < cv.size(); ++i) {
+		EXPECT_NEAR(out[i].real(), 2 * cv[i].real(), CKKS_PRECISION) << "slot " << i;
+		EXPECT_NEAR(out[i].imag(), 2 * cv[i].imag(), CKKS_PRECISION) << "slot " << i;
+	}
+}
+
+// The device bootstraps lack OpenFHE's separate imaginary-part pass, so their bootstrap setup
+// refuses a COMPLEX context.
+FIDES_TEST_IF(OnDevice(), CKKSDataTypeTest, DevicesRefuseComplexBootstrapSetup) {
+	auto [cc, keys] = MakeDataTypeContext(COMPLEX);
+	try {
+		cc->EvalBootstrapSetup({ 1, 1 });
+		FAIL() << "EvalBootstrapSetup on a COMPLEX context did not throw";
+	} catch (const std::exception& e) {
+		EXPECT_NE(std::string(e.what()).find("COMPLEX"), std::string::npos) << e.what();
+	}
+}

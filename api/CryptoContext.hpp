@@ -55,6 +55,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	uint32_t GetCyclotomicOrder() const;
 	uint32_t GetRingDimension() const;
+	CKKSDataType GetCKKSDataType() const;
 	double GetPreScaleFactor(uint32_t slots);
 	/// @brief Devices this context is configured to use (empty on the CPU backend).
 	std::vector<int> GetCudaDevices() const;
