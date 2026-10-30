@@ -715,6 +715,18 @@ void CudaEngine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ci
 	FIDESlib::CKKS::evalChebyshevSeries(*res_gpu, coeffs, a, b);
 }
 
+Ciphertext<DCRTPoly> CudaEngine::multByMonomial(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	deviceCt(result)->multMonomial(static_cast<int>(power % (2 * ctx.GetRingDimension())));
+	return result;
+}
+
+void CudaEngine::multByMonomialInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	ctx.LoadCiphertext(ciphertext);
+	deviceCt(ciphertext)->multMonomial(static_cast<int>(power % (2 * ctx.GetRingDimension())));
+}
+
 Ciphertext<DCRTPoly> CudaEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
 	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);

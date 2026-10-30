@@ -1256,6 +1256,14 @@ std::vector<double> CryptoContextImpl<DCRTPoly>::GetChebyshevCoefficients(std::f
 	return fideslib::get_chebyshev_coefficients(func, a, b, degree);
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::MultByMonomial(const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	return engine_->multByMonomial(*this, ciphertext, power);
+}
+
+void CryptoContextImpl<DCRTPoly>::MultByMonomialInPlace(Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	engine_->multByMonomialInPlace(*this, ciphertext, power);
+}
+
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Rescale(const Ciphertext<DCRTPoly>& ciphertext) {
 	return engine_->rescale(*this, ciphertext);
 }

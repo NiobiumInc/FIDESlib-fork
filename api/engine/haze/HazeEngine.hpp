@@ -110,6 +110,8 @@ class HazeEngine : public Engine {
 	void evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, Plaintext& pt) override;
 	Ciphertext<DCRTPoly> evalSquare(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct) override;
 	void evalSquareInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct) override;
+	Ciphertext<DCRTPoly> multByMonomial(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) override;
+	void multByMonomialInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t power) override;
 	Ciphertext<DCRTPoly> rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) override;
 	void rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext) override;
 
@@ -498,14 +500,13 @@ class HazeEngine : public Engine {
 	/// @brief Integer scalar multiply (OpenFHE MultByIntegerInPlace): scalar mod q_i per
 	/// limb, metadata unchanged.
 	Operand multIntCore(const Operand& x, uint64_t scalar);
-	/// @brief Multiply both components by the bare monomial X^power (OpenFHE
-	/// MultByMonomialInPlace / CUDA Ciphertext::multMonomial) in R_q = Z_q[X]/(X^N+1).
-	/// Implemented with the coefficient-domain primitive hazeRotAutomorphCoeffMrp (mult by
-	/// X^{-offset}) plus an optional per-limb negate, mapping X^power onto X^{-offset} with the
-	/// X^N=-1 wraparound sign handled explicitly (see the .cpp for the offset/sign derivation).
-	/// Records a single op on the existing ciphertext — no synthetic monomial input. Metadata
-	/// unchanged (a literal monomial, not a CKKS-encoded plaintext — NSD/sf/level preserved).
-	Operand multByMonomialCore(const Operand& x, uint32_t power);
+	/// @brief OpenFHE MultByMonomialInPlace: a pointwise multiply of every component by X^power in
+	/// evaluation form. Metadata is unchanged.
+	Operand multByMonomialCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t power);
+	/// @brief X^r over the leading `towers` Q primes in evaluation form, built on the host and
+	/// uploaded once per (r, towers).
+	const hazebk::LimbChain& monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uint32_t r, size_t towers);
+	std::map<std::pair<uint32_t, size_t>, hazebk::LimbChain> monomials_;
 	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
 	/// of OpenFHE EvalLinearTransform).
 	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);

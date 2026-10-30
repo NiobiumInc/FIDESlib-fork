@@ -215,74 +215,43 @@ HazeEngine::Operand HazeEngine::multIntCore(const Operand& x, uint64_t scalar) {
 	return res;
 }
 
-HazeEngine::Operand HazeEngine::multByMonomialCore(const Operand& x, uint32_t power) {
-	// OpenFHE MultByMonomialInPlace / CUDA Ciphertext::multMonomial (Ciphertext.cpp:1623):
-	// multiply both components by the literal monomial X^power in R_q = Z_q[X]/(X^N+1).
-	//
-	// We use the dedicated coefficient-domain primitive hazeRotAutomorphCoeffMrp(offset), which is
-	// multiplication by X^{-offset} (negacyclic LEFT shift, offset in [0,N), X^N = -1 sign flip on
-	// wraparound — haze.h:281). This records a single IR op on the EXISTING ciphertext and creates
-	// no synthetic monomial input (a host-built plaintext-monomial would need a replay-bridge input
-	// template, which fails to synthesize for a literal monomial — its bytes are not a valid CKKS
-	// ciphertext shape). Map X^power onto X^{-offset}:
-	//   r = power mod 2N.
-	//   r == 0          -> X^1 == identity ... handled as r in [0,N) below (offset 0, no negate).
-	//   r in [N, 2N)    -> X^r = X^{-(2N-r)};  offset = 2N - r in (0,N], no extra sign.
-	//   r in [0, N)     -> X^r = -X^{-(N-r)};  offset = N - r in (0,N], with a per-limb negate
-	//                      (because X^{-(N-r)} = X^{(2N-(N-r))} ... = X^{N+r} = X^N*X^r = -X^r).
-	// offset == N collapses to offset 0 with the sign already accounted for (X^{-N} = -1).
-	// For our two call sites: power = 3N/2 -> r=3N/2 -> offset=N/2, no negate; power = N/2 ->
-	// r=N/2 -> offset=N/2, negate. (Consistent: X^{3N/2} = -X^{N/2}.)
-	const uint32_t N	= static_cast<uint32_t>(ringDim_);
-	const uint32_t mTwo = 2 * N;
-	const uint32_t r	= power % mTwo; // X^{2N} = 1
-
-	uint32_t offset = 0;
-	bool negate		= false;
-	if (r >= N) {
-		offset = mTwo - r; // in (0, N]
-	} else {
-		offset = N - r; // in (0, N]
-		negate = true;
+const LimbChain& HazeEngine::monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uint32_t r, size_t towers) {
+	if (auto it = monomials_.find({ r, towers }); it != monomials_.end()) {
+		return it->second;
 	}
-	if (offset == N) { // X^{-N} = -1: fold to offset 0 and flip the accumulated sign
-		offset = 0;
-		negate = !negate;
+	// As OpenFHE MultByMonomialInPlace builds it: +1 at r, or -1 at r - N when r >= N.
+	const auto params = hostContext(ctx)->GetCryptoParameters()->GetElementParams();
+	const uint32_t n  = static_cast<uint32_t>(ringDim_);
+	lbcrypto::DCRTPoly monomial(params, Format::COEFFICIENT, true);
+	for (size_t t = 0; t < params->GetParams().size(); ++t) {
+		lbcrypto::NativePoly tower(params->GetParams()[t], Format::COEFFICIENT, true);
+		tower[r % n] = r < n ? lbcrypto::NativeInteger(1) : params->GetParams()[t]->GetModulus() - lbcrypto::NativeInteger(1);
+		monomial.SetElementAtIndex(t, std::move(tower));
 	}
-
-	const auto base = qPrefix(x.towers);
-
-	std::vector<uint64_t> negScalars(x.towers);
-	for (size_t t = 0; t < x.towers; ++t) {
-		negScalars[t] = qBase_[t] - 1; // ≡ -1 mod q_t
-	}
-
-	// hazeRotAutomorphCoeffMrp is a COEFFICIENT-form negacyclic shift (haze.h:281), but ciphertext
-	// limbs travel the bootstrap pipeline in EVALUATION form. Bracket the monomial multiply in
-	// INTT (eval -> coeff) ... shift [... optional -1] ... NTT (coeff -> eval), mirroring CUDA
-	// Ciphertext::multMonomial which builds the monomial in coeff form, NTTs it, then multiplies
-	// pointwise in eval form (Ciphertext.cpp:1623-1685). Skipping the INTT/NTT applies the shift to
-	// eval-domain samples, which is NOT a monomial multiply and corrupts the ciphertext.
-	auto shiftChain = [&](const LimbChain& src) {
-		LimbChain coeff(x.towers, polyBytes_);
-		hazeCheck(hazeINTTMrp(coeff.data(), src.asConst().data(), base.data(), base.size(), nullptr), "hazeINTTMrp(monomial)");
-		LimbChain shifted(x.towers, polyBytes_);
-		hazeCheck(hazeRotAutomorphCoeffMrp(shifted.data(), coeff.asConst().data(), offset, base.data(), base.size(), nullptr), "hazeRotAutomorphCoeffMrp(monomial)");
-		if (negate) {
-			LimbChain neg(x.towers, polyBytes_);
-			hazeCheck(hazeMulScalarMrp(neg.data(), shifted.asConst().data(), negScalars.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp(monomial negate)");
-			shifted = std::move(neg);
+	monomial.SetFormat(Format::EVALUATION);
+	std::vector<std::vector<uint64_t>> rows(towers, std::vector<uint64_t>(n));
+	for (size_t t = 0; t < towers; ++t) {
+		const auto& vals = monomial.GetElementAtIndex(static_cast<uint32_t>(t)).GetValues();
+		for (uint32_t i = 0; i < n; ++i) {
+			rows[t][i] = vals[i].template ConvertToInt<uint64_t>();
 		}
-		LimbChain ev(x.towers, polyBytes_);
-		hazeCheck(hazeNTTMrp(ev.data(), shifted.asConst().data(), base.data(), base.size(), nullptr), "hazeNTTMrp(monomial)");
-		return ev;
-	};
+	}
+	return monomials_.emplace(std::make_pair(r, towers), LimbChain(rows, qPrefix(towers))).first->second;
+}
 
-	LimbChain out0 = shiftChain(x.p->c0());
-	LimbChain out1 = shiftChain(x.p->c1());
-
-	Operand res = x; // metadata unchanged (literal monomial: NSD/sf/level preserved)
-	res.p		= finishPayload(hazebk::makeComponents(std::move(out0), std::move(out1)), res);
+HazeEngine::Operand HazeEngine::multByMonomialCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t power) {
+	// X^(2N) = 1, so the monomial depends on power mod 2N, and it is built at the ciphertext's level.
+	const LimbChain& monomial = monomialChain(ctx, power % (2 * static_cast<uint32_t>(ringDim_)), x.towers);
+	const auto base			  = qPrefix(x.towers);
+	std::vector<LimbChain> outs;
+	outs.reserve(x.p->components.size());
+	for (const auto& comp : x.p->components) {
+		LimbChain out(x.towers, polyBytes_);
+		hazeCheck(hazeMulMrp(out.data(), comp.asConst().data(), monomial.asConst().data(), base.data(), base.size(), nullptr), "hazeMulMrp(monomial)");
+		outs.push_back(std::move(out));
+	}
+	Operand res = x;
+	res.p		= finishPayload(std::move(outs), res);
 	return res;
 }
 
@@ -1111,7 +1080,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 	};
 	auto multMonomial = [&](Ciphertext<DCRTPoly>& c, uint32_t power) {
 		auto p	  = devicePayload(c);
-		Operand r = multByMonomialCore(asOperand(p), power);
+		Operand r = multByMonomialCore(ctx, asOperand(p), power);
 		rebindPayload(*p, std::move(r.p->components), r);
 	};
 

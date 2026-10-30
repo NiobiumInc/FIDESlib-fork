@@ -406,6 +406,11 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void EvalChebyshevSeriesInPlace(Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b);
 	static std::vector<double> GetChebyshevCoefficients(std::function<double(double)>& func, double a, double b, size_t degree);
 
+	/// @brief OpenFHE MultByMonomial: multiply every component by X^power in Z_q[X]/(X^N+1), leaving
+	/// level, scale and noise degree unchanged.
+	Ciphertext<DCRTPoly> MultByMonomial(const Ciphertext<DCRTPoly>& ciphertext, uint32_t power);
+	void MultByMonomialInPlace(Ciphertext<DCRTPoly>& ciphertext, uint32_t power);
+
 	Ciphertext<DCRTPoly> Rescale(const Ciphertext<DCRTPoly>& ciphertext);
 	void RescaleInPlace(Ciphertext<DCRTPoly>& ciphertext);
 

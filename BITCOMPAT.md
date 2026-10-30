@@ -282,6 +282,20 @@ level with that of a CPU-engine context built from the same parameters.
 `ReducedLevelMatchesBootstrapThenDrop` now encrypts deep enough that its target sits below the input
 level, and asserts that precondition.
 
+### R17. `MultByMonomial` on the api
+`CryptoContext::MultByMonomial(ct, power)` and `MultByMonomialInPlace` mirror OpenFHE's
+`MultByMonomial`: every component (2 or 3) is multiplied by X^power, and level, scale and noise
+degree are unchanged. The power is reduced mod 2N first, as OpenFHE does; the CUDA
+`Ciphertext::multMonomial` used to write -1 for every power of N or more, so X^(2N+k) came out as
+-X^k, and it refused a degree-2 ciphertext. haze multiplies pointwise by the monomial in evaluation
+form, built on the host and uploaded once per power and level, and its bootstrap uses the same core
+in place of the INTT, shift and NTT it used before. The result is bit-exact against OpenFHE on CUDA and haze
+across the ring, for powers of 2N and above, a ciphertext with dropped towers and a degree-2
+ciphertext.
+
+Tests: `CKKSTest.*MultByMonomial*` (`test/ApiTests.cpp`); `ApiParityTest.*MultByMonomial*`
+(`test/ApiParityTest.cpp`).
+
 ### O1. `EvalRotate` unification *(resolved — landed as `fideslib-ref-v1.5.1.2`)*
 The hoisted HYBRID formulation (already used by `EvalFastRotation`, added upstream for the GPU
 backend) is extended to `EvalRotate`/`EvalAtIndex`/`EvalAutomorphism`/`Conjugate`, making
