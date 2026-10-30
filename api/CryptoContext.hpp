@@ -408,6 +408,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	Ciphertext<DCRTPoly> Rescale(const Ciphertext<DCRTPoly>& ciphertext);
 	void RescaleInPlace(Ciphertext<DCRTPoly>& ciphertext);
+	/// @brief OpenFHE Compress: mod-reduce down to scale degree `noiseScaleDeg`, then keep `towersLeft`
+	/// towers; a ciphertext with that many towers or fewer keeps them.
+	Ciphertext<DCRTPoly> Compress(const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft = 1, size_t noiseScaleDeg = 1);
 
 	static void SetLevel(Ciphertext<DCRTPoly>& ct, size_t level);
 

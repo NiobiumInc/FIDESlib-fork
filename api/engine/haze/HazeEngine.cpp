@@ -1969,6 +1969,30 @@ void HazeEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
+Ciphertext<DCRTPoly> HazeEngine::compress(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft, size_t noiseScaleDeg) {
+	// OpenFHE LeveledSHERNS::Compress on the recorded chains: mod-reduce, then drop towers only.
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "Compress");
+	Operand res = asOperand(p);
+	if (res.noiseScaleDeg <= noiseScaleDeg) {
+		// No rescale made a new payload, so copy only the towers the result keeps.
+		res.towers = std::min<size_t>(towersLeft, res.towers);
+		std::vector<LimbChain> comps;
+		for (const auto& comp : p->components)
+			comps.push_back(passThroughChain(comp, res.towers));
+		res.p = finishPayload(std::move(comps), res);
+		return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
+	}
+	while (res.noiseScaleDeg > noiseScaleDeg)
+		res = rescaleCore(res);
+	if (towersLeft < res.towers) {
+		for (auto& comp : res.p->components)
+			comp.truncate(towersLeft);
+		res.p->towers = towersLeft;
+	}
+	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
+}
+
 // ---- Rotation + accumulate ----
 
 HazeEngine::KsKey& HazeEngine::autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint32_t autoIndex) {
