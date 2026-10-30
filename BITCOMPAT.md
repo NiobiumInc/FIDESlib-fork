@@ -291,6 +291,18 @@ backends (`Engine::supportsComplexBootstrap`).
 
 Tests: `CKKSDataTypeTest.*` (`test/ApiTests.cpp`).
 
+### R16. `Compress` on the api
+`CryptoContext::Compress(ct, towersLeft = 1, noiseScaleDeg = 1)` has OpenFHE's signature and its
+check that `towersLeft` is not less than `noiseScaleDeg`. Like `LeveledSHERNS::Compress`, it
+mod-reduces while the noise degree exceeds `noiseScaleDeg`, then keeps `towersLeft` towers without
+adjusting the scale, and a ciphertext that already has that many or fewer keeps them. The CPU engine
+calls OpenFHE; the CUDA and haze engines count the device towers, so the result matches OpenFHE
+bit-exactly under every scaling technique. A degree-2 ciphertext at the FLEXIBLEAUTOEXT extra level
+is still refused by their rescale (O13).
+
+Tests: `CKKSTest.*Compress*` (`test/ApiTests.cpp`); `Techniques/ApiParityTechniqueTest.Compress/*`
+(`test/ApiParityTest.cpp`).
+
 ### R17. `MultByMonomial` on the api
 `CryptoContext::MultByMonomial(ct, power)` and `MultByMonomialInPlace` mirror OpenFHE's
 `MultByMonomial`: every component (2 or 3) is multiplied by X^power, and level, scale and noise
