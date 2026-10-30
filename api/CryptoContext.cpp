@@ -1264,6 +1264,17 @@ void CryptoContextImpl<DCRTPoly>::RescaleInPlace(Ciphertext<DCRTPoly>& ciphertex
 	engine_->rescaleInPlace(*this, ciphertext);
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Compress(const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft, size_t noiseScaleDeg) {
+	// The same checks as OpenFHE's CryptoContextImpl::Compress.
+	if (ciphertext == nullptr) {
+		OPENFHE_THROW("input ciphertext is invalid (has no data)");
+	}
+	if (towersLeft < noiseScaleDeg) {
+		OPENFHE_THROW("Input towersLeft[" + std::to_string(towersLeft) + "] may not be less than noiseScaleDeg[" + std::to_string(noiseScaleDeg) + "]");
+	}
+	return engine_->compress(*this, ciphertext, towersLeft, noiseScaleDeg);
+}
+
 void CryptoContextImpl<DCRTPoly>::SetLevel(Ciphertext<DCRTPoly>& ct, size_t level) {
 	ct->SetLevel(level);
 }

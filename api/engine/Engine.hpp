@@ -166,6 +166,7 @@ class Engine {
 	// ---- Rescale ----
 	virtual Ciphertext<DCRTPoly> rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
 	virtual void rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext);
+	virtual Ciphertext<DCRTPoly> compress(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft, size_t noiseScaleDeg);
 
 	// ---- Accumulate (sum reduction) ----
 	virtual Ciphertext<DCRTPoly> accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride);

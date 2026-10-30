@@ -2690,3 +2690,67 @@ TEST(SparseSecretModEval, SparseTernaryBootstrapIsCorrect) {
 }
 
 
+// ---- Compress ----
+
+namespace {
+std::vector<double> Product(const std::vector<double>& a, const std::vector<double>& b) {
+	std::vector<double> out(a.size());
+	for (size_t i = 0; i < a.size(); ++i)
+		out[i] = a[i] * b[i];
+	return out;
+}
+} // namespace
+
+// Compress rescales down to noiseScaleDeg and keeps towersLeft towers, with OpenFHE's defaults
+// when no arguments are given.
+TEST_F(CKKSTest, Compress) {
+	struct Case {
+		const char* name;
+		Ciphertext<DCRTPoly> result;
+		std::vector<double> expected;
+		size_t numElements;
+		size_t noiseScaleDeg;
+		size_t level;
+	};
+	auto a		  = EncryptVec(cc, v1, keys.publicKey);
+	auto b		  = EncryptVec(cc, v2, keys.publicKey);
+	const auto ab = Product(v1, v2);
+	std::vector<Case> cases = {
+		{ "product", cc->Compress(cc->EvalMult(a, b), 2), ab, 2, 1, kDepth + 1 - 2 },
+		{ "defaults", cc->Compress(cc->EvalMult(a, b)), ab, 2, 1, kDepth },
+		{ "product at scale degree 2", cc->Compress(cc->EvalMult(a, b), 3, 2), ab, 2, 2, kDepth + 1 - 3 },
+		{ "drop towers", cc->Compress(a, 3), v1, 2, 1, kDepth + 1 - 3 },
+		{ "degree-2 product", cc->Compress(cc->EvalMultNoRelin(a, b), 2), ab, 3, 1, kDepth + 1 - 2 },
+	};
+	for (auto& c : cases)
+		cc->MarkOutput(c.result);
+	for (auto& c : cases) {
+		SCOPED_TRACE(c.name);
+		CheckPrecision(cc, c.result, keys.secretKey, c.expected, CKKS_PRECISION);
+		EXPECT_EQ(c.result->GetNumElements(), c.numElements);
+		EXPECT_EQ(c.result->GetNoiseScaleDeg(), c.noiseScaleDeg);
+		EXPECT_EQ(c.result->GetLevel(), c.level);
+	}
+}
+
+// A ciphertext with no more than towersLeft towers keeps them, in a new ciphertext.
+TEST_F(CKKSTest, CompressKeepsShortCiphertext) {
+	std::vector<double> doubled(v1.size());
+	for (size_t i = 0; i < v1.size(); ++i)
+		doubled[i] = 2.0 * v1[i];
+	auto ct	 = EncryptVec(cc, v1, keys.publicKey);
+	auto res = cc->Compress(ct, kDepth + 3);
+	EXPECT_EQ(res->GetLevel(), 0u);
+	cc->EvalAddInPlace(res, res);
+	cc->MarkOutput(ct);
+	cc->MarkOutput(res);
+	CheckPrecision(cc, ct, keys.secretKey, v1, CKKS_PRECISION);
+	CheckPrecision(cc, res, keys.secretKey, doubled, CKKS_PRECISION);
+}
+
+// As in OpenFHE, towersLeft may not be less than noiseScaleDeg.
+TEST_F(CKKSTest, CompressRejectsTowersBelowNoiseScaleDeg) {
+	auto ct = EncryptVec(cc, v1, keys.publicKey);
+	EXPECT_ANY_THROW(cc->Compress(ct, 0));
+	EXPECT_ANY_THROW(cc->Compress(ct, 1, 2));
+}

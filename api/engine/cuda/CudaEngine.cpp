@@ -729,6 +729,18 @@ void CudaEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCR
 	res_gpu->rescale();
 }
 
+Ciphertext<DCRTPoly> CudaEngine::compress(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft, size_t noiseScaleDeg) {
+	// OpenFHE LeveledSHERNS::Compress on the device limbs: mod-reduce, then drop towers only.
+	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	auto res_gpu				= deviceCt(result);
+	while (res_gpu->NoiseLevel > static_cast<int>(noiseScaleDeg))
+		res_gpu->rescale();
+	if (static_cast<int>(towersLeft) < res_gpu->getLevel() + 1)
+		res_gpu->dropToLevel(static_cast<int>(towersLeft) - 1, true);
+	return result;
+}
+
 Ciphertext<DCRTPoly> CudaEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
 	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);

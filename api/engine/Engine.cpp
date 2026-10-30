@@ -196,6 +196,10 @@ void Engine::rescaleInPlace(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRTPoly>&)
 	notImplemented("rescaleInPlace");
 }
 
+Ciphertext<DCRTPoly> Engine::compress(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&, uint32_t, size_t) {
+	notImplemented("compress");
+}
+
 // ---- Accumulate (sum reduction) ----
 Ciphertext<DCRTPoly> Engine::accumulateSum(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&, int, int) {
 	notImplemented("accumulateSum");
