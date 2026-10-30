@@ -2189,7 +2189,8 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kMonomial);
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	CKKS::SetCurrentContext(cc_);
-	requireDegree1("multMonomial");
+	// X^(2N) = 1, so reduce first as OpenFHE does; X^r for r in [N, 2N) is -X^(r-N).
+	power %= 2 * cc.N;
 
 	// Per-issuing-thread cache (slot 0 is cc.precom.monomialCache, i.e. today's object): the entry
 	// is ERASED and rebuilt whenever the level moves, so two threads bootstrapping at once would
@@ -2255,6 +2256,8 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 
 	c0.multElement(monomial);
 	c1.multElement(monomial);
+	if (c2.has_value())
+		c2->multElement(monomial);
 
 	/* Based on this (OpenFHE):
 std::vector<DCRTPoly>& cv = ciphertext->GetElements();
