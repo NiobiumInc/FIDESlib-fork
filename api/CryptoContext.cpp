@@ -142,6 +142,11 @@ uint32_t CryptoContextImpl<DCRTPoly>::GetRingDimension() const {
 	return context->GetRingDimension();
 }
 
+CKKSDataType CryptoContextImpl<DCRTPoly>::GetCKKSDataType() const {
+	auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->host);
+	return static_cast<CKKSDataType>(context->GetCKKSDataType());
+}
+
 double CryptoContextImpl<DCRTPoly>::GetPreScaleFactor(uint32_t /*slots*/) {
 	// Pure host computation (a single scalar derived from the crypto parameters + the bootstrap
 	// correction factor); it touches no device, so it lives here rather than on the engine. This
@@ -335,7 +340,11 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 	if (engine_->isContextLoaded()) {
 		OPENFHE_THROW("EvalBootstrapSetup must be called before LoadContext");
 	}
-	auto& context		   = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->host);
+	auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->host);
+	// OpenFHE's precomputation and evaluation both depend on the data type, so refuse here once.
+	if (context->GetCKKSDataType() == lbcrypto::COMPLEX && !engine_->bootstrapsComplexData()) {
+		OPENFHE_THROW(std::string("EvalBootstrapSetup: CKKSDataType COMPLEX is not supported on the ") + engine_->name() + " backend");
+	}
 	int32_t modall		   = bootstrapModEvalLevels(this->keyDist, this->modReduction);
 	BootstrapSetupPolicy p = engine_->bootstrapSetupPolicy(precompute, btsfirstboot, modall);
 	context->EvalBootstrapSetup(levelBudget, std::move(dim1), slots, correctionFactor, p.precompute, p.btSlotsEncoding, p.modEvalLevels);

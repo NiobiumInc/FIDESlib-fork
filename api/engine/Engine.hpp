@@ -176,6 +176,11 @@ class Engine {
 	/// @brief Per-backend arguments for the facade's host EvalBootstrapSetup call (the setup itself is a
 	/// host computation and lives on the facade, not here).
 	virtual BootstrapSetupPolicy bootstrapSetupPolicy(bool precompute, bool btsfirstboot, int32_t modEvalLevels) const;
+	/// @brief Whether this backend bootstraps a COMPLEX context, which needs OpenFHE's separate
+	/// imaginary-part pass.
+	virtual bool bootstrapsComplexData() const {
+		return false;
+	}
 	virtual void evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const PrivateKey<DCRTPoly>& secretKey, uint32_t slots);
 	virtual Ciphertext<DCRTPoly>
 	evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled);
