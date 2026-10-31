@@ -1781,6 +1781,34 @@ TEST_P(ApiParityTechniqueTest, AddMany) {
 
 // The suite has no cases on the backends it does not apply to.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityTechniqueTest);
+// Compress under every scaling technique: a tower drop, a product rescaled to scale degree 1 or
+// kept at 2, and a degree-2 product. FLEXIBLEAUTOEXT skips the degree-2 case, which its extra
+// level does not support on the devices (O13).
+TEST_P(ApiParityTechniqueTest, Compress) {
+	MakeContext(4);
+	auto c1 = Encrypt(x1), c2 = Encrypt(x2);
+	auto l1 = LbCt(c1), l2 = LbCt(c2);
+	auto& lb = LbCc(cc);
+
+	struct Case {
+		const char* name;
+		Ciphertext<DCRTPoly> device;
+		lbcrypto::Ciphertext<lbcrypto::DCRTPoly> oracle;
+	};
+	std::vector<Case> cases;
+	auto add = [&](const char* name, Ciphertext<DCRTPoly> d, lbcrypto::Ciphertext<lbcrypto::DCRTPoly> o) {
+		cc->MarkOutput(d);
+		cases.push_back({ name, d, o });
+	};
+	add("drop towers", cc->Compress(c1, 3), lb->Compress(l1, 3));
+	add("product", cc->Compress(cc->EvalMult(c1, c2), 2), lb->Compress(lb->EvalMult(l1, l2), 2));
+	add("product at scale degree 2", cc->Compress(cc->EvalMult(c1, c2), 3, 2), lb->Compress(lb->EvalMult(l1, l2), 3, 2));
+	if (GetParam() != FLEXIBLEAUTOEXT)
+		add("degree-2 product", cc->Compress(cc->EvalMultNoRelin(c1, c2), 2), lb->Compress(lb->EvalMultNoRelin(l1, l2), 2));
+	for (auto& c : cases)
+		ExpectIdentical(c.name, c.device, c.oracle);
+}
+
 INSTANTIATE_TEST_SUITE_P(Techniques, ApiParityTechniqueTest, OnlyIf<ApiParityTechniqueTest::ParamType>(OnDevice(), ::testing::Values(FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT)), TechniqueParamName);
 // The suite has no cases on the backends it does not apply to.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ApiParityOperandAdjustmentTest);
@@ -1893,3 +1921,27 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "SparseEncapsulated_FIXEDAUTO", FIXEDAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 })),
   BootstrapShapeName);
+
+// ---- Compress ----
+
+// A tower drop with no rescale is exact.
+TEST_F(ApiParityTest, CompressDropsTowers) {
+	auto a1		= EncryptV1();
+	auto lb1	= LbCt(a1);
+	auto res	= cc->Compress(a1, 3);
+	auto got	= HostCt(cc, res);
+	auto oracle = LbCc(cc)->Compress(lb1, 3);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
+}
+
+// A degree-2 product rescaled and truncated matches OpenFHE in all three components.
+TEST_F(ApiParityTest, Degree2Compress) {
+	Ciphertext<DCRTPoly> a1, a2;
+	EncryptInputs(a1, a2);
+	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
+	auto res = cc->Compress(cc->EvalMultNoRelin(a1, a2), 2);
+	cc->MarkOutput(res);
+	auto got	= HostCt(cc, res);
+	auto oracle = LbCc(cc)->Compress(LbCc(cc)->EvalMultNoRelin(lb1, lb2), 2);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
+}

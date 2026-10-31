@@ -282,6 +282,18 @@ level with that of a CPU-engine context built from the same parameters.
 `ReducedLevelMatchesBootstrapThenDrop` now encrypts deep enough that its target sits below the input
 level, and asserts that precondition.
 
+### R16. `Compress` on the api
+`CryptoContext::Compress(ct, towersLeft = 1, noiseScaleDeg = 1)` has OpenFHE's signature and its
+check that `towersLeft` is not less than `noiseScaleDeg`. Like `LeveledSHERNS::Compress`, it
+mod-reduces while the noise degree exceeds `noiseScaleDeg`, then keeps `towersLeft` towers without
+adjusting the scale, and a ciphertext that already has that many or fewer keeps them. The CPU engine
+calls OpenFHE; the CUDA and haze engines count the device towers, so the result matches OpenFHE
+bit-exactly under every scaling technique. A degree-2 ciphertext at the FLEXIBLEAUTOEXT extra level
+is still refused by their rescale (O13).
+
+Tests: `CKKSTest.*Compress*` (`test/ApiTests.cpp`); `ApiParityTest.*Compress*` and
+`Techniques/ApiParityTechniqueTest.Compress/*` (`test/ApiParityTest.cpp`).
+
 ### O1. `EvalRotate` unification *(resolved — landed as `fideslib-ref-v1.5.1.2`)*
 The hoisted HYBRID formulation (already used by `EvalFastRotation`, added upstream for the GPU
 backend) is extended to `EvalRotate`/`EvalAtIndex`/`EvalAutomorphism`/`Conjugate`, making

@@ -459,6 +459,11 @@ void OpenFheEngine::rescaleInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 	return;
 }
 
+Ciphertext<DCRTPoly> OpenFheEngine::compress(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t towersLeft, size_t noiseScaleDeg) {
+	auto& context = hostContext(ctx);
+	return wrapHostCt(ctx, context->Compress(hostCt(ciphertext), towersLeft, noiseScaleDeg));
+}
+
 Ciphertext<DCRTPoly> OpenFheEngine::accumulateSum(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, int slots, int stride) {
 	// EvalPartialSumInPlace key-switches per rotation step (ApproxSwitchCRTBasis + ApproxModDown); refused whenever it could key-switch, even when slots<=1 (OpenFHE's own no-op).
 	requireLinkedVariant("accumulateSum");
