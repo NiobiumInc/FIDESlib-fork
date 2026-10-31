@@ -327,4 +327,41 @@ TEST_F(PoolStressTest, AllocateOnOneStreamFreeOnAnother) {
 	EXPECT_EQ(DrainErrors(d_errors), 0) << "a block freed on a different stream than it was used on was handed out too early";
 }
 
+// ---------------------------------------------------------------------------------------------
+// A large class is cut one block per chunk. A pooled chunk is never returned to the device, so a
+// 1 GiB chunk for a class that holds one or two live blocks strands the rest of it. Measured on the
+// device's default stream-ordered pool, which every chunk is cut from in every pool mode: taking a
+// 32 MiB block may claim at most that block, never a 1 GiB slab.
+// ---------------------------------------------------------------------------------------------
+TEST_F(PoolStressTest, LargeClassCutsOneBlockPerChunk) {
+	constexpr int bytes = 32 << 20;
+	cudaStream_t s		= streams[0];
+	cudaMemPool_t pool	= nullptr;
+	ASSERT_EQ(cudaDeviceGetDefaultMemPool(&pool, kDevice), cudaSuccess);
+	const auto used = [&] {
+		cudaDeviceSynchronize();
+		uint64_t v = 0;
+		cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &v);
+		return v;
+	};
+
+	const uint64_t before = used();
+	void* a				  = GPUmalloc(kDevice, bytes, s, true);
+	void* b				  = GPUmalloc(kDevice, bytes, s, true);
+	ASSERT_NE(a, nullptr);
+	ASSERT_NE(b, nullptr);
+	EXPECT_NE(a, b);
+	const uint64_t taken = used();
+	EXPECT_LE(taken - before, 2ull * bytes) << "two large blocks claimed " << ((taken - before) >> 20) << " MiB";
+
+	// Freed blocks are reused, not cut again.
+	GPUfree(a, kDevice, bytes, s, true);
+	GPUfree(b, kDevice, bytes, s, true);
+	void* c = GPUmalloc(kDevice, bytes, s, true);
+	ASSERT_NE(c, nullptr);
+	EXPECT_EQ(used(), taken) << "a freed large block was not reused";
+	GPUfree(c, kDevice, bytes, s, true);
+	cudaStreamSynchronize(s);
+}
+
 } // namespace FIDESlib::Testing

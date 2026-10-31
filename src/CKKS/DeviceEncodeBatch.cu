@@ -81,7 +81,7 @@ constexpr uint32_t kReduceBlock = 128;
 /// is allocated from the ordinary pool, so it must stay ONE size class -- hence a power of two, and
 /// hence allocated at the full cap even for a short chunk, so a tail never opens a second class.
 /// At logN = 16 the default is 32 * 65536 * 8 B = 16 MiB, which is one more pooled size class per
-/// device (the pool refills a class 1 GiB at a time, GPUmalloc in CudaUtils.cu). (2) `int` is the
+/// device (a large class, which the pool cuts one block per chunk, GPUmalloc in CudaUtils.cu). (2) `int` is the
 /// width of VectorGPU's size and of GPUmalloc's byte count, so the buffer has to stay well inside
 /// it: 64 * 65536 * 8 B = 32 MiB is the ceiling here, far below INT_MAX.
 ///

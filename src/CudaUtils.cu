@@ -2188,6 +2188,8 @@ unsigned long long PoolNullStreamEvents() {
 }
 
 #define MEMPOOL true
+/// Size classes at or above this are cut one block per chunk instead of 1 GiB; see GPUmalloc.
+constexpr int kPoolLargeClassBytes = 8 << 20;
 // void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 	void* ptr = nullptr;
@@ -2203,6 +2205,15 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 		cache = true;
 		MBs   = bytes / 1024;
 	}
+	// LARGE CLASSES are cut ONE BLOCK per chunk. A pooled chunk is never returned to the device,
+	// and a 1 GiB chunk for a class whose live count stays at one or two blocks (the batched
+	// encoder's 16 MiB staging buffer and 64 MiB NTT scratch, DeviceEncodeBatch.cu) strands nearly
+	// all of it: 2 GiB reserved for 80 MiB in use, with nothing else able to draw on it. A block
+	// this large is rare enough that a chunk cut per block grown costs nothing measurable, and once
+	// freed it is reused through the free list exactly as before -- only the slab granularity
+	// changes. Every pooled path below (lane, per-stream, shared) cuts its slab from MBs.
+	if (bytes >= kPoolLargeClassBytes)
+		MBs = static_cast<uint64_t>(bytes) >> 20;
 #if MEMPOOL
 	if (cache && (bytes & (bytes - 1)) == 0 && ConcurrentOps()) {
 		// CONCURRENT MODE: same pool, same slabs, but the handshake names the block's PREVIOUS
