@@ -2690,3 +2690,69 @@ TEST(SparseSecretModEval, SparseTernaryBootstrapIsCorrect) {
 }
 
 
+// ---- Monomial multiply ----
+
+namespace {
+std::vector<double> Negated(const std::vector<double>& v) {
+	std::vector<double> out(v.size());
+	for (size_t i = 0; i < v.size(); ++i)
+		out[i] = -v[i];
+	return out;
+}
+} // namespace
+
+// X^N = -1 in Z_q[X]/(X^N+1), so multiplying by X^N negates every slot.
+TEST_F(CKKSTest, MultByMonomialNegates) {
+	auto ct	 = EncryptVec(cc, v1, keys.publicKey);
+	auto res = cc->MultByMonomial(ct, kRingDim);
+	CheckPrecision(cc, res, keys.secretKey, Negated(v1), CKKS_PRECISION);
+	EXPECT_EQ(res->GetNoiseScaleDeg(), 1u);
+	EXPECT_EQ(res->GetLevel(), ct->GetLevel());
+}
+
+// X^a * X^(2N-a) = X^(2N) = 1 for every a, including shifts that wrap past X^N and powers of
+// 2N and above.
+TEST_F(CKKSTest, MultByMonomialInversePowersCancel) {
+	const std::vector<std::pair<uint32_t, uint32_t>> pairs = { { 1, 2 * kRingDim - 1 }, { 64, 2 * kRingDim - 64 }, { kRingDim + 3, kRingDim - 3 }, { 2 * kRingDim + 5, 2 * kRingDim - 5 }, { 4 * kRingDim, 0 } };
+	std::vector<Ciphertext<DCRTPoly>> results;
+	for (auto [a, b] : pairs) {
+		auto r = cc->MultByMonomial(cc->MultByMonomial(EncryptVec(cc, v1, keys.publicKey), a), b);
+		cc->MarkOutput(r);
+		results.push_back(r);
+	}
+	for (size_t k = 0; k < pairs.size(); ++k) {
+		SCOPED_TRACE("powers " + std::to_string(pairs[k].first) + " and " + std::to_string(pairs[k].second));
+		CheckPrecision(cc, results[k], keys.secretKey, v1, CKKS_PRECISION);
+	}
+}
+
+// The in-place form gives the same result.
+TEST_F(CKKSTest, MultByMonomialInPlace) {
+	auto ct = EncryptVec(cc, v1, keys.publicKey);
+	cc->MultByMonomialInPlace(ct, 3 * kRingDim);
+	cc->MarkOutput(ct);
+	CheckPrecision(cc, ct, keys.secretKey, Negated(v1), CKKS_PRECISION);
+}
+
+// A ciphertext with dropped towers keeps its level.
+TEST_F(CKKSTest, MultByMonomialAtLowerLevel) {
+	auto ct = EncryptVec(cc, v1, keys.publicKey);
+	CryptoContextImpl<DCRTPoly>::SetLevel(ct, 2);
+	auto res = cc->MultByMonomial(ct, kRingDim);
+	cc->MarkOutput(res);
+	CheckPrecision(cc, res, keys.secretKey, Negated(v1), CKKS_PRECISION);
+	EXPECT_EQ(res->GetLevel(), 2u);
+}
+
+// Every component of a degree-2 ciphertext is multiplied, so X^N still negates the product.
+TEST_F(CKKSTest, Degree2MultByMonomialDecrypt) {
+	std::vector<double> expected(v1.size());
+	for (size_t i = 0; i < v1.size(); ++i)
+		expected[i] = -(v1[i] * v2[i]);
+	auto a	 = EncryptVec(cc, v1, keys.publicKey);
+	auto b	 = EncryptVec(cc, v2, keys.publicKey);
+	auto res = cc->MultByMonomial(cc->EvalMultNoRelin(a, b), kRingDim);
+	cc->MarkOutput(res);
+	CheckPrecision(cc, res, keys.secretKey, expected, CKKS_PRECISION);
+	EXPECT_EQ(res->GetNumElements(), 3u);
+}

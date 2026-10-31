@@ -187,6 +187,15 @@ void Engine::evalChebyshevSeriesInPlace(CryptoContextImpl<DCRTPoly>&, Ciphertext
 	notImplemented("evalChebyshevSeriesInPlace");
 }
 
+// ---- Monomial multiply ----
+Ciphertext<DCRTPoly> Engine::multByMonomial(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&, uint32_t) {
+	notImplemented("multByMonomial");
+}
+
+void Engine::multByMonomialInPlace(CryptoContextImpl<DCRTPoly>&, Ciphertext<DCRTPoly>&, uint32_t) {
+	notImplemented("multByMonomialInPlace");
+}
+
 // ---- Rescale ----
 Ciphertext<DCRTPoly> Engine::rescale(CryptoContextImpl<DCRTPoly>&, const Ciphertext<DCRTPoly>&) {
 	notImplemented("rescale");

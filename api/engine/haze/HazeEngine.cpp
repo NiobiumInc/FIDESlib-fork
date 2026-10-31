@@ -185,6 +185,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	rotKeys_.clear();
 	autoKeys_.clear();
 	sparseKey_.reset();
+	monomials_.clear();
 	for (const int32_t step : ctx.rotation_indexes) {
 		if (rotKeys_.count(step) != 0) {
 			continue;
@@ -317,6 +318,7 @@ void HazeEngine::teardown() {
 	rotKeys_.clear();
 	autoKeys_.clear();
 	sparseKey_.reset();
+	monomials_.clear();
 	boot_.clear();
 	numPartQ_ = 0;
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
@@ -1945,6 +1947,20 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	auto ptp = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalMultInPlace(pt)");
 	Operand res = multPtCore(asOperand(p), *ptp);
+	rebindPayload(*p, std::move(res.p->components), res);
+}
+
+Ciphertext<DCRTPoly> HazeEngine::multByMonomial(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "MultByMonomial");
+	Operand res = multByMonomialCore(ctx, asOperand(p), power);
+	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
+}
+
+void HazeEngine::multByMonomialInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "MultByMonomialInPlace");
+	Operand res = multByMonomialCore(ctx, asOperand(p), power);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 

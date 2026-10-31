@@ -1893,3 +1893,49 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "SparseEncapsulated_FIXEDAUTO", FIXEDAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 })),
   BootstrapShapeName);
+
+// ---- Monomial multiply ----
+
+// Bit-exact against OpenFHE MultByMonomial across the ring, including powers that wrap past X^N
+// and powers of 2N and above.
+TEST_F(ApiParityTest, MultByMonomial) {
+	const std::vector<uint32_t> powers = { 0, 1, 5, 1000, kRingDim / 2, kRingDim - 1, kRingDim, kRingDim + 1, 3 * kRingDim / 2, 2 * kRingDim - 1, 2 * kRingDim, 2 * kRingDim + 1, 3 * kRingDim + 7 };
+	auto a1							   = EncryptV1();
+	auto lb1						   = LbCt(a1);
+	std::vector<Ciphertext<DCRTPoly>> results;
+	for (uint32_t p : powers) {
+		auto r = cc->MultByMonomial(a1, p);
+		cc->MarkOutput(r);
+		results.push_back(r);
+	}
+	for (size_t k = 0; k < powers.size(); ++k) {
+		SCOPED_TRACE("power " + std::to_string(powers[k]));
+		auto got	= HostCt(cc, results[k]);
+		auto oracle = LbCc(cc)->GetScheme()->MultByMonomial(lb1, powers[k]);
+		ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
+	}
+}
+
+// The in-place form and a ciphertext with dropped towers match OpenFHE bit-exactly.
+TEST_F(ApiParityTest, MultByMonomialInPlaceAtLowerLevel) {
+	auto ct = EncryptV1();
+	auto lb = LbCc(cc)->Compress(LbCt(ct), kDepth + 1 - 3);
+	CryptoContextImpl<DCRTPoly>::SetLevel(ct, 3);
+	cc->MultByMonomialInPlace(ct, kRingDim + 1);
+	cc->MarkOutput(ct);
+	auto got	= HostCt(cc, ct);
+	auto oracle = LbCc(cc)->GetScheme()->MultByMonomial(lb, kRingDim + 1);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 2);
+}
+
+// All three components of a degree-2 ciphertext are multiplied, as OpenFHE MultByMonomial does.
+TEST_F(ApiParityTest, Degree2MultByMonomial) {
+	Ciphertext<DCRTPoly> a1, a2;
+	EncryptInputs(a1, a2);
+	auto lb1 = LbCt(a1), lb2 = LbCt(a2);
+	auto res = cc->MultByMonomial(cc->EvalMultNoRelin(a1, a2), kRingDim + 1);
+	cc->MarkOutput(res);
+	auto got	= HostCt(cc, res);
+	auto oracle = LbCc(cc)->GetScheme()->MultByMonomial(LbCc(cc)->EvalMultNoRelin(lb1, lb2), kRingDim + 1);
+	ASSERT_EQ_CIPHERTEXT_N(oracle, got, 3);
+}

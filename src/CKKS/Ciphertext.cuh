@@ -724,7 +724,7 @@ class Ciphertext {
 	void dotProduct(const std::vector<Ciphertext*>& a, const std::vector<Ciphertext*>& b, bool ext);
 
 	/**
-	 * @brief Multiplies the ciphertext by a monomial of the given `power`.
+	 * @brief Multiplies every component of the ciphertext by the monomial X^`power`.
 	 *
 	 * The monomial is cached in the context; if not present, it is generated.
 	 *

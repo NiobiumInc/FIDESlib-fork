@@ -443,6 +443,17 @@ void modReduceOneLevelInPlace(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& conte
 }
 } // namespace
 
+Ciphertext<DCRTPoly> OpenFheEngine::multByMonomial(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto& context = hostContext(ctx);
+	return wrapHostCt(ctx, context->GetScheme()->MultByMonomial(hostCt(ciphertext), power));
+}
+
+void OpenFheEngine::multByMonomialInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto& context = hostContext(ctx);
+	ciphertext->EnsureLazyHostCopy();
+	context->GetScheme()->MultByMonomialInPlace(hostCt(ciphertext), power);
+}
+
 Ciphertext<DCRTPoly> OpenFheEngine::rescale(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
 	auto& context = hostContext(ctx);
 	auto& ctImpl  = hostCt(ciphertext);
