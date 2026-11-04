@@ -21,6 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <cstdio>
+#include <algorithm>
+#include <fstream>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -179,6 +182,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	const auto& keyMap = context->GetAllEvalMultKeys();
 	if (keyMap.find(keyTag_) != keyMap.end()) {
 		relinKey_	   = KsKey{};
+		relinKey_.id   = "relin";
 		relinKey_.host = hazebk::extractEvalMultKeyLimbs(context, keyTag_);
 		haveRelinKey_  = true;
 	}
@@ -191,6 +195,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		}
 		RotKey rk;
 		rk.autoIndex = context->FindAutomorphismIndex(step);
+		rk.key.id	 = "auto:" + std::to_string(rk.autoIndex);
 		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, rk.autoIndex);
 		rotKeys_.emplace(step, std::move(rk));
 	}
@@ -310,6 +315,7 @@ void HazeEngine::teardown() {
 		return;
 	}
 	outputs_.clear();
+	inputRoles_.clear();
 	// Drop uploaded key chains before the device reset frees their meaning; the host limbs
 	// are re-extracted by the next loadContext.
 	relinKey_	  = KsKey{};
@@ -394,6 +400,17 @@ void HazeEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext
 	payload->noiseScaleDeg = host->GetNoiseScaleDeg();
 	payload->scalingFactor = host->GetScalingFactor();
 	payload->slots		   = host->GetSlots();
+	for (size_t c = 0; c < payload->components.size(); ++c) {
+		InputRole r;
+		r.role			= "ciphertext";
+		r.tag			= ct->tag;
+		r.component		= c;
+		r.towers		= payload->towers;
+		r.noiseScaleDeg = payload->noiseScaleDeg;
+		r.scalingFactor = payload->scalingFactor;
+		r.slots			= payload->slots;
+		noteInput(payload->components[c], r);
+	}
 	payload->state		   = Residency::Uploaded;
 
 	ct->device = std::make_any<std::shared_ptr<HazePayload>>(std::move(payload));
@@ -462,6 +479,17 @@ void HazeEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Plaintext& 
 	payload->noiseScaleDeg = ptImpl->GetNoiseScaleDeg();
 	payload->scalingFactor = ptImpl->GetScalingFactor();
 	payload->slots		   = ptImpl->GetSlots();
+	{
+		InputRole r;
+		r.role			= "plaintext";
+		r.tag			= pt->tag;
+		r.towers		= payload->towers;
+		r.noiseScaleDeg = payload->noiseScaleDeg;
+		r.scalingFactor = payload->scalingFactor;
+		r.slots			= payload->slots;
+		r.extended		= extended;
+		noteInput(payload->chain, r);
+	}
 
 	pt->device = std::make_any<std::shared_ptr<HazePtPayload>>(std::move(payload));
 }
@@ -509,6 +537,7 @@ void HazeEngine::materialize() {
 		}
 	}
 	hazeCheck(hazeFlush(), "hazeFlush");
+	writeInputRoles();
 	for (const auto& weak : outputs_) {
 		if (auto payload = weak.lock(); payload && payload->state == Residency::Recorded) {
 			payload->state = Residency::Flushed;
@@ -647,6 +676,15 @@ std::any HazeEngine::cloneCiphertextBackend(CryptoContextImpl<DCRTPoly>& /*ctx*/
 		};
 		for (const auto& srcComp : srcPayload->components) {
 			clone->components.push_back(LimbChain(pull(srcComp), qPrefix(srcPayload->towers)));
+			InputRole r;
+			r.role			= "ciphertext";
+			r.tag			= src.tag;
+			r.component		= clone->components.size() - 1;
+			r.towers		= clone->towers;
+			r.noiseScaleDeg = clone->noiseScaleDeg;
+			r.scalingFactor = clone->scalingFactor;
+			r.slots			= clone->slots;
+			noteInput(clone->components.back(), r);
 		}
 		clone->state = Residency::Uploaded;
 	}
@@ -1473,6 +1511,80 @@ LimbChain addChain(size_t polyBytes, const std::vector<uint64_t>& base, const vo
 }
 } // namespace
 
+void HazeEngine::noteInput(const LimbChain& chain, InputRole role) {
+	if (chain.empty()) {
+		return;
+	}
+	char name[256];
+	if (hazeInputGroupName(chain[0], name, sizeof name) != HAZE_SUCCESS) {
+		return; // not a named input (nothing was uploaded)
+	}
+	role.name = name;
+	inputRoles_.push_back(std::move(role));
+}
+
+namespace {
+std::string jsonString(const std::string& s) {
+	std::string out = "\"";
+	for (char c : s) {
+		if (c == '"' || c == '\\') {
+			out += '\\';
+		}
+		out += c;
+	}
+	return out + "\"";
+}
+} // namespace
+
+void HazeEngine::writeInputRoles() {
+	if (programDir_.empty()) {
+		return;
+	}
+	std::vector<std::string> omit;
+	if (const char* e = std::getenv("FIDESLIB_HAZE_OMIT_INPUTS"); e != nullptr) {
+		std::string s = e;
+		for (size_t p = 0; p <= s.size();) {
+			const size_t q = std::min(s.find(',', p), s.size());
+			if (q > p) {
+				omit.push_back(s.substr(p, q - p));
+			}
+			p = q + 1;
+		}
+	}
+	const std::filesystem::path dir = programDir_;
+	std::ofstream out(dir / "fideslib.input_roles.json");
+	out << "{\n  \"format\": 1,\n  \"inputs\": [";
+	char sf[64];
+	for (size_t i = 0; i < inputRoles_.size(); ++i) {
+		const InputRole& r = inputRoles_[i];
+		bool omitted	   = false;
+		if (std::find(omit.begin(), omit.end(), r.role) != omit.end()) {
+			const auto bin = dir / ("fideslib.input_" + r.name + ".bin");
+			std::error_code ec;
+			if (std::filesystem::exists(bin, ec)) {
+				std::filesystem::resize_file(bin, 0, ec);
+				omitted = !ec;
+			}
+		}
+		std::snprintf(sf, sizeof sf, "%.17g", r.scalingFactor);
+		out << (i ? ",\n    " : "\n    ") << "{\"name\": " << jsonString(r.name) << ", \"role\": " << jsonString(r.role);
+		if (r.role == "key") {
+			out << ", \"id\": " << jsonString(r.id) << ", \"digit\": " << r.digit << ", \"component\": \"" << (r.component ? "b" : "a") << "\"";
+		} else {
+			if (r.role == "ciphertext") {
+				out << ", \"component\": " << r.component;
+			}
+			out << ", \"tag\": " << jsonString(r.tag) << ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"scaling_factor\": " << sf
+				<< ", \"slots\": " << r.slots;
+			if (r.extended) {
+				out << ", \"extended\": true";
+			}
+		}
+		out << ", \"towers\": " << r.towers << (omitted ? ", \"omitted\": true" : "") << "}";
+	}
+	out << "\n  ]\n}\n";
+}
+
 void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	if (key.uploaded) {
 		return; // uploaded once; reused within the single program (see the one-program contract)
@@ -1489,6 +1601,15 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	for (size_t d = 0; d < digits; ++d) {
 		key.aDigits.emplace_back(key.host.a_limbs[d], qpBaseFull); // H2D: full Q∥P rows
 		key.bDigits.emplace_back(key.host.b_limbs[d], qpBaseFull);
+		InputRole r;
+		r.role	 = "key";
+		r.id	 = key.id;
+		r.digit	 = d;
+		r.towers = qpBaseFull.size();
+		r.component = 0;
+		noteInput(key.aDigits.back(), r);
+		r.component = 1;
+		noteInput(key.bDigits.back(), r);
 	}
 	key.uploaded = true;
 	// hybridKeyswitch only needs numPartQ_ after this point; drop the per-key host limbs, which
@@ -1976,6 +2097,7 @@ HazeEngine::KsKey& HazeEngine::autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint
 	if (it == autoKeys_.end()) {
 		auto& context = hostContext(ctx);
 		KsKey key;
+		key.id	 = "auto:" + std::to_string(autoIndex);
 		key.host = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, autoIndex);
 		it		 = autoKeys_.emplace(autoIndex, std::move(key)).first;
 	}
@@ -1993,6 +2115,14 @@ HazeEngine::SparseSwitchKey& HazeEngine::sparseKeyFor(CryptoContextImpl<DCRTPoly
 		const std::vector<uint64_t> base = { key.host.q0, key.host.p0 };
 		key.a							 = LimbChain(key.host.a_limbs, base);
 		key.b							 = LimbChain(key.host.b_limbs, base);
+		InputRole r;
+		r.role		= "key";
+		r.id		= "sparse";
+		r.towers	= base.size();
+		r.component = 0;
+		noteInput(key.a, r);
+		r.component = 1;
+		noteInput(key.b, r);
 		key.uploaded					 = true;
 		key.host.a_limbs.clear();
 		key.host.b_limbs.clear();

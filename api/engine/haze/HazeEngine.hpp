@@ -318,6 +318,8 @@ class HazeEngine : public Engine {
 	/// @brief A HYBRID keyswitch key: host limbs + the lazily-uploaded device chains
 	/// (full Q∥P rows per digit; Uploaded state, never tagged, reused across epochs).
 	struct KsKey {
+		/// @brief The key's identity among the context's keys: "relin" or "auto:<automorphism index>".
+		std::string id;
 		hazebk::HybridKeyswitchLimbs host;
 		std::vector<hazebk::LimbChain> aDigits; // [digit] -> |Q|+|P| rows
 		std::vector<hazebk::LimbChain> bDigits;
@@ -595,6 +597,25 @@ class HazeEngine : public Engine {
 	bool executed_ = false;
 	/// @brief Program directory of this context (cleaned up at teardown unless kept).
 	std::string programDir_;
+
+	/// @brief What each uploaded input of the program is, written next to the program at its
+	/// flush (fideslib.input_roles.json) so that a runtime can bind the inputs of a recorded
+	/// program again: role "key" (id, digit, component a or b), "ciphertext" (component, the
+	/// caller's tag) or "plaintext" (the caller's tag; an untagged one is a constant of the
+	/// program), with the encoding of the value.
+	struct InputRole {
+		std::string name, role, id, tag;
+		size_t component = 0, digit = 0, towers = 0, noiseScaleDeg = 0, slots = 0;
+		double scalingFactor = 0.0;
+		bool extended = false;
+	};
+	std::vector<InputRole> inputRoles_;
+	/// @brief Record the role of the input `chain` was just uploaded as (its haze input name).
+	void noteInput(const hazebk::LimbChain& chain, InputRole role);
+	/// @brief Write fideslib.input_roles.json; with FIDESLIB_HAZE_OMIT_INPUTS (a comma list of
+	/// roles, e.g. "key"), empty the recorded words of those inputs and mark them omitted: the
+	/// runtime supplies them (keys it holds resident), and the program keeps only their slots.
+	void writeInputRoles();
 
   private:
 	/// @brief haze configuration is process-global: one loaded haze context per process.

@@ -71,8 +71,9 @@ CiphertextImpl<DCRTPoly>::CiphertextImpl(const CiphertextImpl<DCRTPoly>& other) 
 		this->need_lazy_copy   = true;
 	}
 
-	// Copy parent context.
+	// Copy parent context, and the caller's tag: a copy of an input is that input.
 	this->parent_context = other.parent_context;
+	this->tag			 = other.tag;
 
 	// Cloning any backend-resident payload is the engine's decision, not ours: it returns an empty
 	// slot when `other` is not resident (always so on the CPU backend).

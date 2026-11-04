@@ -5,6 +5,7 @@
 #include <complex>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "Definitions.hpp"
@@ -77,6 +78,10 @@ class PlaintextImpl {
 	/// A device-only plaintext is valid wherever only the backend value is consumed, which is the
 	/// case for LinearTransformInPlace diagonals — the one and only consumer this was built for.
 	bool device_only = false;
+	/// @brief An opaque name the caller gives this value as a program input; empty: none. A
+	/// recording back end (haze) writes it next to the input it uploads, so that whoever runs the
+	/// recorded program can bind that input again. No engine interprets it.
+	std::string tag;
 	/// @brief Parent context.
 	CryptoContext<DCRTPoly> parent_context;
 };
