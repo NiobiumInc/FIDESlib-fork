@@ -611,6 +611,8 @@ class HazeEngine : public Engine {
 	std::vector<double> sfReal_, sfRealBig_, modReduceFactor_;
 	/// @brief Outputs declared via markOutput (weak: a dropped ciphertext is not an output).
 	std::vector<std::weak_ptr<hazebk::HazePayload>> outputs_;
+	/// @brief The caller's tag of each declared output, when it was declared (outputs_ order).
+	std::vector<std::string> outputTags_;
   protected:
 	// Visible to subclasses so one can tell whether a readback is the flush and where that
 	// flush wrote. Nothing else about the program state is exposed.
@@ -637,6 +639,14 @@ class HazeEngine : public Engine {
 		std::vector<uint64_t> factors;
 	};
 	std::vector<InputRole> inputRoles_;
+	/// @brief What each output of the program is, written beside the inputs' roles: its name
+	/// in the outputs index, the ciphertext component and the caller's tag (e.g. the file the
+	/// value is saved to), so that a runtime can feed it to the next program that reads it.
+	struct OutputRole {
+		std::string name, tag;
+		size_t component = 0, towers = 0;
+	};
+	std::vector<OutputRole> outputRoles_;
 	/// @brief Record the role of the input `chain` was just uploaded as (its haze input name).
 	void noteInput(const hazebk::LimbChain& chain, InputRole role);
 	/// @brief Write fideslib.input_roles.json; with FIDESLIB_HAZE_OMIT_INPUTS (a comma list of

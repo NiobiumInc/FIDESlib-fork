@@ -528,6 +528,7 @@ void HazeEngine::markOutput(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext<DCR
 		}
 	}
 	outputs_.emplace_back(payload);
+	outputTags_.push_back(ct->tag);
 }
 
 void HazeEngine::materialize() {
@@ -535,8 +536,8 @@ void HazeEngine::materialize() {
 	// tags the group, but tag each chain to be explicit — ops.cpp tag_ct), then run the
 	// program's single flush. A tag is readback DMA on real hardware: only declared outputs,
 	// never intermediates.
-	for (const auto& weak : outputs_) {
-		auto payload = weak.lock();
+	for (size_t o = 0; o < outputs_.size(); ++o) {
+		auto payload = outputs_[o].lock();
 		if (!payload || payload->state != Residency::Recorded) {
 			continue;
 		}
@@ -544,6 +545,15 @@ void HazeEngine::materialize() {
 			for (std::size_t t = 0; t < payload->towers; ++t) {
 				hazeCheck(hazeTagOutput(comp[t]), "hazeTagOutput");
 			}
+		}
+		// The name each component goes by in the outputs index, read before the finalize
+		// consumes the pending outputs.
+		for (size_t c = 0; c < payload->components.size(); ++c) {
+			char name[256];
+			if (payload->towers == 0 || hazeOutputGroupName(payload->components[c][0], name, sizeof name) != HAZE_SUCCESS) {
+				continue;
+			}
+			outputRoles_.push_back(OutputRole{ name, o < outputTags_.size() ? outputTags_[o] : std::string(), c, payload->towers });
 		}
 	}
 	if (traceOnly_) {
@@ -558,6 +568,7 @@ void HazeEngine::materialize() {
 		}
 	}
 	outputs_.clear();
+	outputTags_.clear();
 	executed_ = true;
 }
 
@@ -1678,6 +1689,12 @@ void HazeEngine::writeInputRoles() {
 			}
 		}
 		out << ", \"towers\": " << r.towers << (omitted ? ", \"omitted\": true" : "") << "}";
+	}
+	out << "\n  ],\n  \"outputs\": [";
+	for (size_t i = 0; i < outputRoles_.size(); ++i) {
+		const OutputRole& r = outputRoles_[i];
+		out << (i ? ",\n    " : "\n    ") << "{\"name\": " << jsonString(r.name) << ", \"role\": \"ciphertext\", \"component\": "
+			<< r.component << ", \"tag\": " << jsonString(r.tag) << ", \"towers\": " << r.towers << "}";
 	}
 	out << "\n  ]\n}\n";
 }
