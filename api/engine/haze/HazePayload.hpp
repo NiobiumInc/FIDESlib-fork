@@ -32,6 +32,10 @@ class LimbChain {
 	/// A per-limb hazeMemcpy loop cannot name those primes and is rejected by any later
 	/// multi-residue MRP op, so this is the only legal way to upload a residue chain.
 	LimbChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base);
+	/// @brief Allocate one device polynomial per prime of `base` and record them as one MRP input
+	/// WITHOUT words (hazeDeclareMrp): the recorded program names the input, its addresses and
+	/// primes; whoever runs the program supplies the words.
+	static LimbChain declared(std::size_t polyBytes, const std::vector<uint64_t>& base);
 
 	~LimbChain();
 	LimbChain(LimbChain&& other) noexcept;
