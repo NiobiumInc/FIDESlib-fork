@@ -309,6 +309,8 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		const char* e  = std::getenv("FIDESLIB_HAZE_SCALAR_INPUTS");
 		scalarInputs_ = e != nullptr && std::string(e) == "1";
 		scalarCount_  = 0;
+		const char* t = std::getenv("FIDESLIB_HAZE_TRACE_ONLY");
+		traceOnly_	  = t != nullptr && std::string(t) == "1";
 	}
 	liveEngines_.fetch_add(1);
 	loaded_	  = true;
@@ -400,13 +402,14 @@ void HazeEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext
 		} else if (rows.size() != payload->towers) {
 			throw std::runtime_error("haze backend: ciphertext components disagree on tower count");
 		}
-		payload->components.push_back(LimbChain(rows, qPrefix(rows.size())));
+		payload->components.push_back(inputChain(rows, qPrefix(rows.size()), traceOnly_));
 	}
 	payload->noiseScaleDeg = host->GetNoiseScaleDeg();
 	payload->scalingFactor = host->GetScalingFactor();
 	payload->slots		   = host->GetSlots();
 	for (size_t c = 0; c < payload->components.size(); ++c) {
 		InputRole r;
+		r.declared		= traceOnly_;
 		r.role			= "ciphertext";
 		r.tag			= ct->tag;
 		r.component		= c;
@@ -480,12 +483,14 @@ void HazeEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Plaintext& 
 
 	auto payload			  = std::make_shared<HazePtPayload>();
 	payload->towers			  = rows.size();
-	payload->chain			  = LimbChain(rows, base);
+	const bool declare		  = traceOnly_ && !pt->tag.empty(); // a constant keeps its words
+	payload->chain			  = inputChain(rows, base, declare);
 	payload->noiseScaleDeg = ptImpl->GetNoiseScaleDeg();
 	payload->scalingFactor = ptImpl->GetScalingFactor();
 	payload->slots		   = ptImpl->GetSlots();
 	{
 		InputRole r;
+		r.declared		= declare;
 		r.role			= "plaintext";
 		r.tag			= pt->tag;
 		r.towers		= payload->towers;
@@ -541,7 +546,11 @@ void HazeEngine::materialize() {
 			}
 		}
 	}
-	hazeCheck(hazeFlush(), "hazeFlush");
+	if (traceOnly_) {
+		hazeCheck(hazeWriteProgram(), "hazeWriteProgram"); // the program, no replay
+	} else {
+		hazeCheck(hazeFlush(), "hazeFlush");
+	}
 	writeInputRoles();
 	for (const auto& weak : outputs_) {
 		if (auto payload = weak.lock(); payload && payload->state == Residency::Recorded) {
@@ -624,12 +633,18 @@ void HazeEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextI
 	}
 
 	// Pure shadow D2H per limb (Uploaded: the upload bytes; Flushed: the program's result).
+	// Trace-only: no program ran and no input has words, so every value reads back as zeros
+	// with the recorded metadata.
 	std::vector<uint64_t> buf(ringDim_);
 	for (size_t e = 0; e < comps; ++e) {
 		const LimbChain& chain = payload->components[e];
 		auto& towersVec		   = host->GetElements()[e].GetAllElements();
 		for (std::size_t t = 0; t < payload->towers; ++t) {
-			hazeCheck(hazeMemcpy(buf.data(), chain[t], polyBytes_, HAZE_MEMCPY_DEVICE_TO_HOST), "hazeMemcpy(D2H)");
+			if (traceOnly_) {
+				std::fill(buf.begin(), buf.end(), 0);
+			} else {
+				hazeCheck(hazeMemcpy(buf.data(), chain[t], polyBytes_, HAZE_MEMCPY_DEVICE_TO_HOST), "hazeMemcpy(D2H)");
+			}
 			auto& np = towersVec[t];
 			lbcrypto::NativeVector nv(static_cast<uint32_t>(ringDim_), np.GetModulus());
 			for (std::size_t i = 0; i < ringDim_; ++i) {
@@ -680,8 +695,10 @@ std::any HazeEngine::cloneCiphertextBackend(CryptoContextImpl<DCRTPoly>& /*ctx*/
 			return rows;
 		};
 		for (const auto& srcComp : srcPayload->components) {
-			clone->components.push_back(LimbChain(pull(srcComp), qPrefix(srcPayload->towers)));
+			clone->components.push_back(traceOnly_ ? LimbChain::declared(polyBytes_, qPrefix(srcPayload->towers))
+												   : LimbChain(pull(srcComp), qPrefix(srcPayload->towers)));
 			InputRole r;
+			r.declared		= traceOnly_;
 			r.role			= "ciphertext";
 			r.tag			= src.tag;
 			r.component		= clone->components.size() - 1;
@@ -1105,9 +1122,10 @@ HazeEngine::Operand HazeEngine::scalarInputCore(const Operand& x, const std::vec
 		rows[i].assign(ringDim_, factors[i]);
 	}
 	const auto base = qPrefix(x.towers);
-	LimbChain in(rows, base);
+	LimbChain in = inputChain(rows, base, traceOnly_);
 	{
 		InputRole r;
+		r.declared		= traceOnly_;
 		r.role			= "scalar";
 		r.tag			= "scalar:" + std::to_string(scalarCount_++);
 		r.kind			= add ? "add" : "mul";
@@ -1574,6 +1592,13 @@ LimbChain addChain(size_t polyBytes, const std::vector<uint64_t>& base, const vo
 }
 } // namespace
 
+LimbChain HazeEngine::inputChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base, bool declare) {
+	if (declare) {
+		return LimbChain::declared(polyBytes_, base);
+	}
+	return LimbChain(rows, base);
+}
+
 void HazeEngine::noteInput(const LimbChain& chain, InputRole role) {
 	if (chain.empty()) {
 		return;
@@ -1620,7 +1645,7 @@ void HazeEngine::writeInputRoles() {
 	char sf[64];
 	for (size_t i = 0; i < inputRoles_.size(); ++i) {
 		const InputRole& r = inputRoles_[i];
-		bool omitted	   = false;
+		bool omitted	   = r.declared;
 		if (std::find(omit.begin(), omit.end(), r.role) != omit.end()) {
 			const auto bin = dir / ("fideslib.input_" + r.name + ".bin");
 			std::error_code ec;
@@ -1671,9 +1696,10 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	std::vector<uint64_t> qpBaseFull = qBase_;
 	qpBaseFull.insert(qpBaseFull.end(), pBase_.begin(), pBase_.end());
 	for (size_t d = 0; d < digits; ++d) {
-		key.aDigits.emplace_back(key.host.a_limbs[d], qpBaseFull); // H2D: full Q∥P rows
-		key.bDigits.emplace_back(key.host.b_limbs[d], qpBaseFull);
+		key.aDigits.push_back(inputChain(key.host.a_limbs[d], qpBaseFull, traceOnly_)); // H2D: full Q∥P rows
+		key.bDigits.push_back(inputChain(key.host.b_limbs[d], qpBaseFull, traceOnly_));
 		InputRole r;
+		r.declared = traceOnly_;
 		r.role	 = "key";
 		r.id	 = key.id;
 		r.digit	 = d;
@@ -2185,9 +2211,10 @@ HazeEngine::SparseSwitchKey& HazeEngine::sparseKeyFor(CryptoContextImpl<DCRTPoly
 			throw std::runtime_error("haze backend: the sparse switching key is not over the first primes of Q and P");
 		}
 		const std::vector<uint64_t> base = { key.host.q0, key.host.p0 };
-		key.a							 = LimbChain(key.host.a_limbs, base);
-		key.b							 = LimbChain(key.host.b_limbs, base);
+		key.a							 = inputChain(key.host.a_limbs, base, traceOnly_);
+		key.b							 = inputChain(key.host.b_limbs, base, traceOnly_);
 		InputRole r;
+		r.declared = traceOnly_;
 		r.role		= "key";
 		r.id		= "sparse";
 		r.towers	= base.size();

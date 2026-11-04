@@ -303,6 +303,15 @@ class HazeEngine : public Engine {
 	/// Each such input is role "scalar", named "scalar:<n>" in program order, with its kind, value
 	/// and per-limb factors in fideslib.input_roles.json.
 	bool scalarInputs_ = false;
+	/// @brief FIDESLIB_HAZE_TRACE_ONLY=1: record the program and its input roles without its
+	/// data. Keys, ciphertexts, tagged plaintexts and scalar inputs are declared, not uploaded
+	/// (no words recorded or written); untagged plaintexts (constants computed from the context:
+	/// masks, the refresh's tables) keep their words. The flush writes the program and does not
+	/// replay it; outputs read back as zero ciphertexts with their recorded level, noise scale
+	/// degree, scaling factor and slots, so the next stage can record from them.
+	bool traceOnly_ = false;
+	/// @brief A chain for `rows`: uploaded, or declared under trace-only.
+	hazebk::LimbChain inputChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base, bool declare);
 	size_t scalarCount_ = 0;
 	Operand scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value);
 	/// @brief c0 ± pt with the FIXEDAUTO rescale-if rule (Ciphertext.cpp:250-252): rescale
@@ -621,6 +630,7 @@ class HazeEngine : public Engine {
 		size_t component = 0, digit = 0, towers = 0, noiseScaleDeg = 0, slots = 0;
 		double scalingFactor = 0.0;
 		bool extended = false;
+		bool declared = false; // recorded without words (trace-only)
 		// role "scalar": "mul" or "add", the operand, its per-limb encoding
 		std::string kind;
 		double value = 0.0;

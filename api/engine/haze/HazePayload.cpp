@@ -64,6 +64,19 @@ LimbChain::LimbChain(const std::vector<std::vector<uint64_t>>& rows, const std::
 	}
 }
 
+LimbChain LimbChain::declared(std::size_t polyBytes, const std::vector<uint64_t>& base) {
+	LimbChain c(base.size(), polyBytes);
+	if (!base.empty()) {
+		try {
+			hazeCheck(hazeDeclareMrp(c.data(), polyBytes, base.data(), base.size()), "hazeDeclareMrp");
+		} catch (...) {
+			c.freeAll();
+			throw;
+		}
+	}
+	return c;
+}
+
 LimbChain::~LimbChain() {
 	freeAll();
 }
