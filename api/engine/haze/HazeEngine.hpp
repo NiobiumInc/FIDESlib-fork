@@ -293,7 +293,18 @@ class HazeEngine : public Engine {
 	void adjustPtToward(Operand& ptOp, const Operand& ct);
 	/// @brief FIXEDAUTO multScalar precheck (Ciphertext.cpp:761-775): rescale first when
 	/// NSD == 2, then multScalarCore.
-	Operand multScalarWithPrecheck(const Operand& x, double scalar);
+	Operand multScalarWithPrecheck(const Operand& x, double scalar, bool asInput = false);
+	/// @brief With FIDESLIB_HAZE_SCALAR_INPUTS=1, the double operand of a public ct x double or
+	/// ct +- double operation is recorded as a program input instead of an immediate: a constant
+	/// polynomial holding the operand's per-limb encoding in every word, multiplied or added
+	/// polynomial-wise. The result is bit-identical (a constant multiplies or adds the same
+	/// either way), and the program no longer depends on the operand's value, so one recording
+	/// serves every operand. The engine's own constants (the refresh's) stay immediates.
+	/// Each such input is role "scalar", named "scalar:<n>" in program order, with its kind, value
+	/// and per-limb factors in fideslib.input_roles.json.
+	bool scalarInputs_ = false;
+	size_t scalarCount_ = 0;
+	Operand scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value);
 	/// @brief c0 ± pt with the FIXEDAUTO rescale-if rule (Ciphertext.cpp:250-252): rescale
 	/// the ct when (pt.NSD==1, ct.NSD==2, ptTowers == ctTowers−1); then require level/NSD
 	/// agreement with the pt chain trimmed to the ct's towers. c1 passes through (D2D).
@@ -301,6 +312,8 @@ class HazeEngine : public Engine {
 	/// @brief Encode ±scalar per ElemForEvalAddOrSub (negative: per-limb q_i − e_i flip)
 	/// and add it onto c0; metadata unchanged. c1 passes through (D2D).
 	Operand addScalarCore(const Operand& x, double scalar);
+	/// @brief addScalarCore for the public ct +- double entry points (an input with FIDESLIB_HAZE_SCALAR_INPUTS).
+	Operand addScalarPublic(const Operand& x, double scalar);
 
 	/// @brief Materialize a view as a payload: if the view truncates its payload, record
 	/// nothing — build the result payload that owns fresh chains is the OPS' job; this
@@ -608,6 +621,10 @@ class HazeEngine : public Engine {
 		size_t component = 0, digit = 0, towers = 0, noiseScaleDeg = 0, slots = 0;
 		double scalingFactor = 0.0;
 		bool extended = false;
+		// role "scalar": "mul" or "add", the operand, its per-limb encoding
+		std::string kind;
+		double value = 0.0;
+		std::vector<uint64_t> factors;
 	};
 	std::vector<InputRole> inputRoles_;
 	/// @brief Record the role of the input `chain` was just uploaded as (its haze input name).

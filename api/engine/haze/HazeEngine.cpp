@@ -305,6 +305,11 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		throw;
 	}
 
+	{
+		const char* e  = std::getenv("FIDESLIB_HAZE_SCALAR_INPUTS");
+		scalarInputs_ = e != nullptr && std::string(e) == "1";
+		scalarCount_  = 0;
+	}
 	liveEngines_.fetch_add(1);
 	loaded_	  = true;
 	executed_ = false;
@@ -1093,13 +1098,57 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	throw std::runtime_error("haze backend: adjustPtToward is meaningful only for the AUTO scaling modes");
 }
 
-HazeEngine::Operand HazeEngine::multScalarWithPrecheck(const Operand& x, double scalar) {
+HazeEngine::Operand HazeEngine::scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value) {
+	// The operand as an input: one constant polynomial per limb, the per-limb encoding in every word.
+	std::vector<std::vector<uint64_t>> rows(x.towers);
+	for (size_t i = 0; i < x.towers; ++i) {
+		rows[i].assign(ringDim_, factors[i]);
+	}
+	const auto base = qPrefix(x.towers);
+	LimbChain in(rows, base);
+	{
+		InputRole r;
+		r.role			= "scalar";
+		r.tag			= "scalar:" + std::to_string(scalarCount_++);
+		r.kind			= add ? "add" : "mul";
+		r.value			= value;
+		r.factors		= factors;
+		r.towers		= x.towers;
+		r.noiseScaleDeg = x.noiseScaleDeg;
+		noteInput(in, r);
+	}
+	std::vector<LimbChain> outs;
+	if (add) {
+		LimbChain out0(x.towers, polyBytes_);
+		hazeCheck(hazeAddMrp(out0.data(), x.p->c0().asConst().data(), in.asConst().data(), base.data(), base.size(), nullptr), "hazeAddMrp(scalar input)");
+		outs = passThroughTail(std::move(out0), x);
+	} else {
+		outs.reserve(x.p->components.size());
+		for (const auto& comp : x.p->components) {
+			LimbChain out(x.towers, polyBytes_);
+			hazeCheck(hazeMulMrp(out.data(), comp.asConst().data(), in.asConst().data(), base.data(), base.size(), nullptr), "hazeMulMrp(scalar input)");
+			outs.push_back(std::move(out));
+		}
+	}
+	Operand res = x;
+	if (!add) {
+		res.noiseScaleDeg = x.noiseScaleDeg + 1;
+		res.scalingFactor = x.scalingFactor * sfReal_[levelOf(x)];
+	}
+	res.p = finishPayload(std::move(outs), res);
+	return res;
+}
+
+HazeEngine::Operand HazeEngine::multScalarWithPrecheck(const Operand& x, double scalar, bool asInput) {
 	// FIXEDAUTO multScalar precheck (FIDESlib Ciphertext.cpp:761-775): rescale a depth-2
 	// operand before the scalar multiply so the result re-enters depth 2 cleanly.
 	Operand cur	  = x;
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDMANUAL && cur.noiseScaleDeg == 2) {
 		cur = rescaleCore(cur);
+	}
+	if (asInput) {
+		return scalarInputCore(cur, hazebk::elemForEvalMult(scalarParams(), cur.towers, scalar), false, scalar);
 	}
 	return multScalarCore(cur, scalar);
 }
@@ -1111,6 +1160,20 @@ LimbChain HazeEngine::passThroughChain(const LimbChain& src, size_t towers) {
 	LimbChain out(towers, polyBytes_);
 	hazeCheck(hazeMemcpyMrp(out.data(), src.asConst().data(), polyBytes_, HAZE_MEMCPY_DEVICE_TO_DEVICE, base.data(), base.size()), "hazeMemcpyMrp(D2D)");
 	return out;
+}
+
+HazeEngine::Operand HazeEngine::addScalarPublic(const Operand& x, double scalar) {
+	if (!scalarInputs_) {
+		return addScalarCore(x, scalar);
+	}
+	// as addScalarCore, every operand (zero included) an input: the program does not depend on it
+	auto factors = hazebk::elemForEvalAddOrSub(scalarParams(), x.towers, std::fabs(scalar), x.noiseScaleDeg);
+	if (scalar < 0.0) {
+		for (size_t i = 0; i < factors.size(); ++i) {
+			factors[i] = qBase_[i] - factors[i];
+		}
+	}
+	return scalarInputCore(x, factors, true, scalar);
 }
 
 HazeEngine::Operand HazeEngine::addScalarCore(const Operand& x, double scalar) {
@@ -1345,28 +1408,28 @@ void HazeEngine::evalNegateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalAdd(scalar)");
-	Operand res = addScalarCore(asOperand(p), scalar);
+	Operand res = addScalarPublic(asOperand(p), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalAddInPlace(scalar)");
-	Operand res = addScalarCore(asOperand(p), scalar);
+	Operand res = addScalarPublic(asOperand(p), scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
 Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar)");
-	Operand res = addScalarCore(asOperand(p), -scalar);
+	Operand res = addScalarPublic(asOperand(p), -scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar)");
-	Operand res = addScalarCore(asOperand(p), -scalar);
+	Operand res = addScalarPublic(asOperand(p), -scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1379,14 +1442,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, doubl
 	// bug. (The negate primitive itself still differs per #1.)
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar, ct)");
-	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
+	Operand res = addScalarPublic(negateCore(asOperand(p)), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scalar, Ciphertext<DCRTPoly>& ct1) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar, ct)");
-	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
+	Operand res = addScalarPublic(negateCore(asOperand(p)), scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1426,14 +1489,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plain
 Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMult(scalar)");
-	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
+	Operand res = multScalarWithPrecheck(asOperand(p), scalar, scalarInputs_);
 	return wrapDeviceResult(ctx, ct1, std::move(res.p));
 }
 
 void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMultInPlace(scalar)");
-	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
+	Operand res = multScalarWithPrecheck(asOperand(p), scalar, scalarInputs_);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1568,7 +1631,16 @@ void HazeEngine::writeInputRoles() {
 		}
 		std::snprintf(sf, sizeof sf, "%.17g", r.scalingFactor);
 		out << (i ? ",\n    " : "\n    ") << "{\"name\": " << jsonString(r.name) << ", \"role\": " << jsonString(r.role);
-		if (r.role == "key") {
+		if (r.role == "scalar") {
+			char v[64];
+			std::snprintf(v, sizeof v, "%.17g", r.value);
+			out << ", \"tag\": " << jsonString(r.tag) << ", \"kind\": \"" << r.kind << "\", \"value\": " << v
+				<< ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"factors\": [";
+			for (size_t f = 0; f < r.factors.size(); ++f) {
+				out << (f ? ", " : "") << r.factors[f];
+			}
+			out << "]";
+		} else if (r.role == "key") {
 			out << ", \"id\": " << jsonString(r.id) << ", \"digit\": " << r.digit << ", \"component\": \"" << (r.component ? "b" : "a") << "\"";
 		} else {
 			if (r.role == "ciphertext") {
