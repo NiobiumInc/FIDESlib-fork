@@ -11,6 +11,10 @@
 #include "CryptoContext.hpp"
 #include "Definitions.hpp"
 
+/// @brief CiphertextImpl and PlaintextImpl carry `tag`, the caller's name for a value as a
+/// program input.
+#define FIDESLIB_HAS_INPUT_TAGS 1
+
 namespace fideslib {
 
 /// @brief Specialization of Ciphertext for the DCRTPoly representation.
@@ -76,6 +80,10 @@ template <> class CiphertextImpl<DCRTPoly> {
 	std::any host;
 	/// @brief Backend-resident payload (the CUDA backend stores a shared_ptr to its device ciphertext); empty == not resident.
 	std::any device;
+	/// @brief An opaque name the caller gives this value as a program input; empty: none. A
+	/// recording back end (haze) writes it next to the input it uploads, so that whoever runs the
+	/// recorded program can bind that input again. No engine interprets it.
+	std::string tag;
 	/// @brief Parent context.
 	CryptoContext<DCRTPoly> parent_context;
 };
