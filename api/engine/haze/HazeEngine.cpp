@@ -1147,8 +1147,8 @@ HazeEngine::Operand HazeEngine::scalarPatchCore(const Operand& x, const std::vec
 		z ^= z >> 31;
 		r.sentinels[i] = 2 + z % (qBase_[i] - 3);
 	}
-	const std::vector<uint64_t>& words = traceOnly_ ? r.sentinels : factors;
 	scalarRoles_.push_back(std::move(r));
+	const std::vector<uint64_t>& words = traceOnly_ ? scalarRoles_.back().sentinels : factors;
 	const auto base = qPrefix(x.towers);
 	Operand res		= x;
 	if (add) {
