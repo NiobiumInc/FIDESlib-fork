@@ -303,6 +303,21 @@ class HazeEngine : public Engine {
 	/// Each such input is role "scalar", named "scalar:<n>" in program order, with its kind, value
 	/// and per-limb factors in fideslib.input_roles.json.
 	bool scalarInputs_ = false;
+	/// @brief FIDESLIB_HAZE_SCALAR_INPUTS=patch: the same operands stay immediates, one word per
+	/// tower, so the program carries no polynomial for them. Every such operation is recorded
+	/// (an addition of zero included), so the program does not depend on the operands' values;
+	/// under trace-only each immediate is a sentinel, a word derived from the operand's number
+	/// and tower that a runtime replaces with the launch's per-limb factor. Listed under
+	/// "scalars" in fideslib.input_roles.json ("scalar:<n>", kind, value, factors, sentinels).
+	bool scalarPatch_ = false;
+	struct ScalarRole {
+		std::string tag, kind;
+		double value = 0.0;
+		size_t towers = 0, noiseScaleDeg = 0;
+		std::vector<uint64_t> factors, sentinels;
+	};
+	std::vector<ScalarRole> scalarRoles_;
+	Operand scalarPatchCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value);
 	/// @brief FIDESLIB_HAZE_TRACE_ONLY=1: record the program and its input roles without its
 	/// data. Keys, ciphertexts, tagged plaintexts and scalar inputs are declared, not uploaded
 	/// (no words recorded or written); untagged plaintexts (constants computed from the context:

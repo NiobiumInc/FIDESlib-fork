@@ -307,7 +307,8 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 	{
 		const char* e  = std::getenv("FIDESLIB_HAZE_SCALAR_INPUTS");
-		scalarInputs_ = e != nullptr && std::string(e) == "1";
+		scalarInputs_ = e != nullptr && (std::string(e) == "1" || std::string(e) == "patch");
+		scalarPatch_  = e != nullptr && std::string(e) == "patch";
 		scalarCount_  = 0;
 		const char* t = std::getenv("FIDESLIB_HAZE_TRACE_ONLY");
 		traceOnly_	  = t != nullptr && std::string(t) == "1";
@@ -1126,7 +1127,53 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	throw std::runtime_error("haze backend: adjustPtToward is meaningful only for the AUTO scaling modes");
 }
 
+HazeEngine::Operand HazeEngine::scalarPatchCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value) {
+	// The operand as immediates (one word per tower), always recorded; under trace-only each
+	// word is a sentinel the runtime replaces: a splitmix64 of (operand number, tower), in
+	// [2, q_i - 1), so that no sentinel is 0 or 1.
+	ScalarRole r;
+	const size_t n = scalarCount_++;
+	r.tag			= "scalar:" + std::to_string(n);
+	r.kind			= add ? "add" : "mul";
+	r.value			= value;
+	r.towers		= x.towers;
+	r.noiseScaleDeg = x.noiseScaleDeg;
+	r.factors		= factors;
+	r.sentinels.resize(x.towers);
+	for (size_t i = 0; i < x.towers; ++i) {
+		uint64_t z = (static_cast<uint64_t>(n) << 8 | i) + 0x9E3779B97F4A7C15ULL;
+		z		   = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z		   = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		z ^= z >> 31;
+		r.sentinels[i] = 2 + z % (qBase_[i] - 3);
+	}
+	const std::vector<uint64_t>& words = traceOnly_ ? r.sentinels : factors;
+	scalarRoles_.push_back(std::move(r));
+	const auto base = qPrefix(x.towers);
+	Operand res		= x;
+	if (add) {
+		LimbChain out0(x.towers, polyBytes_);
+		hazeCheck(hazeAddScalarMrp(out0.data(), x.p->c0().asConst().data(), words.data(), base.data(), base.size(), nullptr), "hazeAddScalarMrp(scalar)");
+		res.p = finishPayload(passThroughTail(std::move(out0), x), res);
+		return res;
+	}
+	std::vector<LimbChain> outs;
+	outs.reserve(x.p->components.size());
+	for (const auto& comp : x.p->components) {
+		LimbChain out(x.towers, polyBytes_);
+		hazeCheck(hazeMulScalarMrp(out.data(), comp.asConst().data(), words.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp(scalar)");
+		outs.push_back(std::move(out));
+	}
+	res.noiseScaleDeg = x.noiseScaleDeg + 1;
+	res.scalingFactor = x.scalingFactor * sfReal_[levelOf(x)];
+	res.p			  = finishPayload(std::move(outs), res);
+	return res;
+}
+
 HazeEngine::Operand HazeEngine::scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value) {
+	if (scalarPatch_) {
+		return scalarPatchCore(x, factors, add, value);
+	}
 	// The operand as an input: one constant polynomial per limb, the per-limb encoding in every word.
 	std::vector<std::vector<uint64_t>> rows(x.towers);
 	for (size_t i = 0; i < x.towers; ++i) {
@@ -1652,7 +1699,7 @@ void HazeEngine::writeInputRoles() {
 	}
 	const std::filesystem::path dir = programDir_;
 	std::ofstream out(dir / "fideslib.input_roles.json");
-	out << "{\n  \"format\": 1,\n  \"inputs\": [";
+	out << "{\n  \"schema\": \"fideslib.input_roles\",\n  \"version\": 1,\n  \"format\": 1,\n  \"inputs\": [";
 	char sf[64];
 	for (size_t i = 0; i < inputRoles_.size(); ++i) {
 		const InputRole& r = inputRoles_[i];
@@ -1689,6 +1736,22 @@ void HazeEngine::writeInputRoles() {
 			}
 		}
 		out << ", \"towers\": " << r.towers << (omitted ? ", \"omitted\": true" : "") << "}";
+	}
+	out << "\n  ],\n  \"scalars\": [";
+	for (size_t i = 0; i < scalarRoles_.size(); ++i) {
+		const ScalarRole& r = scalarRoles_[i];
+		char v[64];
+		std::snprintf(v, sizeof v, "%.17g", r.value);
+		out << (i ? ",\n    " : "\n    ") << "{\"tag\": " << jsonString(r.tag) << ", \"kind\": \"" << r.kind << "\", \"value\": " << v
+			<< ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"towers\": " << r.towers << ", \"factors\": [";
+		for (size_t f = 0; f < r.factors.size(); ++f) {
+			out << (f ? ", " : "") << r.factors[f];
+		}
+		out << "], \"sentinels\": [";
+		for (size_t f = 0; f < r.sentinels.size(); ++f) {
+			out << (f ? ", " : "") << r.sentinels[f];
+		}
+		out << "]}";
 	}
 	out << "\n  ],\n  \"outputs\": [";
 	for (size_t i = 0; i < outputRoles_.size(); ++i) {
