@@ -185,6 +185,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	rotKeys_.clear();
 	autoKeys_.clear();
 	sparseKey_.reset();
+	monomials_.clear();
 	for (const int32_t step : ctx.rotation_indexes) {
 		if (rotKeys_.count(step) != 0) {
 			continue;
@@ -317,6 +318,7 @@ void HazeEngine::teardown() {
 	rotKeys_.clear();
 	autoKeys_.clear();
 	sparseKey_.reset();
+	monomials_.clear();
 	boot_.clear();
 	numPartQ_ = 0;
 	// Reset order per replay_bridge.h: drop the bridge's cached CryptoContexts so they don't
@@ -1945,6 +1947,52 @@ void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DC
 	auto ptp = ensurePt(ctx, pt);
 	requireComputable(*p, "EvalMultInPlace(pt)");
 	Operand res = multPtCore(asOperand(p), *ptp);
+	rebindPayload(*p, std::move(res.p->components), res);
+}
+
+const LimbChain& HazeEngine::monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uint32_t r) {
+	if (auto it = monomials_.find(r); it != monomials_.end()) {
+		return it->second;
+	}
+	// As OpenFHE MultByMonomialInPlace builds it: +1 at r, or -1 at r - N when r >= N.
+	const auto params = hostContext(ctx)->GetCryptoParameters()->GetElementParams();
+	const uint32_t n  = static_cast<uint32_t>(ringDim_);
+	lbcrypto::DCRTPoly monomial(params, Format::COEFFICIENT, true);
+	for (size_t t = 0; t < params->GetParams().size(); ++t) {
+		lbcrypto::NativePoly tower(params->GetParams()[t], Format::COEFFICIENT, true);
+		tower[r % n] = r < n ? lbcrypto::NativeInteger(1) : params->GetParams()[t]->GetModulus() - lbcrypto::NativeInteger(1);
+		monomial.SetElementAtIndex(t, std::move(tower));
+	}
+	auto rows = extractRows(monomial, ringDim_);
+	return monomials_.emplace(r, LimbChain(rows, qPrefix(rows.size()))).first->second;
+}
+
+HazeEngine::Operand HazeEngine::multByMonomialCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t power) {
+	// X^(2N) = 1, so the monomial depends on power mod 2N. It spans the whole Q chain, and a
+	// ciphertext with fewer towers multiplies by its prefix, as multPtCore does with a plaintext.
+	const LimbChain& monomial = monomialChain(ctx, power % (2 * static_cast<uint32_t>(ringDim_)));
+	const auto base			  = qPrefix(x.towers);
+	std::vector<LimbChain> outs;
+	outs.reserve(x.p->components.size());
+	for (const auto& comp : x.p->components) {
+		outs.push_back(mulChain(polyBytes_, base, comp.asConst().data(), monomial.asConst().data()));
+	}
+	Operand res = x;
+	res.p		= finishPayload(std::move(outs), res);
+	return res;
+}
+
+Ciphertext<DCRTPoly> HazeEngine::multByMonomial(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "MultByMonomial");
+	Operand res = multByMonomialCore(ctx, asOperand(p), power);
+	return wrapDeviceResult(ctx, ciphertext, std::move(res.p));
+}
+
+void HazeEngine::multByMonomialInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ciphertext, uint32_t power) {
+	auto p = ensureCt(ctx, ciphertext);
+	requireComputable(*p, "MultByMonomialInPlace");
+	Operand res = multByMonomialCore(ctx, asOperand(p), power);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
