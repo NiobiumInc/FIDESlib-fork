@@ -282,6 +282,15 @@ level with that of a CPU-engine context built from the same parameters.
 `ReducedLevelMatchesBootstrapThenDrop` now encrypts deep enough that its target sits below the input
 level, and asserts that precondition.
 
+### R15. `CKKSDataType` on the api
+`CCParams::SetCKKSDataType` and `CryptoContext::GetCKKSDataType` mirror OpenFHE, with the enum in
+`api/Definitions.hpp`. COMPLEX changes host encode and decode on every backend. OpenFHE's bootstrap
+precomputation and evaluation both branch on the data type (`ckksrns-fhe.cpp`), and the CUDA and haze
+bootstraps implement only the REAL path, so `EvalBootstrapSetup` refuses a COMPLEX context on those
+backends (`Engine::supportsComplexBootstrap`).
+
+Tests: `CKKSDataTypeTest.*` (`test/ApiTests.cpp`).
+
 ### R17. `MultByMonomial` on the api
 `CryptoContext::MultByMonomial(ct, power)` and `MultByMonomialInPlace` mirror OpenFHE's
 `MultByMonomial`: every component (2 or 3) is multiplied by X^power, and level, scale and noise

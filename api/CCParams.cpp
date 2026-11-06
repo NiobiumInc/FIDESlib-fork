@@ -43,6 +43,13 @@ void CCParams<CryptoContextCKKSRNS>::SetScalingTechnique(ScalingTechnique tech) 
 	params.SetScalingTechnique(scale_openfhe);
 }
 
+void CCParams<CryptoContextCKKSRNS>::SetCKKSDataType(CKKSDataType type) {
+	auto& params	  = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(host);
+	auto type_openfhe = static_cast<lbcrypto::CKKSDataType>(type);
+	assert((int)type_openfhe == (int)type);
+	params.SetCKKSDataType(type_openfhe);
+}
+
 void CCParams<CryptoContextCKKSRNS>::SetNumLargeDigits(uint32_t numDigits) {
 	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(host);
 	params.SetNumLargeDigits(numDigits);
