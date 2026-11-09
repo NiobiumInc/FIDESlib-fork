@@ -1084,6 +1084,8 @@ class CKKSBootstrapTest : public ::testing::Test {
 	CryptoContext<DCRTPoly> cc;
 	KeyPair<DCRTPoly> keys;
 	const std::vector<double> v1 = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+	// EvalBootstrapSetup's btsfirstboot. A derived fixture sets it in its constructor, before SetUp.
+	bool btsFirstBoot = false;
 
 	void SetUp() override {
 		CCParams<CryptoContextCKKSRNS> params;
@@ -1108,7 +1110,7 @@ class CKKSBootstrapTest : public ::testing::Test {
 		cc->EvalMultKeyGen(keys.secretKey);
 		// levelBudget {2,2}, dim1 {0,0}, derived correction factor — OpenFHEBootstrap's
 		// EvalBootstrapSetup({ 2, 2 }, { 0, 0 }, slots) verbatim.
-		cc->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0);
+		cc->EvalBootstrapSetup({ kLevelBudget, kLevelBudget }, { 0, 0 }, kSlots, 0, /*precompute=*/true, btsFirstBoot);
 		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
 		if (TestUseDevice())
 			cc->LoadContext(keys.publicKey);
@@ -1140,6 +1142,33 @@ TEST_F(CKKSBootstrapTest, BootstrapInPlace) {
 	cc->EvalBootstrapInPlace(ct);
 	ASSERT_LT(ct->GetLevel(), levelBefore) << "bootstrap gained no levels: it returned the input unchanged, so this test exercised nothing";
 	CheckPrecision(cc, ct, keys.secretKey, v1, CKKS_BOOTSTRAP_PRECISION);
+}
+
+// The same context with the bootstrap set up for the slots-encoding order (btsfirstboot=true,
+// SlotsToCoeffs first). The device bootstrap of the CUDA backend runs the classic order only, so
+// it used to run that order against these precomputations and return a wrong result silently.
+// It must refuse instead, on every entry point, before touching the ciphertext.
+class CKKSBootstrapSlotsEncodingTest : public CKKSBootstrapTest {
+  protected:
+	CKKSBootstrapSlotsEncodingTest() {
+		btsFirstBoot = true;
+	}
+};
+
+FIDES_TEST_F_IF(OnCuda(), CKKSBootstrapSlotsEncodingTest, CudaRefusesSlotsEncodingBootstrap) {
+	auto pt = cc->MakeCKKSPackedPlaintext(v1, 1, kMaxBootLevel, nullptr, kSlots);
+	auto ct = cc->Encrypt(pt, keys.publicKey);
+	const size_t levelBefore = ct->GetLevel();
+
+	EXPECT_THROW((void)cc->EvalBootstrap(ct), lbcrypto::OpenFHEException);
+	EXPECT_THROW(cc->EvalBootstrapInPlace(ct), lbcrypto::OpenFHEException);
+	// Two iterations (Meta-BTS) run two device bootstraps; the guard comes before either.
+	EXPECT_THROW((void)cc->EvalBootstrap(ct, 2, 16), lbcrypto::OpenFHEException);
+	EXPECT_THROW(cc->EvalBootstrapInPlace(ct, 2, 16), lbcrypto::OpenFHEException);
+
+	// The refusals left the input as it was.
+	EXPECT_EQ(ct->GetLevel(), levelBefore);
+	CheckPrecision(cc, ct, keys.secretKey, v1, CKKS_PRECISION);
 }
 
 // ---- 9. GetPreScaleFactor (FIXEDAUTO) ----

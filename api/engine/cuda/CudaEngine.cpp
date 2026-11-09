@@ -898,8 +898,25 @@ CudaEngine::evalBootstrapMetaDevice(CryptoContextImpl<DCRTPoly>& ctx, const Ciph
 	return out;
 }
 
+// The device Bootstrap runs the classic order only (raise, CoeffsToSlots, EvalMod,
+// SlotsToCoeffs). EvalBootstrapSetup(..., btsfirstboot=true) builds OpenFHE's precomputations for
+// the slots-encoding order (SlotsToCoeffs first) instead, and the device would run its own order
+// against them. Refuse it, as bootstrapOutputLevel already does for EvalBootstrapToLevel.
+void CudaEngine::requireClassicBootstrapOrder(CryptoContextImpl<DCRTPoly>& ctx, int slots) {
+	auto& context  = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(ctx.host);
+	const auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
+	if (!fhe)
+		return;
+	const auto it = fhe->m_bootPrecomMap.find(slots);
+	if (it != fhe->m_bootPrecomMap.end() && it->second->BTSlotsEncoding)
+		OPENFHE_THROW("CUDA backend: EvalBootstrap does not support a bootstrap set up with "
+					  "btsfirstboot=true (the slots-encoding order); the device bootstrap runs the "
+					  "classic order only. Call EvalBootstrapSetup with btsfirstboot=false.");
+}
+
 Ciphertext<DCRTPoly>
 CudaEngine::evalBootstrapInternal(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled, int levelsToDrop) {
+	requireClassicBootstrapOrder(ctx, static_cast<int>(ciphertext->GetSlots()));
 	if (numIterations > 1) {
 		// Meta-BTS (iterative bootstrapping): previously numIterations/precision
 		// were silently DROPPED here (BITCOMPAT "fails silently" class), so
@@ -1019,6 +1036,7 @@ void CudaEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 		ciphertext->device		 = out->device; // the device result (default); empty under the host glue (FIDESLIB_METABTS_DEVICE=0)
 		return;
 	}
+	requireClassicBootstrapOrder(ctx, static_cast<int>(ciphertext->GetSlots()));
 	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 	auto res_gpu = deviceCt(ciphertext);
 	FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled);
