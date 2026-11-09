@@ -125,10 +125,17 @@ jobs:
             echo "toolchain=${ID}${VERSION_ID}-gcc$(gcc -dumpversion)"
           } >> "$GITHUB_OUTPUT"
 
-      # The GPU test suite includes nccl.h. Install the NCCL build for the
-      # runner's CUDA version from NVIDIA's apt repository, after checking the
-      # keyring package's hash. The keyring goes through apt-get, not dpkg -i,
-      # because dpkg does not wait for a lock another process holds.
+      # The GPU test suite includes nccl.h. Install an NCCL build from NVIDIA's
+      # apt repository, after checking the keyring package's hash. The keyring
+      # goes through apt-get, not dpkg -i, because dpkg does not wait for a lock
+      # another process holds.
+      #
+      # The build must not target a newer CUDA than the runner's: the unpinned
+      # package follows NVIDIA's newest CUDA. It need not match the runner's
+      # minor version either, since CUDA's minor version compatibility lets a
+      # build for 13.4 run on 13.5, and NVIDIA can ship a CUDA release before
+      # the NCCL build for it. So take the newest build for the runner's CUDA
+      # major version whose minor version is not above the runner's.
       - name: Install NCCL
         env:
           CUDA_VERSION: ${{ steps.env.outputs.cuda }}
@@ -158,12 +165,22 @@ jobs:
           apt=(sudo apt-get -o DPkg::Lock::Timeout=600)
           "${apt[@]}" install -y ./cuda-keyring.deb
           "${apt[@]}" update
-          suffix="+cuda$CUDA_VERSION"
+          # apt-cache madison lists the newest version first, so the first build
+          # seen for the highest eligible minor version is the newest NCCL for it.
           ver=$(apt-cache madison libnccl-dev |
-                awk -v s="$suffix" 'substr($3, length($3) - length(s) + 1) == s { print $3; exit }')
+                awk -v major="${CUDA_VERSION%%.*}" -v minor="${CUDA_VERSION#*.}" '
+                  BEGIN { best_minor = -1 }
+                  match($3, /\+cuda[0-9]+\.[0-9]+$/) {
+                    split(substr($3, RSTART + 5), v, ".")
+                    if (v[1] == major && v[2] <= minor && v[2] > best_minor) { best = $3; best_minor = v[2] }
+                  }
+                  END { print best }')
           if [ -z "$ver" ]; then
-            echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION"
+            echo "::error::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION or an earlier ${CUDA_VERSION%%.*}.x"
             exit 1
+          fi
+          if [ "${ver##*+cuda}" != "$CUDA_VERSION" ]; then
+            echo "::warning::NVIDIA's repository has no NCCL build for CUDA $CUDA_VERSION yet; using $ver"
           fi
           "${apt[@]}" install -y --no-install-recommends "libnccl2=$ver" "libnccl-dev=$ver"
 
