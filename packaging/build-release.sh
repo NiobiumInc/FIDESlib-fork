@@ -252,8 +252,13 @@ if [ "$PLATFORM" = linux ]; then
     done
 else
     for dy in "$LIBDIR"/*.dylib; do
-        [ -f "$dy" ] || continue
-        install_name_tool -id "@rpath/$(basename "$dy")" "$dy" \
+        [ -f "$dy" ] && [ ! -L "$dy" ] || continue
+        # Keep the name the library declares, and only move it under @rpath: CMake gives
+        # libfideslib its compatibility name, libfideslib.1.dylib, which is what a
+        # consumer records, not the unversioned development symlink.
+        id=$(otool -D "$dy" | sed -n 2p) || { echo "otool -D failed on $dy" >&2; exit 1; }
+        [ -n "$id" ] || { echo "no install name in $dy" >&2; exit 1; }
+        install_name_tool -id "@rpath/${id##*/}" "$dy" \
             || { echo "install_name_tool -id failed on $dy" >&2; exit 1; }
         # The bundled libc++*/libunwind already carry @loader_path from their own
         # Homebrew build (checked with otool -l), so -add_rpath on those specific
