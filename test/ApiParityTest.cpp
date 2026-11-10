@@ -2019,6 +2019,10 @@ FIDES_TEST_F_IF(OnDevice(), ApiParityIteratedBootstrapTest, EvalBootstrapTwoIter
 	const size_t levelBefore = ct->GetLevel();
 	auto refreshed			 = cc->EvalBootstrap(ct, kIterations, precision);
 	cc->EvalBootstrapInPlace(inPlace, kIterations, precision);
+	// Both results are read back below; haze records the program and needs every value read after
+	// the first Decrypt declared up front.
+	cc->MarkOutput(refreshed);
+	cc->MarkOutput(inPlace);
 
 	const std::pair<const char*, Ciphertext<DCRTPoly>*> results[] = { { "EvalBootstrap", &refreshed }, { "EvalBootstrapInPlace", &inPlace } };
 	for (const auto& [call, result] : results) {
