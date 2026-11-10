@@ -496,11 +496,74 @@ jobs:
             --title "FIDESlib $VERSION" --notes "" \
             dist/*.tar.gz dist/SHA256SUMS dist/fideslib-bin.nix
 
+  # packaging/pin-nix-release.sh rewrites public refs, and the nix-release job runs it only
+  # after a real publish, so every run of this workflow first exercises it against a
+  # throwaway remote. It needs git and nothing else.
+  pin-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            packaging/pin-nix-release.sh
+            packaging/test-pin-nix-release.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Test the nix-release pin
+        run: bash packaging/test-pin-nix-release.sh "$RUNNER_TEMP/pin-test"
+
+  # The flake's fideslib-bin can only be pinned once its release is published: a commit
+  # cannot carry the hashes of the release built from it. This job pins each nb_main
+  # release on the nix-release branch and the <release tag>-nix tag, moving the branch only
+  # forward (packaging/pin-nix-release.sh). nb_main itself is never written: it requires a
+  # reviewed pull request, and its template carries no pin.
+  nix-release:
+    needs: [version, release, pin-test]
+    if: github.ref == 'refs/heads/nb_main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # Full history, so the script can check that this release descends from the one
+      # nix-release already pins.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            packaging/fideslib-bin.nix
+            packaging/pin-nix-release.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Pin the release on nix-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # The file the release published, not one emitted again here.
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p fideslib-bin.nix -D "$RUNNER_TEMP/release"
+          out=$(bash packaging/pin-nix-release.sh "$TAG" "$RUNNER_TEMP/release/fideslib-bin.nix" origin)
+          echo "$out"
+          {
+            echo "### nix-release"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`$(sed -n 's/^tag=//p' <<< "$out")\` |"
+            echo "| Commit | \`$(sed -n 's/^commit=//p' <<< "$out")\` |"
+            echo "| nix-release moved | $(sed -n 's/^moved=//p' <<< "$out") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # One table for the whole run: every job with its result, duration and link, whether
   # the CUDA packages were built, whether the run published, and the packages it built.
   # It runs even when a build or a consumer failed, which is when it matters most.
   report:
-    needs: [version, cpu-tests, gpu-tests, build, consume, release]
+    needs: [version, cpu-tests, gpu-tests, build, consume, release, pin-test, nix-release]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
