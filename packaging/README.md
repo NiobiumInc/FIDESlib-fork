@@ -54,6 +54,52 @@ simulator, `FUNC_SIM` and hardware targets dispatch to `nbcc_fhetch_replay`, whi
 be on `PATH` or named by `NBCC_FHETCH_REPLAY`. Set `FIDESLIB_HAZE_RUNS_DIR` to a
 writable path — the default is under `/tmp` and is commonly not writable.
 
+## Using it from nix
+
+The flake on the `nix-release` branch exposes the latest `nb_main` release as
+`packages.<system>.fideslib-bin`, on every system the release has a tarball for. With
+`follows`, the consumer's nixpkgs supplies the toolchain the libraries are patched against:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.fideslib.url = "github:NiobiumInc/FIDESlib-fork/nix-release";
+  inputs.fideslib.inputs.nixpkgs.follows = "nixpkgs";
+  outputs = { nixpkgs, fideslib, ... }: {
+    devShells.aarch64-darwin.default = nixpkgs.legacyPackages.aarch64-darwin.mkShell {
+      packages = [ fideslib.packages.aarch64-darwin.fideslib-bin ];
+    };
+  };
+}
+```
+
+`nix-release` moves forward to each new release, and a consumer's `flake.lock` records the
+commit it built against. For one fixed release, use its tag, `<release tag>-nix`:
+`github:NiobiumInc/FIDESlib-fork/v<date>-<sha>-nix`. The flake on `nb_main` has no
+`fideslib-bin`: a commit cannot carry the hashes of the release built from it, so the
+release workflow adds the pin afterwards, as one commit on top of the release commit.
+
+Without flakes, use the release's own `fideslib-bin.nix`, the same expression:
+
+```sh
+# Download a release's nix expression and checksums, then verify the expression
+# (on macOS, `shasum -a 256 -c --ignore-missing SHA256SUMS`).
+gh release download <tag> -R NiobiumInc/FIDESlib-fork -p fideslib-bin.nix -p SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+and import it with `pkgs.callPackage ./fideslib-bin.nix { }`.
+
+A shell that lists the package (`mkShell`, `nix develop`) gets `FIDESLIB`, the package
+root, to use as `PKG` in the plain-flags build above. `nix shell` runs no setup hooks,
+so it does not set it.
+
+The package keeps one C++ runtime in the process under nix too. On Linux,
+`autoPatchelfHook` points the libraries at nixpkgs' libstdc++. On macOS nothing is
+rewritten: nixpkgs links its programs against the system libc++ (its `libcxx` is an SDK
+stub naming `/usr/lib/libc++.1.dylib`), the one the libraries use. A consumer built with
+nix's clang, like one built with Apple clang, needs no extra link flags.
+
 ## What "self-contained" means here
 
 The package carries everything specific to FIDESlib. It still uses the platform's own
@@ -224,6 +270,9 @@ floor holds *below* the image that built the artifact.
 
 GitHub-hosted runners have no accelerator, so the FPGA leg is not covered there; run
 `test-package.sh` with `FIDESLIB_FPGA_TARGET` on an FPGA host for that.
+
+After publishing, the workflow pins the release on the `nix-release` branch and the
+`<release tag>-nix` tag (see "Using it from nix").
 
 `NiobiumInc/niobium-haze` and its nested `NiobiumInc/niobium-fhetch` submodule are
 public repositories, so the default `GITHUB_TOKEN` clones them without any extra
