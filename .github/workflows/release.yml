@@ -240,17 +240,15 @@ jobs:
       - name: Install build tools (macos)
         if: startsWith(matrix.name, 'macos')
         run: |
-          # Apple Clang's libc++ predates <print>, which haze needs. Homebrew LLVM 19
-          # supplies it. The package says macOS 15 or newer, and that is the floor of what it
-          # bundles (Homebrew's libomp is built for the runner's macOS 15) and of the only runner
-          # that tests it, so the deployment target is 15.0; std::print's runtime support alone
-          # would allow 13.3.
+          # Homebrew LLVM 19 compiles everything, as it does in haze's own CI. Its
+          # headers pair with the system libc++ of macOS 15.4 and newer, which every
+          # library links and nothing bundles; build-release.sh sets that floor as the
+          # deployment target, and verify-artifact.sh checks Homebrew's libomp against it.
           brew install llvm@19 libomp cmake ninja
           llvm="$(brew --prefix llvm@19)"
           {
             echo "CC=$llvm/bin/clang"
             echo "CXX=$llvm/bin/clang++"
-            echo "MACOSX_DEPLOYMENT_TARGET=15.0"
           } >> "$GITHUB_ENV"
 
       - name: Build release package
