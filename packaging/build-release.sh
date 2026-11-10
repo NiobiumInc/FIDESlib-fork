@@ -24,6 +24,9 @@
 #                 release floor; override for a local build on a newer host that isn't
 #                 meant to match the release floor)
 #   MAX_GLIBCXX   verify-artifact.sh's libstdc++ floor (default 3.4.29)
+#   MAX_MACOS     verify-artifact.sh's macOS floor, the newest minos any library may
+#                 declare (default 15.4; a local build bundles the host's Homebrew
+#                 libomp, whose minos is the host's macOS release)
 #   TEST_BUILD=1  build fideslib-cpu-test (CPU and haze backends, static) against the same
 #                 three dependency builds and stop: no package. The haze CI job uses it,
 #                 so the tests run on what the release ships.
@@ -39,6 +42,7 @@ BUILD_ROOT=${BUILD_ROOT:-/opt/${USER}/fideslib-release/build}
 OUT_DIR=${OUT_DIR:-$REPO/packaging/dist}
 MAX_GLIBC=${MAX_GLIBC:-2.28}
 MAX_GLIBCXX=${MAX_GLIBCXX:-3.4.29}
+MAX_MACOS=${MAX_MACOS:-15.4}
 
 # ---- platform / arch, spelled as the published artifacts name them ---------------
 case "$(uname -s)" in
@@ -306,5 +310,8 @@ tar -czf "$OUT_DIR/$PKGNAME.tar.gz" -C "$WORK" "$PKGNAME"
 
 echo "==> wrote $OUT_DIR/$PKGNAME.tar.gz"
 echo "==> verifying"
-BUILD_HOST_PATHS="$REPO $BUILD_ROOT" \
+# Homebrew is on the build machine only, so nothing in the package may name it.
+HOST_PATHS="$REPO $BUILD_ROOT"
+if [ "$PLATFORM" = macos ]; then HOST_PATHS="$HOST_PATHS $(brew --prefix)"; fi
+BUILD_HOST_PATHS="$HOST_PATHS" MAX_MACOS="$MAX_MACOS" \
     "$REPO/packaging/verify-artifact.sh" "$OUT_DIR/$PKGNAME.tar.gz" "$MAX_GLIBC" "$MAX_GLIBCXX"
