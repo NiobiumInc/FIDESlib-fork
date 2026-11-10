@@ -469,9 +469,6 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Checksums
-        run: cd dist && sha256sum ./*.tar.gz | tee SHA256SUMS
-
       - name: Emit the nix consumer expression
         run: |
           # nix consumes the published tarball rather than producing it: nixpkgs pins
@@ -479,6 +476,11 @@ jobs:
           # See packaging/README.md. Same split sunscreen-llvm uses.
           bash packaging/emit-nix-expr.sh dist "${{ needs.version.outputs.tag }}" \
             "${{ github.server_url }}/${{ github.repository }}" > dist/fideslib-bin.nix
+
+      # After the expression, so that a consumer downloading fideslib-bin.nix can check it
+      # too, not only the tarballs it names.
+      - name: Checksums
+        run: cd dist && sha256sum ./*.tar.gz ./fideslib-bin.nix | tee SHA256SUMS
 
       # gh is preinstalled on the runner, so no third-party action is needed. --target
       # puts the tag on the commit that was built rather than the default branch's tip. The
