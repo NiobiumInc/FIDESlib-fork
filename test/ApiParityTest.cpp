@@ -1933,15 +1933,19 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 // to be much closer to the plaintext than a single refresh gets.
 //
 // Parameters follow OpenFHE's iterative-ckks-bootstrapping example: N = 4096, 8 slots, FIXEDAUTO,
-// 59-bit scaling and 60-bit first modulus. `precision` is measured as the example does, from single
-// host bootstraps of the same input, less the example's 5-bit buffer.
+// 59-bit scaling and 60-bit first modulus, a {3,3} budget, and the example's depth: 10 levels left
+// after the bootstrap, plus the bootstrap's own depth, plus one level per extra iteration. With less
+// (depth 25 at this budget), the first refresh plus the rescale two iterations add leaves no more
+// towers than the input had, and OpenFHE returns the input unchanged. `precision` is measured as the
+// example does, from single host bootstraps of the same input, less the example's 5-bit buffer.
 class ApiParityIteratedBootstrapTest : public ::testing::Test {
   protected:
-	static constexpr uint32_t kDepth	   = 25;
 	static constexpr uint32_t kRingDim	   = 1u << 12;
 	static constexpr uint32_t kSlots	   = 8;
 	static constexpr uint32_t kIterations  = 2;
 	static constexpr uint32_t kBudget	   = 3;
+	static constexpr uint32_t kLevelsAfterBootstrap = 10;
+	const uint32_t kDepth = kLevelsAfterBootstrap + lbcrypto::FHECKKSRNS::GetBootstrapDepth({ kBudget, kBudget }, UNIFORM_TERNARY) + (kIterations - 1);
 	// The bits OpenFHE's example subtracts from the measured precision before passing it on.
 	static constexpr uint32_t kPrecisionBuffer = 5;
 	// How much closer to the plaintext two iterations must land than the best single refresh. Two
