@@ -28,11 +28,18 @@ sri() {
     fi
 }
 
+# Exactly one tarball per system. The release job runs only when every build leg
+# succeeded, so a missing or doubled tarball is a bug, not a platform to leave out:
+# meta.platforms, and with it the flake's packages, come from this list.
 emit_system() {
     local nix_system=$1 pattern=$2
-    local f
-    f=$(find "$DIST" -name "$pattern" | head -1)
-    [ -n "$f" ] || return 0
+    local f count
+    f=$(find "$DIST" -name "$pattern")
+    count=$(printf '%s' "$f" | grep -c . || true)
+    if [ "$count" -ne 1 ]; then
+        echo "expected one $pattern in $DIST, found $count" >&2
+        exit 1
+    fi
     cat <<EOF
     $nix_system = {
       url = "$REPO/releases/download/$TAG/$(basename "$f")";
