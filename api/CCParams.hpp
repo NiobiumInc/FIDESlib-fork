@@ -39,6 +39,8 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	void SetBatchSize(uint32_t size);
 	void SetRingDim(uint32_t dim);
 	void SetScalingTechnique(ScalingTechnique tech);
+	/// @brief COMPLEX keeps imaginary parts through encode and decode; the default is REAL.
+	void SetCKKSDataType(CKKSDataType type);
 	void SetNumLargeDigits(uint32_t numDigits);
 	void SetFirstModSize(uint32_t size);
 	void SetDigitSize(uint32_t size);
