@@ -1945,7 +1945,7 @@ class ApiParityIteratedBootstrapTest : public ::testing::Test {
 	static constexpr uint32_t kIterations  = 2;
 	static constexpr uint32_t kBudget	   = 3;
 	static constexpr uint32_t kLevelsAfterBootstrap = 10;
-	const uint32_t kDepth = kLevelsAfterBootstrap + lbcrypto::FHECKKSRNS::GetBootstrapDepth({ kBudget, kBudget }, UNIFORM_TERNARY) + (kIterations - 1);
+	const uint32_t kDepth = kLevelsAfterBootstrap + lbcrypto::FHECKKSRNS::GetBootstrapDepth({ kBudget, kBudget }, lbcrypto::UNIFORM_TERNARY) + (kIterations - 1);
 	// The bits OpenFHE's example subtracts from the measured precision before passing it on.
 	static constexpr uint32_t kPrecisionBuffer = 5;
 	// How much closer to the plaintext two iterations must land than the best single refresh. Two
