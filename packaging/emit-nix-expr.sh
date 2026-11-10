@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Emit a nix expression that consumes the published tarballs.
+# Emit the nix expression that consumes one release's published tarballs: the template
+# packaging/fideslib-bin.nix with its pinned block (version and sources) filled in.
+# Everything else in the expression comes from the template unchanged.
 #
 # nix packages the release rather than producing it. nixpkgs pins a single glibc per
 # revision, and no revision pairs a glibc old enough to be portable with a compiler new
@@ -15,6 +17,7 @@ set -euo pipefail
 DIST=${1:?usage: emit-nix-expr.sh <dist-dir> <tag> <repo-url>}
 TAG=${2:?missing tag}
 REPO=${3:?missing repo url}
+TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fideslib-bin.nix"
 
 # nix wants SRI hashes; sha256sum gives hex.
 sri() {
@@ -38,52 +41,34 @@ emit_system() {
 EOF
 }
 
-cat <<'HEADER'
-# FIDESlib, consumed as a published binary release.
-#
-# Usage:
-#   pkgs.callPackage ./fideslib-bin.nix { }
-#
-# autoPatchelfHook rewrites the ELF interpreter and RPATHs to point into the nix
-# store, which is exactly what it is for: importing a foreign binary into nix. The
-# tarball itself is built against an old glibc in a manylinux container so that it
-# also works on non-nix machines.
-{ lib, stdenv, fetchurl, autoPatchelfHook }:
-
-let
-  sources = {
-HEADER
-emit_system '"x86_64-linux"'  'fideslib-linux-x86-64-*.tar.gz'
-emit_system '"aarch64-linux"' 'fideslib-linux-aarch64-*.tar.gz'
-emit_system '"aarch64-darwin"' 'fideslib-macos-aarch64-*.tar.gz'
-cat <<HEADER2
-  };
-  src = sources.\${stdenv.hostPlatform.system} or (throw
-    "fideslib-bin: no released artifact for \${stdenv.hostPlatform.system}");
-in
-stdenv.mkDerivation {
-  pname = "fideslib-bin";
-  version = "${TAG#v}";
-
-  src = fetchurl src;
-
-  nativeBuildInputs = lib.optionals stdenv.isLinux [ autoPatchelfHook ];
-  # Supplies libstdc++.so.6 / libgcc_s.so.1 for the rewrite. The library links the
-  # C++ runtime dynamically on purpose: its public API exposes std::vector and
-  # lbcrypto:: types, so a private static libstdc++ would put two C++ runtimes on
-  # either side of the ABI boundary.
-  buildInputs = [ stdenv.cc.cc.lib ];
-
-  installPhase = ''
-    runHook preInstall
-    mkdir -p \$out
-    cp -r . \$out/
-    runHook postInstall
-  '';
-
-  meta = {
-    description = "FIDESlib CKKS library with CPU and HAZE backends (prebuilt)";
-    platforms = builtins.attrNames sources;
-  };
+pinned_block() {
+    echo "  version = \"${TAG#v}\";"
+    echo "  sources = {"
+    emit_system '"x86_64-linux"'  'fideslib-linux-x86-64-*.tar.gz'
+    emit_system '"aarch64-linux"' 'fideslib-linux-aarch64-*.tar.gz'
+    emit_system '"aarch64-darwin"' 'fideslib-macos-aarch64-*.tar.gz'
+    echo "  };"
 }
-HEADER2
+
+BEGIN_MARK='# begin pinned release'
+END_MARK='# end pinned release'
+
+# A plain assignment, so set -e stops the script when pinned_block fails.
+block=$(pinned_block)
+
+# Replace what lies between the markers and keep the markers, so the output can be
+# re-pinned the same way. One pass: state 0 before the block, 1 inside it, 2 after; any
+# marker out of that order, or a block that never closes, is an error. The values go
+# through the environment rather than awk -v, which some awks reject when they span lines.
+PINNED="$block" BEGIN_MARK="$BEGIN_MARK" END_MARK="$END_MARK" awk '
+    index($0, ENVIRON["BEGIN_MARK"]) {
+        if (state != 0) exit 2
+        print; print ENVIRON["PINNED"]; state = 1; next
+    }
+    index($0, ENVIRON["END_MARK"]) { if (state != 1) exit 2; state = 2 }
+    state != 1 { print }
+    END { if (state != 2) exit 2 }
+' "$TEMPLATE" || {
+    echo "$TEMPLATE needs exactly one pinned block: a '$BEGIN_MARK' line, then a '$END_MARK' line" >&2
+    exit 1
+}
