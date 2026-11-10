@@ -379,7 +379,7 @@ FIXEDAUTO arithmetic all came back bit-exact with no changes; FIXEDAUTO bootstra
 Known remaining coverage gaps: dense×LT{1,1} needs ≈2·slots raised-level LT plaintexts resident
 (several GB at N=4096 fully packed) and could not run on a 4 GB GPU. **Stale as of
 2026-08-26:** it is testable on a GPU with 32 GB. Iterated bootstrap (`numIterations = 2`) is implemented on every
-backend but has no test yet; StC-first setups remain an api dispatch gap on CUDA (see O11).
+backend but has no test yet; CUDA now refuses StC-first setups in `EvalBootstrap` (see O11).
 
 **Bit-compatible with no changes needed (green):**
 - Bootstrap level budget {1,1} → `isLT`/`EvalLinearTransform` branch (`EvalBootstrapLT`) —
@@ -723,7 +723,7 @@ code relying on the narrowing convention would break — worth confirming with t
 maintainers. `Broadcast` has the same trailing `slots` rewrite with no in-tree consumers;
 leave it alone for this fix but it is the same pattern.
 
-### O11. api `EvalBootstrap` GPU dispatch drops parameters *(iterations resolved on CUDA and haze; StC-first open on CUDA)*
+### O11. api `EvalBootstrap` GPU dispatch drops parameters *(resolved: iterations on CUDA and haze, StC-first refused on CUDA)*
 Two silent divergences between the api's CPU path and its device paths, found while auditing the
 bootstrap dispatch during the combination sweep. The dispatch has since moved from
 `api/CryptoContext.cpp` into the engines (`EvalBootstrap` forwards to `Engine::evalBootstrap`).
@@ -744,7 +744,7 @@ bootstrap dispatch during the combination sweep. The dispatch has since moved fr
   calls a bootstrap with `numIterations = 2`; the haze composition was checked only by decrypting
   an application circuit against its plaintext reference (#85), not limb-exact against the CPU
   engine.
-- **`btsfirstboot` (StC-first) misroutes on CUDA — open.** api `EvalBootstrapSetup` forwards
+- **`btsfirstboot` (StC-first) misroutes on CUDA — resolved (CUDA throws).** api `EvalBootstrapSetup` forwards
   `btsfirstboot` to OpenFHE's precomputation (`BTSlotsEncoding`) on every engine.
   - CPU: runs the variant the setup selects (ModRaise-first by default, StC-first for `true`).
   - haze: dispatches on `btSlotsEncoding` to its StC-first port (`bootstrapStCFirst`) or to
@@ -752,11 +752,16 @@ bootstrap dispatch during the combination sweep. The dispatch has since moved fr
   - CUDA: `EvalBootstrapToLevel` throws for a slots-encoding setup, but the plain
     `EvalBootstrap` path does not look at `BTSlotsEncoding` and runs the device ModRaise-first
     `FIDESlib::CKKS::Bootstrap` (FIDESlib has no StC-first pipeline) against StC-first
-    precomputations. Not re-measured since the dispatch moved into the engines.
+    precomputations. Run that way, the ciphertext dropped two levels, decrypted to noise and the
+    process later aborted with an illegal memory access.
 
-The remaining item is an O3-class semantic gap (api contract, not bit-compat): on CUDA, either
-throw for a slots-encoding setup in `EvalBootstrap` as `EvalBootstrapToLevel` already does, or
-fall back to the CPU engine. Until then it fails silently rather than loudly.
+  Fix (#95): `CudaEngine::requireClassicBootstrapOrder` throws `OpenFHEException` for a
+  slots-encoding setup in `EvalBootstrap` and `EvalBootstrapInPlace`, one and two iterations
+  alike, before touching the ciphertext. CUDA still has no StC-first pipeline; a caller who needs
+  it uses the CPU or haze engine. Test: `CKKSBootstrapSlotsEncodingTest.CudaRefusesSlotsEncodingBootstrap`
+  (`test/ApiTests.cpp`) checks all four calls throw and the ciphertext is left untouched.
+
+The `numIterations = 2` coverage gap above is the only open item.
 
 ### O12. Degree-2 Rescale on device backends inherits the O3 divergence
 The api's degree-2 `Rescale` runs unconditionally on device backends (CUDA, haze); OpenFHE's
@@ -887,7 +892,7 @@ O6e. Remaining: **O6c** — the SPARSE_ENCAPSULATED
 implementations are structurally different designs (dual-context GPU vs in-context stock) and
 the GPU output is value-wrong at the test configuration; fix deferred, plan documented (see
 O6c) — and **O6e** — FIXEDAUTO add/sub operand adjustment (fix direction documented). Then
-close out the smaller semantic gaps (O3–O5, O11) and the api type-erasure decision (O7).
+close out the smaller semantic gaps (O3–O5) and the api type-erasure decision (O7).
 
 ## Validation methodology (reusable)
 
