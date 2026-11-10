@@ -657,11 +657,15 @@ install(
 
 # A redistributable package resolves libhaze from inside itself ($ORIGIN), so the
 # build-host haze paths must not be written into the shipped config at all -- they
-# would be dead absolute strings naming this machine.
+# would be dead absolute strings naming this machine. Its OpenMP is private (linked
+# PRIVATE, no public header includes <omp.h>), so a consumer needs none of the OpenMP
+# flags either; on macOS they name this machine's Homebrew libomp.
 if (FIDESLIB_BUILD_SHARED)
     set(_FIDESLIB_CFG_HAZE_LIB "")
     set(_FIDESLIB_CFG_HAZE_DIR "")
+    set(_FIDESLIB_CFG_CXX_FLAGS "")
 else ()
+    set(_FIDESLIB_CFG_CXX_FLAGS "${FIX_OMP_FLAGS}")
     # _HAZE_SO/_HAZE_DIR (set above), not the raw FIDESLIB_HAZE_LIB/DIR cache
     # variables: the raw variables are empty in the default vendored-submodule case
     # (no override given), which left a static build with the default vendored haze
