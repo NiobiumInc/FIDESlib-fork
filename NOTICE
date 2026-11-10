@@ -2,9 +2,9 @@ THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 ============================================================
 
 Project: FIDESlib-fork
-Generated: 2026-11-01
+Generated: 2026-11-10
 Tool: SCANOSS (snippet detection with License dataset)
-Components: 78
+Components: 77
 
 This file lists all third-party software components detected
 in this repository, along with their licenses and copyright
@@ -25,7 +25,7 @@ These require manual review to determine licensing terms.
 
 LICENSE SUMMARY
 
-  Apache-2.0: 17 component(s)
+  Apache-2.0: 16 component(s)
   Apache-2.0 WITH LLVM-exception: 2 component(s)
   Apache-2.0 WITH LLVM-exception AND NCSA: 1 component(s)
   Apache-2.0 WITH LLVM-exception AND NCSA AND NCSA OR MIT AND NCSA AND MIT: 1 component(s)
@@ -561,7 +561,6 @@ COMPONENT ATTRIBUTIONS
     Copyright 2012-2016 Free Software Foundation Inc
     Copyright 2014 gperftools Contributors
     Copyright 2026 gperftools Contributors
-    Copyright (c) 2000; Google Inc.
     Copyright (c) 2003; Google Inc.
     Copyright (c) 2004; Google Inc.
     Copyright (c) 2006; Google Inc.
@@ -920,15 +919,6 @@ COMPONENT ATTRIBUTIONS
   Version: 0.1.0a14.post0
   Source: https://pypi.org/project/nurikit
   PURL: pkg:pypi/nurikit
-  Copyright:
-    Copyright 2017 Google Inc
-    Copyright 2007; Google Inc.
-  License: Apache-2.0
-
-  nurikit
-  Version: v0.1.0a14.post0
-  Source: https://github.com/seoklab/nurikit
-  PURL: pkg:github/seoklab/nurikit
   Copyright:
     Copyright 2017 Google Inc
     Copyright 2007; Google Inc.
