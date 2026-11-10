@@ -1,5 +1,6 @@
-// Redistributable-package smoke test: encrypt two numbers, add them under
-// encryption, decrypt, and check the result.
+// Redistributable-package smoke test: check that an exception thrown inside libfideslib
+// reaches the consumer, then encrypt two numbers, add them under encryption, decrypt, and
+// check the result.
 //
 // This exists to prove the shipped tarball is self-contained. packaging/test-package.sh
 // builds it with plain -I/-L/-l flags against the installed package -- no cmake, no
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -36,6 +38,18 @@ bool wantsLargeRing() {
 
 int main() {
 	using namespace fideslib;
+
+	// An exception thrown inside libfideslib has to reach this catch. When the consumer and
+	// libfideslib run on two different C++ runtimes, it terminates the process instead, which
+	// nothing else here would show. GenCryptoContext throws before any other work when
+	// SetReducedNoise was not called.
+	try {
+		CCParams<CryptoContextCKKSRNS> unset;
+		GenCryptoContext(unset);
+		std::cerr << "FAIL: GenCryptoContext accepted parameters without SetReducedNoise" << std::endl;
+		return 1;
+	} catch (const std::runtime_error&) {
+	}
 
 	CCParams<CryptoContextCKKSRNS> parameters;
 	parameters.SetMultiplicativeDepth(1);

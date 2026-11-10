@@ -194,6 +194,13 @@ builds the bundled smoke example against it with nothing but a compiler (plain
 `-I`/`-L`/`-l` flags, no cmake), and runs each backend. CI runs this exact script, so a
 local pass and a CI pass mean the same thing.
 
+The smoke example first makes libfideslib throw (`GenCryptoContext` without
+`SetReducedNoise`) and catches the exception itself. That only works when the consumer and
+libfideslib share one C++ runtime; with two, the process terminates
+(`libc++abi: terminating due to uncaught exception`). On macOS the script also lists every
+library each run loads, and fails if anything comes from outside the OS and the package, or if
+more than one libc++ loads.
+
 ```sh
 # What a GitHub runner does: CPU and the in-process haze simulator.
 packaging/test-package.sh packaging/dist/fideslib-linux-x86-64-<version>.tar.gz
