@@ -25,7 +25,9 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "TestRegistration.hpp" // FIDES_TEST_IF, FIDES_TEST_F_IF, OnlyIf
@@ -1921,6 +1923,113 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityBootstrapShapeTest,
 	BootstrapShape{ "SparseEncapsulated_FIXEDAUTO", FIXEDAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 },
 	BootstrapShape{ "SparseEncapsulated_FLEXIBLEAUTO", FLEXIBLEAUTO, SPARSE_ENCAPSULATED, { 3, 3 }, 8, 0 })),
   BootstrapShapeName);
+
+// ---- Iterated bootstrap (numIterations = 2, Meta-BTS) ----
+// OpenFHE's two-iteration bootstrap (ckksrns-fhe.cpp EvalBootstrap, numIterations == 2) refreshes the
+// input, scales the result up by 2^precision, subtracts the scaled input to isolate the bootstrap
+// error, refreshes that error and subtracts it. The device engines compose the same algorithm (see
+// BITCOMPAT.md O11). Before that, a device backend ran one refresh for numIterations = 2 and every
+// value check still passed within a single bootstrap's error, so this test also requires the result
+// to be much closer to the plaintext than a single refresh gets.
+//
+// Parameters follow OpenFHE's iterative-ckks-bootstrapping example: N = 4096, 8 slots, FIXEDAUTO,
+// 59-bit scaling and 60-bit first modulus. `precision` is measured as the example does, from single
+// host bootstraps of the same input, less the example's 5-bit buffer.
+class ApiParityIteratedBootstrapTest : public ::testing::Test {
+  protected:
+	static constexpr uint32_t kDepth	   = 25;
+	static constexpr uint32_t kRingDim	   = 1u << 12;
+	static constexpr uint32_t kSlots	   = 8;
+	static constexpr uint32_t kIterations  = 2;
+	static constexpr uint32_t kBudget	   = 3;
+	// The bits OpenFHE's example subtracts from the measured precision before passing it on.
+	static constexpr uint32_t kPrecisionBuffer = 5;
+	// How much closer to the plaintext two iterations must land than the best single refresh. Two
+	// iterations gain about `precision` bits; 2^4 leaves a wide margin and still rejects one refresh.
+	static constexpr double kRequiredGain = 16.0;
+
+	CryptoContext<DCRTPoly> cc;
+	KeyPair<DCRTPoly> keys;
+	const std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+
+	void SetUp() override {
+		CCParams<CryptoContextCKKSRNS> params;
+		params.SetSecretKeyDist(UNIFORM_TERNARY);
+		params.SetScalingTechnique(FIXEDAUTO);
+		params.SetMultiplicativeDepth(kDepth);
+		params.SetScalingModSize(59);
+		params.SetFirstModSize(60);
+		params.SetBatchSize(kSlots);
+		params.SetSecurityLevel(HEStd_NotSet);
+		params.SetRingDim(kRingDim);
+		ConfigureTestEngine(params);
+		cc = GenCryptoContext(params);
+		cc->Enable(PKE);
+		cc->Enable(KEYSWITCH);
+		cc->Enable(LEVELEDSHE);
+		cc->Enable(ADVANCEDSHE);
+		cc->Enable(FHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+		cc->EvalBootstrapSetup({ kBudget, kBudget }, { 0, 0 }, kSlots, 0);
+		cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
+		cc->LoadContext(keys.publicKey);
+	}
+
+	// Bits of precision as OpenFHE's example measures them: -log2 of the mean absolute error.
+	double PrecisionBits(const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& ct) {
+		auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(keys.secretKey->pimpl);
+		lbcrypto::Plaintext pt;
+		LbCc(cc)->Decrypt(skImpl, ct, &pt);
+		pt->SetLength(x.size());
+		const auto v = pt->GetRealPackedValue();
+		double sum	 = 0;
+		for (size_t i = 0; i < x.size(); ++i)
+			sum += std::abs(v[i] - x[i]);
+		return -std::log2(sum / x.size());
+	}
+};
+
+FIDES_TEST_F_IF(OnDevice(), ApiParityIteratedBootstrapTest, EvalBootstrapTwoIterations) {
+	// Deplete to the deepest level the host bootstrap accepts, so that every refresh does real work.
+	auto pt	  = cc->MakeCKKSPackedPlaintext(x, 1, kDepth - (kBudget + 2), nullptr, kSlots);
+	auto ct	  = cc->Encrypt(pt, keys.publicKey);
+	auto lbCt = LbCt(ct)->Clone();
+
+	// Single refreshes on the host: the precision to pass on, and the error two iterations must beat.
+	double bitsOnceWorst = std::numeric_limits<double>::infinity();
+	double errOnceBest	 = std::numeric_limits<double>::infinity();
+	for (size_t i = 0; i < kHostBootstrapRuns; ++i) {
+		auto once	  = LbCc(cc)->EvalBootstrap(lbCt->Clone());
+		bitsOnceWorst = std::min(bitsOnceWorst, PrecisionBits(once));
+		errOnceBest	  = std::min(errOnceBest, MaxErrorFromPlaintext(cc, keys.secretKey, once, x));
+	}
+	ASSERT_GT(std::floor(bitsOnceWorst), kPrecisionBuffer) << "a single refresh is too imprecise to iterate";
+	const uint32_t precision = static_cast<uint32_t>(std::floor(bitsOnceWorst)) - kPrecisionBuffer;
+
+	std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> hostRuns;
+	for (size_t i = 0; i < kHostBootstrapRuns; ++i)
+		hostRuns.push_back(LbCc(cc)->EvalBootstrap(lbCt->Clone(), kIterations, precision));
+
+	auto inPlace = ct->Clone();
+	const size_t levelBefore = ct->GetLevel();
+	auto refreshed			 = cc->EvalBootstrap(ct, kIterations, precision);
+	cc->EvalBootstrapInPlace(inPlace, kIterations, precision);
+
+	const std::pair<const char*, Ciphertext<DCRTPoly>*> results[] = { { "EvalBootstrap", &refreshed }, { "EvalBootstrapInPlace", &inPlace } };
+	for (const auto& [call, result] : results) {
+		SCOPED_TRACE(call);
+		// Two iterations that gained no levels return the input, and every check below would be vacuous.
+		ASSERT_LT((*result)->GetLevel(), levelBefore) << "the bootstrap gained no levels, so this test exercised nothing";
+		auto host = HostCt(cc, *result);
+		ASSERT_EQ(host->GetLevel(), hostRuns.front()->GetLevel()) << "the refresh lands on another level than OpenFHE's";
+		const std::string label = std::string("IteratedBootstrap ") + call + " precision " + std::to_string(precision);
+		ExpectDeviceBootstrapAsAccurateAsHost(label.c_str(), cc, keys.secretKey, host, hostRuns, x);
+		const double err = MaxErrorFromPlaintext(cc, keys.secretKey, host, x);
+		EXPECT_LE(err * kRequiredGain, errOnceBest) << "two iterations landed no closer to the plaintext than one refresh: error " << err
+													<< ", best single host refresh " << errOnceBest;
+	}
+}
 
 // ---- Monomial multiply ----
 
