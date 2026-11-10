@@ -34,12 +34,18 @@ stdenv.mkDerivation {
 
   src = fetchurl src;
 
-  nativeBuildInputs = lib.optionals stdenv.isLinux [ autoPatchelfHook ];
+  nativeBuildInputs = lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
   # Supplies libstdc++.so.6 / libgcc_s.so.1 for the rewrite. The library links the
   # C++ runtime dynamically on purpose: its public API exposes std::vector and
   # lbcrypto:: types, so a private static libstdc++ would put two C++ runtimes on
   # either side of the ABI boundary.
-  buildInputs = [ stdenv.cc.cc.lib ];
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ stdenv.cc.cc.lib ];
+
+  # The libraries ship as the release built and tested them; the only edit is
+  # autoPatchelfHook's on Linux. On darwin nothing needs rewriting: nix links its own
+  # programs against the system libc++ (its libcxx is an SDK stub naming
+  # /usr/lib/libc++.1.dylib), which is the one the libraries use.
+  dontStrip = true;
 
   installPhase = ''
     runHook preInstall
