@@ -16,6 +16,7 @@
   stdenv,
   fetchurl,
   autoPatchelfHook,
+  writeText,
 }:
 
 let
@@ -45,6 +46,12 @@ stdenv.mkDerivation {
     mkdir -p $out
     cp -r . $out/
     runHook postInstall
+  '';
+
+  # Every shell that lists this package (mkShell, nix develop) gets FIDESLIB, the
+  # package root, which plain -I/-L/-l builds use as their prefix.
+  setupHook = writeText "fideslib-bin-setup-hook" ''
+    export FIDESLIB=@out@
   '';
 
   meta = {
