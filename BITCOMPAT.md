@@ -379,7 +379,7 @@ FIXEDAUTO arithmetic all came back bit-exact with no changes; FIXEDAUTO bootstra
 Known remaining coverage gaps: dense×LT{1,1} needs ≈2·slots raised-level LT plaintexts resident
 (several GB at N=4096 fully packed) and could not run on a 4 GB GPU. **Stale as of
 2026-08-26:** it is testable on a GPU with 32 GB. Iterated bootstrap (`numIterations = 2`) is implemented on every
-backend but has no test yet; CUDA now refuses StC-first setups in `EvalBootstrap` (see O11).
+backend and tested against OpenFHE (`ApiParityIteratedBootstrapTest`, see O11); CUDA now refuses StC-first setups in `EvalBootstrap` (see O11).
 
 **Bit-compatible with no changes needed (green):**
 - Bootstrap level budget {1,1} → `isLT`/`EvalLinearTransform` branch (`EvalBootstrapLT`) —
@@ -740,10 +740,13 @@ bootstrap dispatch during the combination sweep. The dispatch has since moved fr
   - haze (`HazeEngine::evalBootstrap`, #85): every step recorded on the device operands,
     nothing read back. Before #85 haze still ran a single refresh.
 
-  Three or more iterations throw on both device engines. **Coverage gap:** no test in `test/`
-  calls a bootstrap with `numIterations = 2`; the haze composition was checked only by decrypting
-  an application circuit against its plaintext reference (#85), not limb-exact against the CPU
-  engine.
+  Three or more iterations throw on both device engines. Test:
+  `ApiParityIteratedBootstrapTest.EvalBootstrapTwoIterations` (`test/ApiParityTest.cpp`) runs
+  `EvalBootstrap` and `EvalBootstrapInPlace` with two iterations on the device engine and checks
+  that each lands on OpenFHE's level, within the error of repeated OpenFHE two-iteration bootstraps,
+  and at least 16 times closer to the plaintext than the best single OpenFHE refresh (so a backend
+  that runs one refresh fails). The comparison is by decrypted values, not limb-exact: a bootstrap is
+  not deterministic.
 - **`btsfirstboot` (StC-first) misroutes on CUDA — resolved (CUDA throws).** api `EvalBootstrapSetup` forwards
   `btsfirstboot` to OpenFHE's precomputation (`BTSlotsEncoding`) on every engine.
   - CPU: runs the variant the setup selects (ModRaise-first by default, StC-first for `true`).
@@ -761,7 +764,6 @@ bootstrap dispatch during the combination sweep. The dispatch has since moved fr
   it uses the CPU or haze engine. Test: `CKKSBootstrapSlotsEncodingTest.CudaRefusesSlotsEncodingBootstrap`
   (`test/ApiTests.cpp`) checks all four calls throw and the ciphertext is left untouched.
 
-The `numIterations = 2` coverage gap above is the only open item.
 
 ### O12. Degree-2 Rescale on device backends inherits the O3 divergence
 The api's degree-2 `Rescale` runs unconditionally on device backends (CUDA, haze); OpenFHE's
