@@ -19,13 +19,10 @@ TAG=${2:?missing tag}
 REPO=${3:?missing repo url}
 TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fideslib-bin.nix"
 
-# nix wants SRI hashes; sha256sum gives hex.
+# nix wants SRI hashes: the base64 of the raw digest. openssl computes it the same way on
+# Linux and macOS, so a local emit takes the release job's path.
 sri() {
-    if command -v nix-hash >/dev/null 2>&1; then
-        echo "sha256-$(nix-hash --type sha256 --flat --base64 "$1")"
-    else
-        echo "sha256-$(sha256sum "$1" | cut -d' ' -f1 | xxd -r -p | base64)"
-    fi
+    echo "sha256-$(openssl dgst -sha256 -binary "$1" | base64)"
 }
 
 # Exactly one tarball per system. The release job runs only when every build leg
