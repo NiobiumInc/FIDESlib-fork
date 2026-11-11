@@ -308,6 +308,10 @@ jobs:
   # Run packaging/test-package.sh against them on a GPU host.
   consume:
     needs: [build, version]
+    # Runs whenever every build leg succeeded. Without the explicit condition GitHub's
+    # default success() also requires build's own skipped needs (cpu-tests, gpu-tests run
+    # only for a release), which skipped this job on every push and pull request.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     name: consume ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     # A leg takes under ten minutes even on a slow package mirror. Without a limit a
