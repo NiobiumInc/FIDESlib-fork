@@ -16,6 +16,7 @@ fideslib-<platform>-<arch>-<version>/
   include/openfhe/      core, pke, binfhe, cereal
   include/haze/         haze C ABI + replay bridge
   lib/                  libfideslib.so.1.0, libhaze.so, libgomp.so.1
+                        (macOS: libfideslib.1.0.dylib, libhaze.dylib, libomp.dylib)
   lib/cmake/fideslib/   the CMake package
   share/fideslib/examples/smoke/
   VERSION  LICENSE.txt  README.md
@@ -73,13 +74,23 @@ the two would put two builds of OpenFHE 1.5.1 in one namespace.
 without GCC installed has no libgomp. It is a leaf C library, so a second copy in the
 process is harmless.
 
+On macOS the same rule holds: `libfideslib` and `libhaze` link the system `libc++`, and
+the package bundles no C++ runtime, so a consumer needs no Homebrew, only the Xcode
+Command Line Tools. The libraries are compiled with Homebrew LLVM 19, whose libc++
+headers may call any LLVM 19 libc++ feature, and macOS ships all of those from 15.4 on,
+so 15.4 is the floor. `libomp.dylib` is bundled for the same reason as `libgomp`, with
+one difference: LLVM's OpenMP runtime aborts when a second copy initializes in the same
+process (`OMP: Error #15`), so a consumer that uses OpenMP itself must link the bundled
+`libomp.dylib`.
+
 ### ABI contract
 
 | Property | Value |
 |---|---|
-| C++ standard library | libstdc++, `_GLIBCXX_USE_CXX11_ABI=1` |
+| C++ standard library | libstdc++, `_GLIBCXX_USE_CXX11_ABI=1`; on macOS, the system libc++ |
 | glibc floor | 2.28 (release builds) / the build host's, for local builds |
 | libstdc++ floor | `GLIBCXX_3.4.29` |
+| macOS floor | 15.4 (`minos` of every library, release builds) |
 | CPU baseline | generic; `-march=native` is explicitly disabled |
 | OpenFHE | patched `fideslib-ref-v1.5.1.6`, `WITH_REDUCED_NOISE=ON` |
 

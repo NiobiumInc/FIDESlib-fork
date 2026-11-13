@@ -4,12 +4,17 @@
 #
 # Checks, in order of how badly each one bites:
 #   1. no build-host absolute paths anywhere in the payload
-#   2. glibc / libstdc++ symbol-version floor within the declared limits
-#   3. DT_NEEDED limited to the platform runtime plus bundled siblings
+#   2. glibc / libstdc++ symbol-version floor (ELF), or the macOS floor (Mach-O),
+#      within the declared limits
+#   3. dependencies limited to the platform runtime plus bundled siblings and resolved
+#      inside the package; no bundled C++ runtime
 #   4. libhaze still exports only its C ABI (OpenFHE stays absorbed and hidden)
 #   5. no CPU instructions above the baseline (i.e. -march=native really was off)
 #
 # Usage: verify-artifact.sh <staged-dir-or-tarball> [max_glibc] [max_glibcxx]
+#
+# Environment:
+#   MAX_MACOS   the newest minos any library may declare; required on macOS
 
 set -euo pipefail
 
@@ -41,6 +46,9 @@ vle() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
 
 is_macho=0
 [ "$(uname -s)" = "Darwin" ] && is_macho=1
+if [ "$is_macho" -eq 1 ]; then
+    : "${MAX_MACOS:?required on macOS: the newest minos any library may declare}"
+fi
 
 libs=$(find "$ROOT" \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -type f)
 [ -n "$libs" ] || { echo "verify: no shared libraries found under $ROOT" >&2; exit 2; }
@@ -63,8 +71,8 @@ if [ -n "$leaks" ]; then
 fi
 check "$([ -z "$leaks" ] && echo 0 || echo 1)" "no build-host absolute paths in payload"
 
-echo "== 2. symbol-version floor (glibc <= $MAX_GLIBC, libstdc++ <= $MAX_GLIBCXX) =="
 if [ "$is_macho" -eq 0 ]; then
+    echo "== 2. symbol-version floor (glibc <= $MAX_GLIBC, libstdc++ <= $MAX_GLIBCXX) =="
     for l in $libs; do
         n=$(basename "$l")
         # objdump/nm failing to read the binary at all must abort the script, not
@@ -82,8 +90,15 @@ if [ "$is_macho" -eq 0 ]; then
         check "$([ "$c" -eq 0 ] && echo 0 || echo 1)" "$n: no __isoc23_* references ($c)"
     done
 else
+    echo "== 2. macOS floor (minos <= $MAX_MACOS) and system dylibs =="
     for l in $libs; do
         n=$(basename "$l")
+        # The counterpart of the glibc floor: a library built for a newer macOS (a
+        # Homebrew bottle for the build machine's release, say) does not load below it,
+        # whatever deployment target the rest of the package was built for.
+        lcs=$(otool -l "$l") || { echo "otool failed to read $n" >&2; exit 1; }
+        minos=$(printf '%s\n' "$lcs" | awk '/cmd LC_BUILD_VERSION/ { b = 1 } b && $1 == "minos" { print $2; exit }')
+        check "$([ -n "$minos" ] && vle "$minos" "$MAX_MACOS" && echo 0 || echo 1)" "$n: minos ${minos:-none}"
         deps=$(otool -L "$l") || { echo "otool failed to read $n" >&2; exit 1; }
         bad=$(printf '%s\n' "$deps" | tail -n +2 | { grep -vE '/usr/lib/(libSystem\.B|libc\+\+\.1|libc\+\+abi)\.dylib|@loader_path|@rpath' || true; })
         [ -z "$bad" ] || echo "$bad" | sed 's/^/    /'
@@ -126,7 +141,36 @@ if [ "$is_macho" -eq 0 ]; then
               "$n: exports no cudart symbols ($leaked_cuda)"
     done
     check 0 "DT_NEEDED limited to platform runtime + bundled siblings"
+else
+    for l in $libs; do
+        n=$(basename "$l")
+        dir=$(dirname "$l")
+        ids=$(otool -D "$l") || { echo "otool failed to read $n" >&2; exit 1; }
+        lcs=$(otool -l "$l") || { echo "otool failed to read $n" >&2; exit 1; }
+        deps=$(otool -L "$l") || { echo "otool failed to read $n" >&2; exit 1; }
+        # The install name is what a consumer records and dyld looks up: the Mach-O
+        # SONAME. It must be @rpath-relative and name a file this package ships, and a
+        # versioned library (libfoo.1.0.dylib) must use its compatibility name
+        # (libfoo.1.dylib), not the unversioned development symlink.
+        id=$(printf '%s\n' "$ids" | sed -n 2p)
+        want=$(printf '%s\n' "$n" | sed -E 's/\.([0-9]+)\.[0-9]+\.dylib$/.\1.dylib/')
+        check "$([ "$id" = "@rpath/$want" ] && [ -e "$dir/$want" ] && echo 0 || echo 1)" \
+              "$n: install name is @rpath/$want (${id:-none})"
+        # The counterpart of the ELF $ORIGIN check: one rpath, the library's own
+        # directory. Any other entry names a directory on the build machine.
+        rp=$(printf '%s\n' "$lcs" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }' | paste -sd ' ' -)
+        check "$([ "$rp" = "@loader_path" ] && echo 0 || echo 1)" "$n: rpath is @loader_path (${rp:-none})"
+        # The counterpart of the DT_NEEDED check: every @rpath dependency is a
+        # library this package ships.
+        missing=$(printf '%s\n' "$deps" | tail -n +2 | awk '{ print $1 }' | sed -n 's|^@rpath/||p' |
+            while read -r d; do [ -e "$dir/$d" ] || echo "$d"; done | paste -sd ' ' -)
+        check "$([ -z "$missing" ] && echo 0 || echo 1)" "$n: every @rpath dependency is bundled (${missing:-none missing})"
+    done
 fi
+# libfideslib's API passes std:: types, so the package must share the consumer's C++
+# runtime, the platform's own. A bundled copy would put a second one in the process.
+cxx=$(for l in $libs; do basename "$l"; done | { grep -E '^lib(stdc\+\+|c\+\+|c\+\+abi|unwind)\.' || true; } | paste -sd ' ' -)
+check "$([ -z "$cxx" ] && echo 0 || echo 1)" "no bundled C++ runtime (${cxx:-none})"
 
 echo "== 4. haze symbol isolation =="
 hz=$(echo "$libs" | { grep -E 'libhaze\.(so|dylib)' || true; })
