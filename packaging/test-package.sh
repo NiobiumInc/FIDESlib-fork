@@ -113,8 +113,10 @@ fi
 # spellings of each directory count.
 audit_images() {
     local name=$1 images img foreign="" cxx=0 cxx_seen=""
-    # Each line is "dyld[<pid>]: <uuid> <path>"; older dyld omits the uuid.
-    images=$(sed -nE 's/^dyld\[[0-9]+\]: (<[^>]+> )?//p' "$WORK/$name.log")
+    # An image is a line "dyld[<pid>]: <uuid> <absolute path>"; older dyld omits the uuid.
+    # Newer dyld also prints other messages under that prefix ("move loaded to delayed:
+    # Foundation" on macOS 15), which are not images, so only absolute paths count.
+    images=$(sed -nE 's|^dyld\[[0-9]+\]: (<[^>]+> )?(/.*)$|\2|p' "$WORK/$name.log")
     case "$images" in
         */libfideslib.*) ;;
         *) printf '  %-10s FAIL  dyld reported no libfideslib load (see %s)\n' "$name" "$WORK/$name.log"
