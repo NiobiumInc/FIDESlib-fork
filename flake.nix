@@ -87,6 +87,19 @@
         }
       );
 
+      # The prebuilt release package, on each system the pinned release has a tarball
+      # for. Empty when packaging/fideslib-bin.nix carries no pin, as on nb_main.
+      packages = forEachSystem (
+        system:
+        let
+          pkgs = pkgsFor system;
+          fideslib-bin = pkgs.callPackage ./packaging/fideslib-bin.nix { };
+        in
+        pkgs.lib.optionalAttrs (pkgs.lib.meta.availableOn pkgs.stdenv.hostPlatform fideslib-bin) {
+          inherit fideslib-bin;
+        }
+      );
+
       formatter = forEachSystem (system: (pkgsFor system).nixfmt);
     };
 }

@@ -13,6 +13,9 @@
 namespace fideslib {
 
 CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params) {
+	// packaging/smoke/src/smoke.cpp relies on this throw happening here, inside libfideslib,
+	// before any other work: catching it is how the smoke test shows that the consumer and the
+	// library share one C++ runtime.
 	if (!params.reducedNoise.has_value()) {
 		throw std::runtime_error("reducedNoise is unset: call CCParams::SetReducedNoise before GenCryptoContext");
 	}
