@@ -345,7 +345,8 @@ void HazeEngine::teardown() {
 	// gtest runs one context per test, so keeping them would fill /tmp across a suite run.
 	// A caller-supplied program key means the directory is meant to outlive this process:
 	// deleting it would destroy the lowered artifacts it exists to preserve.
-	const bool keepRuns = std::getenv("FIDESLIB_HAZE_KEEP_RUNS") != nullptr ||
+	// A trace-only recording's program directory is all it produces: never deleted.
+	const bool keepRuns = traceOnly_ || std::getenv("FIDESLIB_HAZE_KEEP_RUNS") != nullptr ||
 						  std::getenv("FIDESLIB_HAZE_PROGRAM_KEY") != nullptr;
 	if (!programDir_.empty() && !keepRuns) {
 		std::error_code ec;
@@ -548,10 +549,11 @@ void HazeEngine::materialize() {
 		// The name each component goes by in the outputs index, read before the finalize
 		// consumes the pending outputs.
 		for (size_t c = 0; c < payload->components.size(); ++c) {
-			char name[256];
-			if (payload->towers == 0 || hazeOutputGroupName(payload->components[c][0], name, sizeof name) != HAZE_SUCCESS) {
+			if (payload->towers == 0) {
 				continue;
 			}
+			char name[256];
+			hazeCheck(hazeOutputGroupName(payload->components[c][0], name, sizeof name), "hazeOutputGroupName");
 			outputRoles_.push_back(OutputRole{ name, o < outputTags_.size() ? outputTags_[o] : std::string(), c, payload->towers });
 		}
 	}
@@ -613,6 +615,13 @@ void HazeEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextI
 	ct.EnsureLazyHostCopy();
 	auto& host = hostCt(ct);
 
+	// Trace-only: an input's words were declared, never uploaded, so the device has none; the
+	// caller's host value still holds them and is the value. Reading it back must leave it as is.
+	if (traceOnly_ && payload->state == Residency::Uploaded && host->GetElements().size() == payload->components.size() &&
+		!host->GetElements().empty() && host->GetElements()[0].GetNumOfElements() == payload->towers) {
+		return;
+	}
+
 	// Make the host shell carry exactly payload->components.size() elements of payload->towers
 	// limbs each. The element count follows the degree (EvalMultNoRelin grows the shell 2 -> 3, an
 	// in-place Relinearize shrinks it back), so a mismatch is reshaped here; the limb count follows
@@ -643,8 +652,8 @@ void HazeEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextI
 	}
 
 	// Pure shadow D2H per limb (Uploaded: the upload bytes; Flushed: the program's result).
-	// Trace-only: no program ran and no input has words, so every value reads back as zeros
-	// with the recorded metadata.
+	// Trace-only: no program ran, so a result reads back as zeros with the recorded metadata
+	// (an input whose host value is intact returned above).
 	std::vector<uint64_t> buf(ringDim_);
 	for (size_t e = 0; e < comps; ++e) {
 		const LimbChain& chain = payload->components[e];
@@ -1660,9 +1669,11 @@ void HazeEngine::noteInput(const LimbChain& chain, InputRole role) {
 		return;
 	}
 	char name[256];
-	if (hazeInputGroupName(chain[0], name, sizeof name) != HAZE_SUCCESS) {
+	const hazeError_t err = hazeInputGroupName(chain[0], name, sizeof name);
+	if (err == HAZE_ERROR_SOURCE_UNAVAILABLE) {
 		return; // not a named input (nothing was uploaded)
 	}
+	hazeCheck(err, "hazeInputGroupName");
 	role.name = name;
 	inputRoles_.push_back(std::move(role));
 }
@@ -1702,7 +1713,10 @@ void HazeEngine::writeInputRoles() {
 	for (size_t i = 0; i < inputRoles_.size(); ++i) {
 		const InputRole& r = inputRoles_[i];
 		bool omitted	   = r.declared;
-		if (std::find(omit.begin(), omit.end(), r.role) != omit.end()) {
+		// An untagged plaintext is a constant of the program (a mask, a refresh table): no
+		// runtime can supply its words, so it is never omitted.
+		const bool constant = r.role == "plaintext" && r.tag.empty();
+		if (!constant && std::find(omit.begin(), omit.end(), r.role) != omit.end()) {
 			const auto bin = dir / ("fideslib.input_" + r.name + ".bin");
 			std::error_code ec;
 			if (std::filesystem::exists(bin, ec)) {
@@ -2258,8 +2272,14 @@ const LimbChain& HazeEngine::monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uin
 		tower[r % n] = r < n ? lbcrypto::NativeInteger(1) : params->GetParams()[t]->GetModulus() - lbcrypto::NativeInteger(1);
 		monomial.SetElementAtIndex(t, std::move(tower));
 	}
-	auto rows = extractRows(monomial, ringDim_);
-	return monomials_.emplace(r, LimbChain(rows, qPrefix(rows.size()))).first->second;
+	auto rows				  = extractRows(monomial, ringDim_);
+	const LimbChain& uploaded = monomials_.emplace(r, LimbChain(rows, qPrefix(rows.size()))).first->second;
+	// An input of the program like any other: an untagged constant in the roles file.
+	InputRole role;
+	role.role	= "plaintext";
+	role.towers = rows.size();
+	noteInput(uploaded, role);
+	return uploaded;
 }
 
 HazeEngine::Operand HazeEngine::multByMonomialCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t power) {
