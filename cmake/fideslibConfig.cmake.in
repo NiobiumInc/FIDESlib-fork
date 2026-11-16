@@ -33,7 +33,8 @@ set(FIDESLIB_WITH_HAZE "@FIDESLIB_ENABLE_HAZE@")
 # (e.g. /usr/lib64/ccache/g++) will not exist on the machine that unpacks this.
 set(FIDESLIB_CXX_COMPILER_ID      "@CMAKE_CXX_COMPILER_ID@")
 set(FIDESLIB_CXX_COMPILER_VERSION "@CMAKE_CXX_COMPILER_VERSION@")
-set(FIDESLIB_CXX_FLAGS "@FIX_OMP_FLAGS@")
+# The OpenMP flags a consumer of a static install needs; empty for the shared library.
+set(FIDESLIB_CXX_FLAGS "@_FIDESLIB_CFG_CXX_FLAGS@")
 # Retained for source compatibility with the existing examples, which do
 # set(CMAKE_CXX_COMPILER ${FIDESLIB_CXX_COMPILER}). Empty in a relocatable package.
 set(FIDESLIB_CXX_COMPILER "")

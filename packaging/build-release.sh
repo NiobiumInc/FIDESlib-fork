@@ -24,6 +24,9 @@
 #                 release floor; override for a local build on a newer host that isn't
 #                 meant to match the release floor)
 #   MAX_GLIBCXX   verify-artifact.sh's libstdc++ floor (default 3.4.29)
+#   MAX_MACOS     the macOS floor: MACOSX_DEPLOYMENT_TARGET, and the newest minos
+#                 verify-artifact.sh allows (default 15.4; a local build bundles the
+#                 host's Homebrew libomp, whose minos is the host's macOS release)
 #   TEST_BUILD=1  build fideslib-cpu-test (CPU and haze backends, static) against the same
 #                 three dependency builds and stop: no package. The haze CI job uses it,
 #                 so the tests run on what the release ships.
@@ -39,6 +42,7 @@ BUILD_ROOT=${BUILD_ROOT:-/opt/${USER}/fideslib-release/build}
 OUT_DIR=${OUT_DIR:-$REPO/packaging/dist}
 MAX_GLIBC=${MAX_GLIBC:-2.28}
 MAX_GLIBCXX=${MAX_GLIBCXX:-3.4.29}
+MAX_MACOS=${MAX_MACOS:-15.4}
 
 # ---- platform / arch, spelled as the published artifacts name them ---------------
 case "$(uname -s)" in
@@ -74,6 +78,13 @@ if [ "$PLATFORM" = linux ]; then
     [ -x "$GT_ROOT/usr/bin/g++" ] || { echo "no gcc-toolset at $GT_ROOT" >&2; exit 1; }
     export CC="$GT_ROOT/usr/bin/gcc" CXX="$GT_ROOT/usr/bin/g++"
     export PATH="$GT_ROOT/usr/bin:$PATH"
+else
+    # Every library links the system libc++, the one a consumer uses, and none is
+    # bundled. $CXX is Homebrew LLVM 19, whose libc++ headers carry no Apple
+    # availability markup, so they may call any LLVM 19 libc++ feature; macOS ships all
+    # of those from 15.4 on (the SDK's __configuration/availability.h), which makes 15.4
+    # the floor. A newer LLVM needs a newer floor.
+    export MACOSX_DEPLOYMENT_TARGET="$MAX_MACOS"
 fi
 
 STAGE="$BUILD_ROOT/stage"
@@ -106,13 +117,7 @@ if [ "$PLATFORM" = linux ]; then
     HAZE_LINKER_FLAGS="-ldl"
 else
     HAZE_FLAGS="$PREFIX_MAP"
-    # haze's std::println needs libc++'s <print> support, which only Homebrew llvm@19's
-    # own libc++.dylib implements (__is_posix_terminal); the system libc++ the linker
-    # finds by default does not, and CMake links libhaze.dylib against that one unless
-    # told otherwise. Point it at the same libc++ that $CXX (llvm@19 clang++) compiled
-    # against instead.
-    LLVM_ROOT=$(cd "$(dirname "$CXX")/.." && pwd)
-    HAZE_LINKER_FLAGS="-L$LLVM_ROOT/lib/c++ -Wl,-rpath,$LLVM_ROOT/lib/c++"
+    HAZE_LINKER_FLAGS=""
 fi
 
 # -DWITH_NATIVEOPT=OFF is mandatory: OpenFHE defaults it ON, which bakes -march=native
@@ -224,15 +229,11 @@ if [ "$PLATFORM" = linux ]; then
     GOMP=$("${CXX}" -print-file-name=libgomp.so.1)
     if [ -f "$GOMP" ]; then cp -L "$GOMP" "$LIBDIR/"; else echo "warn: libgomp.so.1 not found" >&2; fi
 else
+    # Homebrew's libomp travels the same way. Unlike libgomp it does not tolerate a
+    # second copy: LLVM's OpenMP runtime aborts when another one initializes in the same
+    # process, so a consumer that uses OpenMP has to use this one.
     OMP="$(brew --prefix libomp 2>/dev/null)/lib/libomp.dylib"
     if [ -f "$OMP" ]; then cp -L "$OMP" "$LIBDIR/"; else echo "warn: libomp.dylib not found" >&2; fi
-    # haze's std::println needs Homebrew llvm@19's own libc++ (see step 3), which in
-    # turn needs libc++abi and libunwind (checked via otool -L against a local
-    # install); none of the three are on a machine without this exact keg.
-    for f in c++/libc++.1.dylib c++/libc++abi.1.dylib unwind/libunwind.1.dylib; do
-        src="$LLVM_ROOT/lib/$f"
-        if [ -f "$src" ]; then cp -L "$src" "$LIBDIR/"; else echo "warn: $f not found" >&2; fi
-    done
 fi
 
 # Resolve siblings relative to the library itself, never by absolute path. $STAGE was
@@ -248,42 +249,36 @@ if [ "$PLATFORM" = linux ]; then
     done
 else
     for dy in "$LIBDIR"/*.dylib; do
-        [ -f "$dy" ] || continue
-        install_name_tool -id "@rpath/$(basename "$dy")" "$dy" \
+        [ -f "$dy" ] && [ ! -L "$dy" ] || continue
+        # Keep the name the library declares, and only move it under @rpath: CMake gives
+        # libfideslib its compatibility name, libfideslib.1.dylib, which is what a
+        # consumer records, not the unversioned development symlink.
+        id=$(otool -D "$dy" | sed -n 2p) || { echo "otool -D failed on $dy" >&2; exit 1; }
+        [ -n "$id" ] || { echo "no install name in $dy" >&2; exit 1; }
+        install_name_tool -id "@rpath/${id##*/}" "$dy" \
             || { echo "install_name_tool -id failed on $dy" >&2; exit 1; }
-        # The bundled libc++*/libunwind already carry @loader_path from their own
-        # Homebrew build (checked with otool -l), so -add_rpath on those specific
-        # files fails with "already exists" every time -- a real, expected outcome,
-        # not a hedge to swallow. Check first instead of blindly retrying or ignoring
-        # the result either way.
-        existing_rpaths=$(otool -l "$dy" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
-        if ! printf '%s\n' "$existing_rpaths" | grep -qx '@loader_path'; then
-            install_name_tool -add_rpath "@loader_path" "$dy" \
-                || { echo "install_name_tool -add_rpath failed on $dy" >&2; exit 1; }
-        fi
-        # Mach-O load commands are resolved at link time, unlike ELF's soname+rpath
-        # indirection, so linking against Homebrew's libomp/libc++/libc++abi/libunwind
-        # bakes their absolute Cellar/opt paths into libfideslib/libhaze -- paths that
-        # only exist on this build host. Repoint any dependency this package already
-        # bundles (as a sibling *.dylib in the same dir) at that sibling instead. The
-        # bundled libc++*/libunwind already reference each other via @rpath (checked
-        # locally with otool -l: they carry an @loader_path LC_RPATH of their own), so
-        # this only ever rewrites something for libfideslib/libhaze themselves.
-        for sib in "$LIBDIR"/*.dylib; do
-            [ -f "$sib" ] || continue
-            sib_name=$(basename "$sib")
-            [ "$sib_name" = "$(basename "$dy")" ] && continue
-            # A literal suffix match, not a regex match: library names like
-            # libc++.1.dylib contain '+' and '.', which are regex metacharacters with
-            # no literal fallback for '+' -- an ERE match on the unescaped name silently
-            # never matches, which is exactly how this missed libhaze's libc++ dep.
-            old=$(otool -L "$dy" | awk -v suf="/$sib_name" '
-                { path = $1 } { n = length(path); s = length(suf) }
-                n >= s && substr(path, n - s + 1) == suf { print path; exit }')
-            if [ -n "$old" ] && [ "$old" != "@rpath/$sib_name" ]; then
-                install_name_tool -change "$old" "@rpath/$sib_name" "$dy" \
-                    || { echo "install_name_tool -change failed on $dy" >&2; exit 1; }
-            fi
+        # Exactly one rpath, the library's own directory, as the Linux leg sets exactly
+        # $ORIGIN. Anything a build added (a Homebrew keg, a build tree) goes.
+        rpaths=$(otool -l "$dy" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }') \
+            || { echo "otool -l failed on $dy" >&2; exit 1; }
+        for rp in $rpaths; do
+            install_name_tool -delete_rpath "$rp" "$dy" \
+                || { echo "install_name_tool -delete_rpath $rp failed on $dy" >&2; exit 1; }
+        done
+        install_name_tool -add_rpath "@loader_path" "$dy" \
+            || { echo "install_name_tool -add_rpath failed on $dy" >&2; exit 1; }
+        # Mach-O records each dependency by the path it was linked against, so a
+        # Homebrew library (libomp) is named by its absolute keg path, which only exists
+        # on this machine. Every dependency outside the OS must therefore be bundled, and
+        # is pointed at the bundled copy. The OS ones (libc++, libSystem) stay as they are.
+        deps=$(otool -L "$dy" | tail -n +2 | awk '{ print $1 }') \
+            || { echo "otool -L failed on $dy" >&2; exit 1; }
+        for dep in $deps; do
+            case "$dep" in /usr/lib/*|/System/*|@rpath/*) continue ;; esac
+            [ -f "$LIBDIR/${dep##*/}" ] \
+                || { echo "$(basename "$dy") depends on $dep, which the package does not bundle" >&2; exit 1; }
+            install_name_tool -change "$dep" "@rpath/${dep##*/}" "$dy" \
+                || { echo "install_name_tool -change failed on $dy" >&2; exit 1; }
         done
         # install_name_tool invalidates the signature, and arm64 refuses to load an
         # unsigned Mach-O. Re-sign ad hoc; there is no benign reason for this to fail.
@@ -306,5 +301,8 @@ tar -czf "$OUT_DIR/$PKGNAME.tar.gz" -C "$WORK" "$PKGNAME"
 
 echo "==> wrote $OUT_DIR/$PKGNAME.tar.gz"
 echo "==> verifying"
-BUILD_HOST_PATHS="$REPO $BUILD_ROOT" \
+# Homebrew is on the build machine only, so nothing in the package may name it.
+HOST_PATHS="$REPO $BUILD_ROOT"
+if [ "$PLATFORM" = macos ]; then HOST_PATHS="$HOST_PATHS $(brew --prefix)"; fi
+BUILD_HOST_PATHS="$HOST_PATHS" MAX_MACOS="$MAX_MACOS" \
     "$REPO/packaging/verify-artifact.sh" "$OUT_DIR/$PKGNAME.tar.gz" "$MAX_GLIBC" "$MAX_GLIBCXX"
