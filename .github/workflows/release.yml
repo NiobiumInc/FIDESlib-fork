@@ -454,10 +454,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      # emit-nix-expr.sh lives in the repo, so this job needs the source too.
+      # emit-nix-expr.sh and the expression it fills in live in the repo, so this job needs
+      # the source too.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: packaging/emit-nix-expr.sh
+          sparse-checkout: |
+            packaging/emit-nix-expr.sh
+            packaging/fideslib-bin.nix
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -466,9 +469,6 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Checksums
-        run: cd dist && sha256sum ./*.tar.gz | tee SHA256SUMS
-
       - name: Emit the nix consumer expression
         run: |
           # nix consumes the published tarball rather than producing it: nixpkgs pins
@@ -476,6 +476,11 @@ jobs:
           # See packaging/README.md. Same split sunscreen-llvm uses.
           bash packaging/emit-nix-expr.sh dist "${{ needs.version.outputs.tag }}" \
             "${{ github.server_url }}/${{ github.repository }}" > dist/fideslib-bin.nix
+
+      # After the expression, so that a consumer downloading fideslib-bin.nix can check it
+      # too, not only the tarballs it names.
+      - name: Checksums
+        run: cd dist && sha256sum ./*.tar.gz ./fideslib-bin.nix | tee SHA256SUMS
 
       # gh is preinstalled on the runner, so no third-party action is needed. --target
       # puts the tag on the commit that was built rather than the default branch's tip. The
@@ -491,11 +496,112 @@ jobs:
             --title "FIDESlib $VERSION" --notes "" \
             dist/*.tar.gz dist/SHA256SUMS dist/fideslib-bin.nix
 
+  # packaging/pin-nix-release.sh rewrites public refs, and the nix-release job runs it only
+  # after a real publish, so every run of this workflow first exercises it against a
+  # throwaway remote. It needs git and nothing else.
+  pin-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            packaging/pin-nix-release.sh
+            packaging/test-pin-nix-release.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Test the nix-release pin
+        run: bash packaging/test-pin-nix-release.sh "$RUNNER_TEMP/pin-test"
+
+  # Builds the release's pinned nix package before nix-release points anyone at it, and
+  # runs the smoke consumer against it with nix's own compiler, so a pin that fails to
+  # fetch, evaluate or link never reaches the branch. A job of its own with read-only
+  # permissions, so the nix installer never sees a token that can write the repository.
+  nix-check:
+    needs: [version, release]
+    if: github.ref == 'refs/heads/nb_main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # The org allows only actions owned by the enterprise, created by GitHub, or from a
+      # verified Marketplace creator, pinned by full commit SHA; Determinate Systems is one.
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Build the pinned package and consume it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # The file the release published, in place of the unpinned template. path:
+          # rather than the git checkout, so nix evaluates the edited, uncommitted file.
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p fideslib-bin.nix -D "$RUNNER_TEMP/release"
+          cp "$RUNNER_TEMP/release/fideslib-bin.nix" packaging/fideslib-bin.nix
+          pkg=$(nix build --no-link --print-out-paths "path:.#packages.x86_64-linux.fideslib-bin")
+          # The flake's own nixpkgs supplies the compiler, as it does the libstdc++ the
+          # package is patched against. SCRUB=0 keeps that compiler on PATH.
+          nix shell --inputs-from path:. nixpkgs#gcc -c \
+            env SCRUB=0 CXX=g++ bash packaging/test-package.sh "$pkg" "$RUNNER_TEMP/nix-consume"
+
+  # The flake's fideslib-bin can only be pinned once its release is published: a commit
+  # cannot carry the hashes of the release built from it. This job pins each nb_main
+  # release on the nix-release branch and the <release tag>-nix tag, moving the branch only
+  # forward (packaging/pin-nix-release.sh). nb_main itself is never written: it requires a
+  # reviewed pull request, and its template carries no pin.
+  nix-release:
+    needs: [version, release, pin-test, nix-check]
+    if: github.ref == 'refs/heads/nb_main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # Full history, so the script can check that this release descends from the one
+      # nix-release already pins.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            packaging/fideslib-bin.nix
+            packaging/pin-nix-release.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Pin the release on nix-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # The file the release published, not one emitted again here.
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p fideslib-bin.nix -D "$RUNNER_TEMP/release"
+          out=$(bash packaging/pin-nix-release.sh "$TAG" "$RUNNER_TEMP/release/fideslib-bin.nix" origin)
+          echo "$out"
+          {
+            echo "### nix-release"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`$(sed -n 's/^tag=//p' <<< "$out")\` |"
+            echo "| Commit | \`$(sed -n 's/^commit=//p' <<< "$out")\` |"
+            echo "| nix-release moved | $(sed -n 's/^moved=//p' <<< "$out") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # One table for the whole run: every job with its result, duration and link, whether
   # the CUDA packages were built, whether the run published, and the packages it built.
   # It runs even when a build or a consumer failed, which is when it matters most.
   report:
-    needs: [version, cpu-tests, gpu-tests, build, consume, release]
+    needs: [version, cpu-tests, gpu-tests, build, consume, release, pin-test, nix-check, nix-release]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
