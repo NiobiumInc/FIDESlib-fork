@@ -21,8 +21,21 @@
 
 let
   # begin pinned release
-  version = "unpinned";
-  sources = { };
+  version = "2026.11.17-34ccc62";
+  sources = {
+    "x86_64-linux" = {
+      url = "https://github.com/NiobiumInc/FIDESlib-fork/releases/download/v2026.11.17-34ccc62/fideslib-linux-x86-64-2026-11-17.tar.gz";
+      hash = "sha256-L8uW0roDXuh6iCVSNA0stHwNwOSA3zrQaRGLyW8pKXg=";
+    };
+    "aarch64-linux" = {
+      url = "https://github.com/NiobiumInc/FIDESlib-fork/releases/download/v2026.11.17-34ccc62/fideslib-linux-aarch64-2026-11-17.tar.gz";
+      hash = "sha256-zQKUvQXO1SmPUvDSHOsrCuwrvNI2WqjpdCOoOZr/iAk=";
+    };
+    "aarch64-darwin" = {
+      url = "https://github.com/NiobiumInc/FIDESlib-fork/releases/download/v2026.11.17-34ccc62/fideslib-macos-aarch64-2026-11-17.tar.gz";
+      hash = "sha256-YnKf+rcx4HchRGxt6JefhQQQyfhxn5n87lrak14YnpI=";
+    };
+  };
   # end pinned release
   src =
     sources.${stdenv.hostPlatform.system}
