@@ -292,13 +292,9 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 		// Pure-C bridge: haze rebuilds a matching CryptoContext from (ring_dim, first Q prime).
 		// Must be re-called after every hazeDeviceReset (replay_bridge.h contract), i.e. on every
-		// loadContext. `picked` is now advisory only — the authoritative primes are the ones
-		// passed above via fhe.moduli — but a zero return still signals a failed bring-up.
-		uint64_t picked = 0;
-		hazeCheck(hazeReplayBridgeInitCryptoContext(ringDim_, qBase_.front(), &picked), "hazeReplayBridgeInitCryptoContext");
-		if (picked == 0) {
-			throw std::runtime_error("haze backend: replay bridge returned a zero modulus");
-		}
+		// loadContext. The authoritative primes are the ones passed above via fhe.moduli; the
+		// bridge reports no scaffold modulus back, only its status.
+		hazeCheck(hazeReplayBridgeInitCryptoContext(ringDim_, qBase_.front()), "hazeReplayBridgeInitCryptoContext");
 	} catch (...) {
 		hazeReplayBridgeReset();
 		(void)hazeDeviceReset();
