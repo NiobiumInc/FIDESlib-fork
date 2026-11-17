@@ -76,16 +76,16 @@ class RunsDir {
 		return root_;
 	}
 
-	// The one program directory the engine made: <root>/<key>/ctx<N>.
+	// The program directory the program was written to: the ctx<N> directory holding
+	// fideslib.fhetch (a context can load more than once, and a kept directory stays behind).
 	fs::path programDir() const {
 		std::vector<fs::path> dirs;
-		// Only the ctx<N> directories: the engine keeps other entries beside them.
 		for (const auto& key : fs::directory_iterator(root_))
 			if (key.is_directory())
 				for (const auto& ctx : fs::directory_iterator(key.path()))
-					if (ctx.is_directory() && ctx.path().filename().string().rfind("ctx", 0) == 0)
+					if (ctx.is_directory() && fs::exists(ctx.path() / "fideslib.fhetch"))
 						dirs.push_back(ctx.path());
-		EXPECT_EQ(dirs.size(), 1u) << "program directories under " << root_;
+		EXPECT_EQ(dirs.size(), 1u) << "directories holding a written program under " << root_;
 		return dirs.empty() ? fs::path() : dirs.front();
 	}
 
