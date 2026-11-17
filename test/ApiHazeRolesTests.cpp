@@ -79,9 +79,12 @@ class RunsDir {
 	// The one program directory the engine made: <root>/<key>/ctx<N>.
 	fs::path programDir() const {
 		std::vector<fs::path> dirs;
+		// Only the ctx<N> directories: the engine keeps other entries beside them.
 		for (const auto& key : fs::directory_iterator(root_))
-			for (const auto& ctx : fs::directory_iterator(key.path()))
-				dirs.push_back(ctx.path());
+			if (key.is_directory())
+				for (const auto& ctx : fs::directory_iterator(key.path()))
+					if (ctx.is_directory() && ctx.path().filename().string().rfind("ctx", 0) == 0)
+						dirs.push_back(ctx.path());
 		EXPECT_EQ(dirs.size(), 1u) << "program directories under " << root_;
 		return dirs.empty() ? fs::path() : dirs.front();
 	}
