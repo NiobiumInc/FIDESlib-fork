@@ -203,7 +203,8 @@ static void ExpectDeviceBootstrapAsAccurateAsHost(const char* label,
   const PrivateKey<DCRTPoly>& sk,
   const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& device,
   const std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>& hostRuns,
-  const std::vector<double>& expected) {
+  const std::vector<double>& expected,
+  double factor = kDeviceErrorFactor) {
 	const double errDevice = MaxErrorFromPlaintext(cc, sk, device, expected);
 	double errHostWorst	   = 0;
 	for (const auto& h : hostRuns)
@@ -211,8 +212,8 @@ static void ExpectDeviceBootstrapAsAccurateAsHost(const char* label,
 	char line[256];
 	std::snprintf(line, sizeof line, "[parity] %s: device error from the plaintext %.3e, worst of %zu host bootstraps %.3e\n", label, errDevice, hostRuns.size(), errHostWorst);
 	std::cout << line;
-	EXPECT_LE(errDevice, kDeviceErrorFactor * errHostWorst + 1e-12)
-	  << "the device bootstrap is further from the plaintext than " << kDeviceErrorFactor << " times the worst of " << hostRuns.size() << " OpenFHE bootstraps";
+	EXPECT_LE(errDevice, factor * errHostWorst + 1e-12)
+	  << "the device bootstrap is further from the plaintext than " << factor << " times the worst of " << hostRuns.size() << " OpenFHE bootstraps";
 }
 
 // Same parameters as the api correctness fixture (ApiTests.cpp): depth 5, ringDim 65536, 8 slots,
@@ -1951,6 +1952,13 @@ class ApiParityIteratedBootstrapTest : public ::testing::Test {
 	// How much closer to the plaintext two iterations must land than the best single refresh. Two
 	// iterations gain about `precision` bits; 2^4 leaves a wide margin and still rejects one refresh.
 	static constexpr double kRequiredGain = 16.0;
+	// The device's bound against the worst of the host's iterated bootstraps. An iterated result's
+	// error is set by the noise of each refresh scaled through the correction step, and it spreads
+	// far wider than a single refresh's: over 18 haze CI runs the device's error was a median 0.5
+	// times the worst of 5 host runs but reached 5.9 times, and the worst of 5 host runs alone ranged
+	// from 4.7e-8 to 2.6e-7. 3 (the single-refresh factor) failed about one run in five. 16 is still
+	// far below what a broken correction costs (about 2^precision, which kRequiredGain also checks).
+	static constexpr double kIteratedDeviceErrorFactor = 16.0;
 
 	CryptoContext<DCRTPoly> cc;
 	KeyPair<DCRTPoly> keys;
@@ -2032,7 +2040,7 @@ FIDES_TEST_F_IF(OnDevice(), ApiParityIteratedBootstrapTest, EvalBootstrapTwoIter
 		auto host = HostCt(cc, *result);
 		ASSERT_EQ(host->GetLevel(), hostRuns.front()->GetLevel()) << "the refresh lands on another level than OpenFHE's";
 		const std::string label = std::string("IteratedBootstrap ") + call + " precision " + std::to_string(precision);
-		ExpectDeviceBootstrapAsAccurateAsHost(label.c_str(), cc, keys.secretKey, host, hostRuns, x);
+		ExpectDeviceBootstrapAsAccurateAsHost(label.c_str(), cc, keys.secretKey, host, hostRuns, x, kIteratedDeviceErrorFactor);
 		const double err = MaxErrorFromPlaintext(cc, keys.secretKey, host, x);
 		EXPECT_LE(err * kRequiredGain, errOnceBest) << "two iterations landed no closer to the plaintext than one refresh: error " << err
 													<< ", best single host refresh " << errOnceBest;
