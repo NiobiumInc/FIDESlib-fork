@@ -21,6 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <cstdio>
+#include <algorithm>
+#include <fstream>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -179,6 +182,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 	const auto& keyMap = context->GetAllEvalMultKeys();
 	if (keyMap.find(keyTag_) != keyMap.end()) {
 		relinKey_	   = KsKey{};
+		relinKey_.id   = "relin";
 		relinKey_.host = hazebk::extractEvalMultKeyLimbs(context, keyTag_);
 		haveRelinKey_  = true;
 	}
@@ -192,6 +196,7 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		}
 		RotKey rk;
 		rk.autoIndex = context->FindAutomorphismIndex(step);
+		rk.key.id	 = "auto:" + std::to_string(rk.autoIndex);
 		rk.key.host	 = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, rk.autoIndex);
 		rotKeys_.emplace(step, std::move(rk));
 	}
@@ -287,13 +292,9 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 
 		// Pure-C bridge: haze rebuilds a matching CryptoContext from (ring_dim, first Q prime).
 		// Must be re-called after every hazeDeviceReset (replay_bridge.h contract), i.e. on every
-		// loadContext. `picked` is now advisory only — the authoritative primes are the ones
-		// passed above via fhe.moduli — but a zero return still signals a failed bring-up.
-		uint64_t picked = 0;
-		hazeCheck(hazeReplayBridgeInitCryptoContext(ringDim_, qBase_.front(), &picked), "hazeReplayBridgeInitCryptoContext");
-		if (picked == 0) {
-			throw std::runtime_error("haze backend: replay bridge returned a zero modulus");
-		}
+		// loadContext. The authoritative primes are the ones passed above via fhe.moduli; the
+		// bridge reports no scaffold modulus back, only its status.
+		hazeCheck(hazeReplayBridgeInitCryptoContext(ringDim_, qBase_.front()), "hazeReplayBridgeInitCryptoContext");
 	} catch (...) {
 		hazeReplayBridgeReset();
 		(void)hazeDeviceReset();
@@ -301,6 +302,14 @@ void HazeEngine::loadContext(CryptoContextImpl<DCRTPoly>& ctx, const PublicKey<D
 		throw;
 	}
 
+	{
+		const char* e  = std::getenv("FIDESLIB_HAZE_SCALAR_INPUTS");
+		scalarInputs_ = e != nullptr && (std::string(e) == "1" || std::string(e) == "patch");
+		scalarPatch_  = e != nullptr && std::string(e) == "patch";
+		scalarCount_  = 0;
+		const char* t = std::getenv("FIDESLIB_HAZE_TRACE_ONLY");
+		traceOnly_	  = t != nullptr && std::string(t) == "1";
+	}
 	liveEngines_.fetch_add(1);
 	loaded_	  = true;
 	executed_ = false;
@@ -311,6 +320,7 @@ void HazeEngine::teardown() {
 		return;
 	}
 	outputs_.clear();
+	inputRoles_.clear();
 	// Drop uploaded key chains before the device reset frees their meaning; the host limbs
 	// are re-extracted by the next loadContext.
 	relinKey_	  = KsKey{};
@@ -335,7 +345,8 @@ void HazeEngine::teardown() {
 	// gtest runs one context per test, so keeping them would fill /tmp across a suite run.
 	// A caller-supplied program key means the directory is meant to outlive this process:
 	// deleting it would destroy the lowered artifacts it exists to preserve.
-	const bool keepRuns = std::getenv("FIDESLIB_HAZE_KEEP_RUNS") != nullptr ||
+	// A trace-only recording's program directory is all it produces: never deleted.
+	const bool keepRuns = traceOnly_ || std::getenv("FIDESLIB_HAZE_KEEP_RUNS") != nullptr ||
 						  std::getenv("FIDESLIB_HAZE_PROGRAM_KEY") != nullptr;
 	if (!programDir_.empty() && !keepRuns) {
 		std::error_code ec;
@@ -391,11 +402,23 @@ void HazeEngine::loadCiphertext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext
 		} else if (rows.size() != payload->towers) {
 			throw std::runtime_error("haze backend: ciphertext components disagree on tower count");
 		}
-		payload->components.push_back(LimbChain(rows, qPrefix(rows.size())));
+		payload->components.push_back(inputChain(rows, qPrefix(rows.size()), traceOnly_));
 	}
 	payload->noiseScaleDeg = host->GetNoiseScaleDeg();
 	payload->scalingFactor = host->GetScalingFactor();
 	payload->slots		   = host->GetSlots();
+	for (size_t c = 0; c < payload->components.size(); ++c) {
+		InputRole r;
+		r.declared		= traceOnly_;
+		r.role			= "ciphertext";
+		r.tag			= ct->tag;
+		r.component		= c;
+		r.towers		= payload->towers;
+		r.noiseScaleDeg = payload->noiseScaleDeg;
+		r.scalingFactor = payload->scalingFactor;
+		r.slots			= payload->slots;
+		noteInput(payload->components[c], r);
+	}
 	payload->state		   = Residency::Uploaded;
 
 	ct->device = std::make_any<std::shared_ptr<HazePayload>>(std::move(payload));
@@ -460,10 +483,23 @@ void HazeEngine::loadPlaintext(CryptoContextImpl<DCRTPoly>& /*ctx*/, Plaintext& 
 
 	auto payload			  = std::make_shared<HazePtPayload>();
 	payload->towers			  = rows.size();
-	payload->chain			  = LimbChain(rows, base);
+	const bool declare		  = traceOnly_ && !pt->tag.empty(); // a constant keeps its words
+	payload->chain			  = inputChain(rows, base, declare);
 	payload->noiseScaleDeg = ptImpl->GetNoiseScaleDeg();
 	payload->scalingFactor = ptImpl->GetScalingFactor();
 	payload->slots		   = ptImpl->GetSlots();
+	{
+		InputRole r;
+		r.declared		= declare;
+		r.role			= "plaintext";
+		r.tag			= pt->tag;
+		r.towers		= payload->towers;
+		r.noiseScaleDeg = payload->noiseScaleDeg;
+		r.scalingFactor = payload->scalingFactor;
+		r.slots			= payload->slots;
+		r.extended		= extended;
+		noteInput(payload->chain, r);
+	}
 
 	pt->device = std::make_any<std::shared_ptr<HazePtPayload>>(std::move(payload));
 }
@@ -492,6 +528,7 @@ void HazeEngine::markOutput(CryptoContextImpl<DCRTPoly>& /*ctx*/, Ciphertext<DCR
 		}
 	}
 	outputs_.emplace_back(payload);
+	outputTags_.push_back(ct->tag);
 }
 
 void HazeEngine::materialize() {
@@ -499,8 +536,8 @@ void HazeEngine::materialize() {
 	// tags the group, but tag each chain to be explicit — ops.cpp tag_ct), then run the
 	// program's single flush. A tag is readback DMA on real hardware: only declared outputs,
 	// never intermediates.
-	for (const auto& weak : outputs_) {
-		auto payload = weak.lock();
+	for (size_t o = 0; o < outputs_.size(); ++o) {
+		auto payload = outputs_[o].lock();
 		if (!payload || payload->state != Residency::Recorded) {
 			continue;
 		}
@@ -509,14 +546,30 @@ void HazeEngine::materialize() {
 				hazeCheck(hazeTagOutput(comp[t]), "hazeTagOutput");
 			}
 		}
+		// The name each component goes by in the outputs index, read before the finalize
+		// consumes the pending outputs.
+		for (size_t c = 0; c < payload->components.size(); ++c) {
+			if (payload->towers == 0) {
+				continue;
+			}
+			char name[256];
+			hazeCheck(hazeOutputGroupName(payload->components[c][0], name, sizeof name), "hazeOutputGroupName");
+			outputRoles_.push_back(OutputRole{ name, o < outputTags_.size() ? outputTags_[o] : std::string(), c, payload->towers });
+		}
 	}
-	hazeCheck(hazeFlush(), "hazeFlush");
+	if (traceOnly_) {
+		hazeCheck(hazeWriteProgram(), "hazeWriteProgram"); // the program, no replay
+	} else {
+		hazeCheck(hazeFlush(), "hazeFlush");
+	}
+	writeInputRoles();
 	for (const auto& weak : outputs_) {
 		if (auto payload = weak.lock(); payload && payload->state == Residency::Recorded) {
 			payload->state = Residency::Flushed;
 		}
 	}
 	outputs_.clear();
+	outputTags_.clear();
 	executed_ = true;
 }
 
@@ -562,6 +615,13 @@ void HazeEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextI
 	ct.EnsureLazyHostCopy();
 	auto& host = hostCt(ct);
 
+	// Trace-only: an input's words were declared, never uploaded, so the device has none; the
+	// caller's host value still holds them and is the value. Reading it back must leave it as is.
+	if (traceOnly_ && payload->state == Residency::Uploaded && host->GetElements().size() == payload->components.size() &&
+		!host->GetElements().empty() && host->GetElements()[0].GetNumOfElements() == payload->towers) {
+		return;
+	}
+
 	// Make the host shell carry exactly payload->components.size() elements of payload->towers
 	// limbs each. The element count follows the degree (EvalMultNoRelin grows the shell 2 -> 3, an
 	// in-place Relinearize shrinks it back), so a mismatch is reshaped here; the limb count follows
@@ -592,12 +652,18 @@ void HazeEngine::refreshHostShadow(CryptoContextImpl<DCRTPoly>& ctx, CiphertextI
 	}
 
 	// Pure shadow D2H per limb (Uploaded: the upload bytes; Flushed: the program's result).
+	// Trace-only: no program ran, so a result reads back as zeros with the recorded metadata
+	// (an input whose host value is intact returned above).
 	std::vector<uint64_t> buf(ringDim_);
 	for (size_t e = 0; e < comps; ++e) {
 		const LimbChain& chain = payload->components[e];
 		auto& towersVec		   = host->GetElements()[e].GetAllElements();
 		for (std::size_t t = 0; t < payload->towers; ++t) {
-			hazeCheck(hazeMemcpy(buf.data(), chain[t], polyBytes_, HAZE_MEMCPY_DEVICE_TO_HOST), "hazeMemcpy(D2H)");
+			if (traceOnly_) {
+				std::fill(buf.begin(), buf.end(), 0);
+			} else {
+				hazeCheck(hazeMemcpy(buf.data(), chain[t], polyBytes_, HAZE_MEMCPY_DEVICE_TO_HOST), "hazeMemcpy(D2H)");
+			}
 			auto& np = towersVec[t];
 			lbcrypto::NativeVector nv(static_cast<uint32_t>(ringDim_), np.GetModulus());
 			for (std::size_t i = 0; i < ringDim_; ++i) {
@@ -648,7 +714,18 @@ std::any HazeEngine::cloneCiphertextBackend(CryptoContextImpl<DCRTPoly>& /*ctx*/
 			return rows;
 		};
 		for (const auto& srcComp : srcPayload->components) {
-			clone->components.push_back(LimbChain(pull(srcComp), qPrefix(srcPayload->towers)));
+			clone->components.push_back(traceOnly_ ? LimbChain::declared(polyBytes_, qPrefix(srcPayload->towers))
+												   : LimbChain(pull(srcComp), qPrefix(srcPayload->towers)));
+			InputRole r;
+			r.declared		= traceOnly_;
+			r.role			= "ciphertext";
+			r.tag			= src.tag;
+			r.component		= clone->components.size() - 1;
+			r.towers		= clone->towers;
+			r.noiseScaleDeg = clone->noiseScaleDeg;
+			r.scalingFactor = clone->scalingFactor;
+			r.slots			= clone->slots;
+			noteInput(clone->components.back(), r);
 		}
 		clone->state = Residency::Uploaded;
 	}
@@ -1057,13 +1134,104 @@ void HazeEngine::adjustPtToward(Operand& ptOp, const Operand& ct) {
 	throw std::runtime_error("haze backend: adjustPtToward is meaningful only for the AUTO scaling modes");
 }
 
-HazeEngine::Operand HazeEngine::multScalarWithPrecheck(const Operand& x, double scalar) {
+HazeEngine::Operand HazeEngine::scalarPatchCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value) {
+	// The operand as immediates (one word per tower), always recorded; under trace-only each
+	// word is a sentinel the runtime replaces: a splitmix64 of (operand number, tower), in
+	// [2, q_i - 1), so that no sentinel is 0 or 1.
+	ScalarRole r;
+	const size_t n = scalarCount_++;
+	r.tag			= "scalar:" + std::to_string(n);
+	r.kind			= add ? "add" : "mul";
+	r.value			= value;
+	r.towers		= x.towers;
+	r.noiseScaleDeg = x.noiseScaleDeg;
+	r.factors		= factors;
+	r.sentinels.resize(x.towers);
+	for (size_t i = 0; i < x.towers; ++i) {
+		uint64_t z = (static_cast<uint64_t>(n) << 8 | i) + 0x9E3779B97F4A7C15ULL;
+		z		   = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z		   = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		z ^= z >> 31;
+		r.sentinels[i] = 2 + z % (qBase_[i] - 3);
+	}
+	scalarRoles_.push_back(std::move(r));
+	const std::vector<uint64_t>& words = traceOnly_ ? scalarRoles_.back().sentinels : factors;
+	const auto base = qPrefix(x.towers);
+	Operand res		= x;
+	if (add) {
+		LimbChain out0(x.towers, polyBytes_);
+		hazeCheck(hazeAddScalarMrp(out0.data(), x.p->c0().asConst().data(), words.data(), base.data(), base.size(), nullptr), "hazeAddScalarMrp(scalar)");
+		res.p = finishPayload(passThroughTail(std::move(out0), x), res);
+		return res;
+	}
+	std::vector<LimbChain> outs;
+	outs.reserve(x.p->components.size());
+	for (const auto& comp : x.p->components) {
+		LimbChain out(x.towers, polyBytes_);
+		hazeCheck(hazeMulScalarMrp(out.data(), comp.asConst().data(), words.data(), base.data(), base.size(), nullptr), "hazeMulScalarMrp(scalar)");
+		outs.push_back(std::move(out));
+	}
+	res.noiseScaleDeg = x.noiseScaleDeg + 1;
+	res.scalingFactor = x.scalingFactor * sfReal_[levelOf(x)];
+	res.p			  = finishPayload(std::move(outs), res);
+	return res;
+}
+
+HazeEngine::Operand HazeEngine::scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value) {
+	if (scalarPatch_) {
+		return scalarPatchCore(x, factors, add, value);
+	}
+	// The operand as an input: one constant polynomial per limb, the per-limb encoding in every word.
+	std::vector<std::vector<uint64_t>> rows(x.towers);
+	for (size_t i = 0; i < x.towers; ++i) {
+		rows[i].assign(ringDim_, factors[i]);
+	}
+	const auto base = qPrefix(x.towers);
+	LimbChain in = inputChain(rows, base, traceOnly_);
+	{
+		InputRole r;
+		r.declared		= traceOnly_;
+		r.role			= "scalar";
+		r.tag			= "scalar:" + std::to_string(scalarCount_++);
+		r.kind			= add ? "add" : "mul";
+		r.value			= value;
+		r.factors		= factors;
+		r.towers		= x.towers;
+		r.noiseScaleDeg = x.noiseScaleDeg;
+		noteInput(in, r);
+	}
+	std::vector<LimbChain> outs;
+	if (add) {
+		LimbChain out0(x.towers, polyBytes_);
+		hazeCheck(hazeAddMrp(out0.data(), x.p->c0().asConst().data(), in.asConst().data(), base.data(), base.size(), nullptr), "hazeAddMrp(scalar input)");
+		outs = passThroughTail(std::move(out0), x);
+	} else {
+		outs.reserve(x.p->components.size());
+		for (const auto& comp : x.p->components) {
+			LimbChain out(x.towers, polyBytes_);
+			hazeCheck(hazeMulMrp(out.data(), comp.asConst().data(), in.asConst().data(), base.data(), base.size(), nullptr), "hazeMulMrp(scalar input)");
+			outs.push_back(std::move(out));
+		}
+	}
+	Operand res = x;
+	if (!add) {
+		res.noiseScaleDeg = x.noiseScaleDeg + 1;
+		res.scalingFactor = x.scalingFactor * sfReal_[levelOf(x)];
+	}
+	res.p = finishPayload(std::move(outs), res);
+	return res;
+}
+
+HazeEngine::Operand HazeEngine::multScalarWithPrecheck(const Operand& x, double scalar, bool asInput) {
 	// FIXEDAUTO multScalar precheck (FIDESlib Ciphertext.cpp:761-775): rescale a depth-2
 	// operand before the scalar multiply so the result re-enters depth 2 cleanly.
 	Operand cur	  = x;
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	if (st != lbcrypto::FIXEDMANUAL && cur.noiseScaleDeg == 2) {
 		cur = rescaleCore(cur);
+	}
+	if (asInput) {
+		return scalarInputCore(cur, hazebk::elemForEvalMult(scalarParams(), cur.towers, scalar), false, scalar);
 	}
 	return multScalarCore(cur, scalar);
 }
@@ -1075,6 +1243,20 @@ LimbChain HazeEngine::passThroughChain(const LimbChain& src, size_t towers) {
 	LimbChain out(towers, polyBytes_);
 	hazeCheck(hazeMemcpyMrp(out.data(), src.asConst().data(), polyBytes_, HAZE_MEMCPY_DEVICE_TO_DEVICE, base.data(), base.size()), "hazeMemcpyMrp(D2D)");
 	return out;
+}
+
+HazeEngine::Operand HazeEngine::addScalarPublic(const Operand& x, double scalar) {
+	if (!scalarInputs_) {
+		return addScalarCore(x, scalar);
+	}
+	// as addScalarCore, every operand (zero included) an input: the program does not depend on it
+	auto factors = hazebk::elemForEvalAddOrSub(scalarParams(), x.towers, std::fabs(scalar), x.noiseScaleDeg);
+	if (scalar < 0.0) {
+		for (size_t i = 0; i < factors.size(); ++i) {
+			factors[i] = qBase_[i] - factors[i];
+		}
+	}
+	return scalarInputCore(x, factors, true, scalar);
 }
 
 HazeEngine::Operand HazeEngine::addScalarCore(const Operand& x, double scalar) {
@@ -1309,28 +1491,28 @@ void HazeEngine::evalNegateInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<
 Ciphertext<DCRTPoly> HazeEngine::evalAdd(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalAdd(scalar)");
-	Operand res = addScalarCore(asOperand(p), scalar);
+	Operand res = addScalarPublic(asOperand(p), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalAddInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalAddInPlace(scalar)");
-	Operand res = addScalarCore(asOperand(p), scalar);
+	Operand res = addScalarPublic(asOperand(p), scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
 Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, double scalar) {
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar)");
-	Operand res = addScalarCore(asOperand(p), -scalar);
+	Operand res = addScalarPublic(asOperand(p), -scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar)");
-	Operand res = addScalarCore(asOperand(p), -scalar);
+	Operand res = addScalarPublic(asOperand(p), -scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1343,14 +1525,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, doubl
 	// bug. (The negate primitive itself still differs per #1.)
 	auto p = ensureCt(ctx, ct);
 	requireComputable(*p, "EvalSub(scalar, ct)");
-	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
+	Operand res = addScalarPublic(negateCore(asOperand(p)), scalar);
 	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
 void HazeEngine::evalSubInPlace(CryptoContextImpl<DCRTPoly>& ctx, double scalar, Ciphertext<DCRTPoly>& ct1) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalSubInPlace(scalar, ct)");
-	Operand res = addScalarCore(negateCore(asOperand(p)), scalar);
+	Operand res = addScalarPublic(negateCore(asOperand(p)), scalar);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1390,14 +1572,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalSub(CryptoContextImpl<DCRTPoly>& ctx, Plain
 Ciphertext<DCRTPoly> HazeEngine::evalMult(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMult(scalar)");
-	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
+	Operand res = multScalarWithPrecheck(asOperand(p), scalar, scalarInputs_);
 	return wrapDeviceResult(ctx, ct1, std::move(res.p));
 }
 
 void HazeEngine::evalMultInPlace(CryptoContextImpl<DCRTPoly>& ctx, Ciphertext<DCRTPoly>& ct1, double scalar) {
 	auto p = ensureCt(ctx, ct1);
 	requireComputable(*p, "EvalMultInPlace(scalar)");
-	Operand res = multScalarWithPrecheck(asOperand(p), scalar);
+	Operand res = multScalarWithPrecheck(asOperand(p), scalar, scalarInputs_);
 	rebindPayload(*p, std::move(res.p->components), res);
 }
 
@@ -1475,6 +1657,123 @@ LimbChain addChain(size_t polyBytes, const std::vector<uint64_t>& base, const vo
 }
 } // namespace
 
+LimbChain HazeEngine::inputChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base, bool declare) {
+	if (declare) {
+		return LimbChain::declared(polyBytes_, base);
+	}
+	return LimbChain(rows, base);
+}
+
+void HazeEngine::noteInput(const LimbChain& chain, InputRole role) {
+	if (chain.empty()) {
+		return;
+	}
+	char name[256];
+	const hazeError_t err = hazeInputGroupName(chain[0], name, sizeof name);
+	if (err == HAZE_ERROR_SOURCE_UNAVAILABLE) {
+		return; // not a named input (nothing was uploaded)
+	}
+	hazeCheck(err, "hazeInputGroupName");
+	role.name = name;
+	inputRoles_.push_back(std::move(role));
+}
+
+namespace {
+std::string jsonString(const std::string& s) {
+	std::string out = "\"";
+	for (char c : s) {
+		if (c == '"' || c == '\\') {
+			out += '\\';
+		}
+		out += c;
+	}
+	return out + "\"";
+}
+} // namespace
+
+void HazeEngine::writeInputRoles() {
+	if (programDir_.empty()) {
+		return;
+	}
+	std::vector<std::string> omit;
+	if (const char* e = std::getenv("FIDESLIB_HAZE_OMIT_INPUTS"); e != nullptr) {
+		std::string s = e;
+		for (size_t p = 0; p <= s.size();) {
+			const size_t q = std::min(s.find(',', p), s.size());
+			if (q > p) {
+				omit.push_back(s.substr(p, q - p));
+			}
+			p = q + 1;
+		}
+	}
+	const std::filesystem::path dir = programDir_;
+	std::ofstream out(dir / "fideslib.input_roles.json");
+	out << "{\n  \"schema\": \"fideslib.input_roles\",\n  \"version\": 1,\n  \"format\": 1,\n  \"inputs\": [";
+	char sf[64];
+	for (size_t i = 0; i < inputRoles_.size(); ++i) {
+		const InputRole& r = inputRoles_[i];
+		bool omitted	   = r.declared;
+		// An untagged plaintext is a constant of the program (a mask, a refresh table): no
+		// runtime can supply its words, so it is never omitted.
+		const bool constant = r.role == "plaintext" && r.tag.empty();
+		if (!constant && std::find(omit.begin(), omit.end(), r.role) != omit.end()) {
+			const auto bin = dir / ("fideslib.input_" + r.name + ".bin");
+			std::error_code ec;
+			if (std::filesystem::exists(bin, ec)) {
+				std::filesystem::resize_file(bin, 0, ec);
+				omitted = !ec;
+			}
+		}
+		std::snprintf(sf, sizeof sf, "%.17g", r.scalingFactor);
+		out << (i ? ",\n    " : "\n    ") << "{\"name\": " << jsonString(r.name) << ", \"role\": " << jsonString(r.role);
+		if (r.role == "scalar") {
+			char v[64];
+			std::snprintf(v, sizeof v, "%.17g", r.value);
+			out << ", \"tag\": " << jsonString(r.tag) << ", \"kind\": \"" << r.kind << "\", \"value\": " << v
+				<< ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"factors\": [";
+			for (size_t f = 0; f < r.factors.size(); ++f) {
+				out << (f ? ", " : "") << r.factors[f];
+			}
+			out << "]";
+		} else if (r.role == "key") {
+			out << ", \"id\": " << jsonString(r.id) << ", \"digit\": " << r.digit << ", \"component\": \"" << (r.component ? "b" : "a") << "\"";
+		} else {
+			if (r.role == "ciphertext") {
+				out << ", \"component\": " << r.component;
+			}
+			out << ", \"tag\": " << jsonString(r.tag) << ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"scaling_factor\": " << sf
+				<< ", \"slots\": " << r.slots;
+			if (r.extended) {
+				out << ", \"extended\": true";
+			}
+		}
+		out << ", \"towers\": " << r.towers << (omitted ? ", \"omitted\": true" : "") << "}";
+	}
+	out << "\n  ],\n  \"scalars\": [";
+	for (size_t i = 0; i < scalarRoles_.size(); ++i) {
+		const ScalarRole& r = scalarRoles_[i];
+		char v[64];
+		std::snprintf(v, sizeof v, "%.17g", r.value);
+		out << (i ? ",\n    " : "\n    ") << "{\"tag\": " << jsonString(r.tag) << ", \"kind\": \"" << r.kind << "\", \"value\": " << v
+			<< ", \"noise_scale_deg\": " << r.noiseScaleDeg << ", \"towers\": " << r.towers << ", \"factors\": [";
+		for (size_t f = 0; f < r.factors.size(); ++f) {
+			out << (f ? ", " : "") << r.factors[f];
+		}
+		out << "], \"sentinels\": [";
+		for (size_t f = 0; f < r.sentinels.size(); ++f) {
+			out << (f ? ", " : "") << r.sentinels[f];
+		}
+		out << "]}";
+	}
+	out << "\n  ],\n  \"outputs\": [";
+	for (size_t i = 0; i < outputRoles_.size(); ++i) {
+		const OutputRole& r = outputRoles_[i];
+		out << (i ? ",\n    " : "\n    ") << "{\"name\": " << jsonString(r.name) << ", \"role\": \"ciphertext\", \"component\": "
+			<< r.component << ", \"tag\": " << jsonString(r.tag) << ", \"towers\": " << r.towers << "}";
+	}
+	out << "\n  ]\n}\n";
+}
+
 void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	if (key.uploaded) {
 		return; // uploaded once; reused within the single program (see the one-program contract)
@@ -1489,8 +1788,18 @@ void HazeEngine::ensureKeyUploaded(KsKey& key) {
 	std::vector<uint64_t> qpBaseFull = qBase_;
 	qpBaseFull.insert(qpBaseFull.end(), pBase_.begin(), pBase_.end());
 	for (size_t d = 0; d < digits; ++d) {
-		key.aDigits.emplace_back(key.host.a_limbs[d], qpBaseFull); // H2D: full Q∥P rows
-		key.bDigits.emplace_back(key.host.b_limbs[d], qpBaseFull);
+		key.aDigits.push_back(inputChain(key.host.a_limbs[d], qpBaseFull, traceOnly_)); // H2D: full Q∥P rows
+		key.bDigits.push_back(inputChain(key.host.b_limbs[d], qpBaseFull, traceOnly_));
+		InputRole r;
+		r.declared = traceOnly_;
+		r.role	 = "key";
+		r.id	 = key.id;
+		r.digit	 = d;
+		r.towers = qpBaseFull.size();
+		r.component = 0;
+		noteInput(key.aDigits.back(), r);
+		r.component = 1;
+		noteInput(key.bDigits.back(), r);
 	}
 	key.uploaded = true;
 	// hybridKeyswitch only needs numPartQ_ after this point; drop the per-key host limbs, which
@@ -1963,8 +2272,14 @@ const LimbChain& HazeEngine::monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uin
 		tower[r % n] = r < n ? lbcrypto::NativeInteger(1) : params->GetParams()[t]->GetModulus() - lbcrypto::NativeInteger(1);
 		monomial.SetElementAtIndex(t, std::move(tower));
 	}
-	auto rows = extractRows(monomial, ringDim_);
-	return monomials_.emplace(r, LimbChain(rows, qPrefix(rows.size()))).first->second;
+	auto rows				  = extractRows(monomial, ringDim_);
+	const LimbChain& uploaded = monomials_.emplace(r, LimbChain(rows, qPrefix(rows.size()))).first->second;
+	// An input of the program like any other: an untagged constant in the roles file.
+	InputRole role;
+	role.role	= "plaintext";
+	role.towers = rows.size();
+	noteInput(uploaded, role);
+	return uploaded;
 }
 
 HazeEngine::Operand HazeEngine::multByMonomialCore(CryptoContextImpl<DCRTPoly>& ctx, const Operand& x, uint32_t power) {
@@ -2045,6 +2360,7 @@ HazeEngine::KsKey& HazeEngine::autoKeyFor(CryptoContextImpl<DCRTPoly>& ctx, uint
 	if (it == autoKeys_.end()) {
 		auto& context = hostContext(ctx);
 		KsKey key;
+		key.id	 = "auto:" + std::to_string(autoIndex);
 		key.host = hazebk::extractAutomorphismKeyLimbs(context, keyTag_, autoIndex);
 		it		 = autoKeys_.emplace(autoIndex, std::move(key)).first;
 	}
@@ -2060,8 +2376,17 @@ HazeEngine::SparseSwitchKey& HazeEngine::sparseKeyFor(CryptoContextImpl<DCRTPoly
 			throw std::runtime_error("haze backend: the sparse switching key is not over the first primes of Q and P");
 		}
 		const std::vector<uint64_t> base = { key.host.q0, key.host.p0 };
-		key.a							 = LimbChain(key.host.a_limbs, base);
-		key.b							 = LimbChain(key.host.b_limbs, base);
+		key.a							 = inputChain(key.host.a_limbs, base, traceOnly_);
+		key.b							 = inputChain(key.host.b_limbs, base, traceOnly_);
+		InputRole r;
+		r.declared = traceOnly_;
+		r.role		= "key";
+		r.id		= "sparse";
+		r.towers	= base.size();
+		r.component = 0;
+		noteInput(key.a, r);
+		r.component = 1;
+		noteInput(key.b, r);
 		key.uploaded					 = true;
 		key.host.a_limbs.clear();
 		key.host.b_limbs.clear();

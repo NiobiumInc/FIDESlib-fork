@@ -296,7 +296,42 @@ class HazeEngine : public Engine {
 	void adjustPtToward(Operand& ptOp, const Operand& ct);
 	/// @brief FIXEDAUTO multScalar precheck (Ciphertext.cpp:761-775): rescale first when
 	/// NSD == 2, then multScalarCore.
-	Operand multScalarWithPrecheck(const Operand& x, double scalar);
+	Operand multScalarWithPrecheck(const Operand& x, double scalar, bool asInput = false);
+	/// @brief With FIDESLIB_HAZE_SCALAR_INPUTS=1, the double operand of a public ct x double or
+	/// ct +- double operation is recorded as a program input instead of an immediate: a constant
+	/// polynomial holding the operand's per-limb encoding in every word, multiplied or added
+	/// polynomial-wise. The result is bit-identical (a constant multiplies or adds the same
+	/// either way), and the program no longer depends on the operand's value, so one recording
+	/// serves every operand. The engine's own constants (the refresh's) stay immediates.
+	/// Each such input is role "scalar", named "scalar:<n>" in program order, with its kind, value
+	/// and per-limb factors in fideslib.input_roles.json.
+	bool scalarInputs_ = false;
+	/// @brief FIDESLIB_HAZE_SCALAR_INPUTS=patch: the same operands stay immediates, one word per
+	/// tower, so the program carries no polynomial for them. Every such operation is recorded
+	/// (an addition of zero included), so the program does not depend on the operands' values;
+	/// under trace-only each immediate is a sentinel, a word derived from the operand's number
+	/// and tower that a runtime replaces with the launch's per-limb factor. Listed under
+	/// "scalars" in fideslib.input_roles.json ("scalar:<n>", kind, value, factors, sentinels).
+	bool scalarPatch_ = false;
+	struct ScalarRole {
+		std::string tag, kind;
+		double value = 0.0;
+		size_t towers = 0, noiseScaleDeg = 0;
+		std::vector<uint64_t> factors, sentinels;
+	};
+	std::vector<ScalarRole> scalarRoles_;
+	Operand scalarPatchCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value);
+	/// @brief FIDESLIB_HAZE_TRACE_ONLY=1: record the program and its input roles without its
+	/// data. Keys, ciphertexts, tagged plaintexts and scalar inputs are declared, not uploaded
+	/// (no words recorded or written); untagged plaintexts (constants computed from the context:
+	/// masks, the refresh's tables) keep their words. The flush writes the program and does not
+	/// replay it; outputs read back as zero ciphertexts with their recorded level, noise scale
+	/// degree, scaling factor and slots, so the next stage can record from them.
+	bool traceOnly_ = false;
+	/// @brief A chain for `rows`: uploaded, or declared under trace-only.
+	hazebk::LimbChain inputChain(const std::vector<std::vector<uint64_t>>& rows, const std::vector<uint64_t>& base, bool declare);
+	size_t scalarCount_ = 0;
+	Operand scalarInputCore(const Operand& x, const std::vector<uint64_t>& factors, bool add, double value);
 	/// @brief c0 ± pt with the FIXEDAUTO rescale-if rule (Ciphertext.cpp:250-252): rescale
 	/// the ct when (pt.NSD==1, ct.NSD==2, ptTowers == ctTowers−1); then require level/NSD
 	/// agreement with the pt chain trimmed to the ct's towers. c1 passes through (D2D).
@@ -304,6 +339,8 @@ class HazeEngine : public Engine {
 	/// @brief Encode ±scalar per ElemForEvalAddOrSub (negative: per-limb q_i − e_i flip)
 	/// and add it onto c0; metadata unchanged. c1 passes through (D2D).
 	Operand addScalarCore(const Operand& x, double scalar);
+	/// @brief addScalarCore for the public ct +- double entry points (an input with FIDESLIB_HAZE_SCALAR_INPUTS).
+	Operand addScalarPublic(const Operand& x, double scalar);
 
 	/// @brief Materialize a view as a payload: if the view truncates its payload, record
 	/// nothing — build the result payload that owns fresh chains is the OPS' job; this
@@ -321,6 +358,8 @@ class HazeEngine : public Engine {
 	/// @brief A HYBRID keyswitch key: host limbs + the lazily-uploaded device chains
 	/// (full Q∥P rows per digit; Uploaded state, never tagged, reused across epochs).
 	struct KsKey {
+		/// @brief The key's identity among the context's keys: "relin" or "auto:<automorphism index>".
+		std::string id;
 		hazebk::HybridKeyswitchLimbs host;
 		std::vector<hazebk::LimbChain> aDigits; // [digit] -> |Q|+|P| rows
 		std::vector<hazebk::LimbChain> bDigits;
@@ -589,6 +628,8 @@ class HazeEngine : public Engine {
 	std::vector<double> sfReal_, sfRealBig_, modReduceFactor_;
 	/// @brief Outputs declared via markOutput (weak: a dropped ciphertext is not an output).
 	std::vector<std::weak_ptr<hazebk::HazePayload>> outputs_;
+	/// @brief The caller's tag of each declared output, when it was declared (outputs_ order).
+	std::vector<std::string> outputTags_;
   protected:
 	// Visible to subclasses so one can tell whether a readback is the flush and where that
 	// flush wrote. Nothing else about the program state is exposed.
@@ -597,6 +638,38 @@ class HazeEngine : public Engine {
 	bool executed_ = false;
 	/// @brief Program directory of this context (cleaned up at teardown unless kept).
 	std::string programDir_;
+
+	/// @brief What each uploaded input of the program is, written next to the program at its
+	/// flush (fideslib.input_roles.json) so that a runtime can bind the inputs of a recorded
+	/// program again: role "key" (id, digit, component a or b), "ciphertext" (component, the
+	/// caller's tag) or "plaintext" (the caller's tag; an untagged one is a constant of the
+	/// program), with the encoding of the value.
+	struct InputRole {
+		std::string name, role, id, tag;
+		size_t component = 0, digit = 0, towers = 0, noiseScaleDeg = 0, slots = 0;
+		double scalingFactor = 0.0;
+		bool extended = false;
+		bool declared = false; // recorded without words (trace-only)
+		// role "scalar": "mul" or "add", the operand, its per-limb encoding
+		std::string kind;
+		double value = 0.0;
+		std::vector<uint64_t> factors;
+	};
+	std::vector<InputRole> inputRoles_;
+	/// @brief What each output of the program is, written beside the inputs' roles: its name
+	/// in the outputs index, the ciphertext component and the caller's tag (e.g. the file the
+	/// value is saved to), so that a runtime can feed it to the next program that reads it.
+	struct OutputRole {
+		std::string name, tag;
+		size_t component = 0, towers = 0;
+	};
+	std::vector<OutputRole> outputRoles_;
+	/// @brief Record the role of the input `chain` was just uploaded as (its haze input name).
+	void noteInput(const hazebk::LimbChain& chain, InputRole role);
+	/// @brief Write fideslib.input_roles.json; with FIDESLIB_HAZE_OMIT_INPUTS (a comma list of
+	/// roles, e.g. "key"), empty the recorded words of those inputs and mark them omitted: the
+	/// runtime supplies them (keys it holds resident), and the program keeps only their slots.
+	void writeInputRoles();
 
   private:
 	/// @brief haze configuration is process-global: one loaded haze context per process.
