@@ -190,9 +190,10 @@ FIDES_TEST_IF(OnHaze(), HazeRoles, TraceOnlyKeepsInputValuesAndProgram) {
 	env.unset("FIDESLIB_HAZE_OMIT_INPUTS");
 	fs::path program;
 	{
-		Context c = MakeContext();
-		auto ct	  = c.cc->Encrypt(c.cc->MakeCKKSPackedPlaintext(kValues), c.keys.publicKey);
-		auto sum  = c.cc->EvalAdd(ct, ct);
+		Context c  = MakeContext();
+		auto input = c.cc->MakeCKKSPackedPlaintext(kValues);
+		auto ct	   = c.cc->Encrypt(input, c.keys.publicKey);
+		auto sum   = c.cc->EvalAdd(ct, ct);
 		c.cc->MarkOutput(sum);
 
 		auto before = DecryptValues(c, ct, kValues.size());
@@ -224,7 +225,8 @@ FIDES_TEST_IF(OnHaze(), HazeRoles, RolesNameEveryInputAndOmitKeepsConstants) {
 	env.unset("FIDESLIB_HAZE_PROGRAM_KEY");
 	{
 		Context c		= MakeContext();
-		auto ct			= c.cc->Encrypt(c.cc->MakeCKKSPackedPlaintext(kValues), c.keys.publicKey);
+		auto input		= c.cc->MakeCKKSPackedPlaintext(kValues);
+		auto ct			= c.cc->Encrypt(input, c.keys.publicKey);
 		auto constant	= c.cc->MakeCKKSPackedPlaintext(std::vector<double>(kValues.size(), 0.5));
 		auto weights	= c.cc->MakeCKKSPackedPlaintext(std::vector<double>(kValues.size(), 2.0));
 		weights->tag	= "weights";
