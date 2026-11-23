@@ -1,9 +1,8 @@
 #ifdef FIDESLIB_ENABLE_HAZE
 
-// Bootstrap orchestration. The CPU oracle is OpenFHE
-// FHECKKSRNS::EvalBootstrap (ckksrns-fhe.cpp; sparsely-packed branch, levelBudget {1,1}
-// = single BSGS linear transform per direction); FIDESlib src/CKKS/Bootstrap.cu:169-320
-// is the cross-reference for the stage list. Precision bar is 1e-2, not bit parity.
+// Bootstrap orchestration. The oracle is OpenFHE FHECKKSRNS::EvalBootstrap and EvalBootstrapStCFirst (ckksrns-fhe.cpp); both
+// circuits run on every packing, level budget and scaling technique, and the bar is limb-exact equality with the oracle.
+// FIDESlib src/CKKS/Bootstrap.cu is the cross-reference for the stage list.
 
 #include "engine/haze/HazeEngine.hpp"
 
@@ -53,6 +52,16 @@ Ciphertext<DCRTPoly> wrapDeviceResult(CryptoContextImpl<DCRTPoly>& ctx, const Ci
 	res->need_lazy_copy		 = true;
 	res->device				 = std::make_any<std::shared_ptr<HazePayload>>(std::move(payload));
 	return res;
+}
+
+// The oracle's correction, m_correctionFactor - deg (ckksrns-fhe.cpp:789-794, 1194-1199): the degree the moduli give must fit
+// the correction factor, else the unsigned difference wraps into a scale that decodes to garbage.
+uint32_t bootstrapCorrection(uint32_t correctionFactor, int32_t deg) {
+	if (deg > static_cast<int32_t>(correctionFactor)) {
+		throw std::runtime_error(
+		  "haze backend: degree [" + std::to_string(deg) + "] must be less than or equal to the correction factor [" + std::to_string(correctionFactor) + "]");
+	}
+	return correctionFactor - static_cast<uint32_t>(deg);
 }
 
 } // namespace
@@ -265,7 +274,7 @@ hazebk::LimbChain HazeEngine::extModDownChain(const hazebk::LimbChain& ext, size
 	return evalModDown(surv, pCoeff, pBase_, qPrefix(towers), ModDownLift::Configured);
 }
 
-std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
+HazeEngine::Operand HazeEngine::extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
   const Operand& x,
   const std::vector<Plaintext>& pts,
   const std::vector<int32_t>& rotIn,
@@ -273,16 +282,16 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
   uint32_t numBlocks,
   uint32_t numRotSkip,
   int32_t deltaStride) {
-	// Kill switch for A/B and bisection: force the plain-rotation (per-baby ModDown) path.
-	// ("cts"/"stc" are DIRECTIONAL switches handled at the evalCoeffsToSlotsFFT call site.)
-	if (const char* noExt = std::getenv("FIDESLIB_HAZE_BOOT_NO_EXT"); noExt != nullptr) {
-		const std::string v(noExt);
-		if (v != "cts" && v != "stc") {
-			return std::nullopt;
-		}
+	// Only this extended form rounds once per giant step like the oracle; a plain-rotation evaluation decodes correctly
+	// but differs in the low bits. A stage that cannot run it is therefore refused, never evaluated another way.
+	if (pts.empty() || rotIn.empty() || numBlocks == 0) {
+		throw std::runtime_error("haze backend: extended bsgs stage needs plaintexts, baby steps and giant blocks (got " + std::to_string(pts.size()) + ", " + std::to_string(rotIn.size()) + ", " + std::to_string(numBlocks) + ")");
 	}
-	if (x.noiseScaleDeg != 1 || pts.empty() || rotIn.empty() || numBlocks == 0 || x.p->components.size() != 2) {
-		return std::nullopt; // stage drivers rescale to depth 1 first; anything else -> plain path
+	if (x.noiseScaleDeg != 1) {
+		throw std::runtime_error("haze backend: extended bsgs stage needs a depth-1 input (noise scale degree " + std::to_string(x.noiseScaleDeg) + ")");
+	}
+	if (x.p->components.size() != 2) {
+		throw std::runtime_error("haze backend: extended bsgs stage needs a degree-1 input (" + std::to_string(x.p->components.size()) + " components)");
 	}
 	const size_t towers	 = x.towers;
 	const size_t numP	 = pBase_.size();
@@ -295,11 +304,13 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	// exact-level pt is fine under every technique.
 	auto pt0 = ensurePt(ctx, const_cast<Plaintext&>(pts.front()));
 	if (pt0->noiseScaleDeg != 1 || pt0->towers < towers + numP) {
-		return std::nullopt; // not extended-encoded (or too shallow): plain path
+		throw std::runtime_error("haze backend: extended bsgs stage needs plaintexts encoded in the extended basis at depth 1 (noise scale degree " + std::to_string(pt0->noiseScaleDeg) + ", "
+								 + std::to_string(pt0->towers) + " towers for " + std::to_string(towers + numP) + " required)");
 	}
 	const size_t ptQ = pt0->towers - numP;
 	if (!(ptQ == towers || (fixedMode && ptQ > towers))) {
-		return std::nullopt;
+		throw std::runtime_error("haze backend: extended bsgs stage needs plaintexts at the input's level (" + std::to_string(ptQ) + " base towers for an input of " + std::to_string(towers)
+								 + "; a deeper encoding is exact only under the fixed scaling techniques)");
 	}
 
 	const uint32_t g = static_cast<uint32_t>(rotIn.size());
@@ -400,7 +411,7 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	// commutative, so this reordering of the oracle's j-ascending sum is value-identical.
 	// The TOP block mirrors the oracle's `(Gtop + j) != numRotations` guard via numRotSkip
 	// (j = 0 is always included, exactly like the oracle's unconditional A[Gtop] term).
-	auto buildBlock = [&](uint32_t i, bool topBlock) -> std::optional<std::pair<LimbChain, LimbChain>> {
+	auto buildBlock = [&](uint32_t i, bool topBlock) -> std::pair<LimbChain, LimbChain> {
 		const size_t G = static_cast<size_t>(g) * i;
 		auto include   = [&](uint32_t j) {
 			const size_t k = G + j;
@@ -460,7 +471,7 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 			}
 		}
 		if (!started) {
-			return std::nullopt; // empty giant block (cannot happen for a well-formed BSGS split)
+			throw std::runtime_error("haze backend: extended bsgs stage has an empty giant block (block " + std::to_string(i) + " of " + std::to_string(b) + ")");
 		}
 		return std::make_pair(std::move(innB), std::move(innA));
 	};
@@ -489,20 +500,16 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	// Horner backward accumulation (ckksrns-fhe.cpp:2011-2026): start from the TOP giant block,
 	// rotate the ACCUMULATOR by the constant stride between blocks, Ext-add each lower block;
 	// ONE final KeySwitchDown of both components.
-	auto topBlock = buildBlock(b - 1, /*topBlock=*/true);
-	if (!topBlock) {
-		return std::nullopt;
-	}
-	LimbChain outerB = std::move(topBlock->first);
-	LimbChain outerA = std::move(topBlock->second);
+	auto topBlock	 = buildBlock(b - 1, /*topBlock=*/true);
+	LimbChain outerB = std::move(topBlock.first);
+	LimbChain outerA = std::move(topBlock.second);
 	for (int32_t i = static_cast<int32_t>(b) - 2; i >= 0; --i) {
 		if (gKey != nullptr) {
 			hornerRotate(outerB, outerA, *gKey, gAuto);
 		}
-		if (auto blk = buildBlock(static_cast<uint32_t>(i), /*topBlock=*/false)) {
-			addInPlace(outerB, blk->first, qpBase);
-			addInPlace(outerA, blk->second, qpBase);
-		}
+		const auto blk = buildBlock(static_cast<uint32_t>(i), /*topBlock=*/false);
+		addInPlace(outerB, blk.first, qpBase);
+		addInPlace(outerA, blk.second, qpBase);
 	}
 
 	// The CtS/StC delta rotation, folded into the last stage's extended output (ckksrns-fhe.cpp:2216-2221,
@@ -517,7 +524,7 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	LimbChain resA = extModDownChain(outerA, towers);
 
 	// EvalMultExt metadata (NSD += pt.NSD, sf ×= pt.sf) — the ext dance itself is metadata-
-	// neutral, matching the plain path's multPtCore(fixedTrimOk): slots stays x.slots. pt0 is a
+	// neutral, as in multPtCore: slots stays x.slots. pt0 is a
 	// bootstrap linear-transform plaintext encoded at full ring width, so its own GetSlots() must
 	// not widen a sparsely-packed x here.
 	Operand res		  = x;
@@ -527,60 +534,27 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	return res;
 }
 
-// ---- BSGS linear transform (plain-rotation equivalent of OpenFHE EvalLinearTransform) ----
+// ---- BSGS linear transform (OpenFHE EvalLinearTransform) ----
 
 Ciphertext<DCRTPoly> HazeEngine::linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep) {
-	// Horner form of OpenFHE EvalLinearTransform (ckksrns-fhe.cpp:1918-1957, post-#1209): baby
-	// index i is the rotation i (i=0 identity); giant blocks are consumed from the top and the
-	// accumulator rotates by the single stride bStep between blocks. Term k = bStep*j + i is
-	// included iff k < slots == a.size(). Run the hoisted-Ext implementation
-	// (extBsgsStage); the plain form below (#19: shared precompute handle, per-index ModDown)
-	// remains as the fallback for non-extended precompute or FIDESLIB_HAZE_BOOT_NO_EXT.
+	// Horner form of OpenFHE EvalLinearTransform (ckksrns-fhe.cpp:1918-1957, post-#1209): baby index i is the rotation i
+	// (i=0 identity); giant blocks are consumed from the top and the accumulator rotates by the single stride bStep
+	// between blocks. Term k = bStep*j + i is included iff k < slots == a.size().
 	const uint32_t slots = static_cast<uint32_t>(a.size());
 	const uint32_t gStep = static_cast<uint32_t>(std::ceil(static_cast<double>(slots) / bStep));
-	const uint32_t m	 = static_cast<uint32_t>(ctx.GetCyclotomicOrder());
 
-	{
-		auto p = ensureCt(ctx, ct);
-		std::vector<int32_t> rotIn(bStep);
-		for (uint32_t i = 0; i < bStep; ++i) {
-			rotIn[i] = static_cast<int32_t>(i);
-		}
-		const int32_t stride = (gStep > 1) ? static_cast<int32_t>(bStep) : 0;
-		// numRotSkip = a.size(): no oracle skip term in LT — the k < a.size() bound is the guard.
-		if (auto ext = extBsgsStage(ctx, asOperand(p), a, rotIn, stride, gStep, slots, /*deltaStride=*/0)) {
-			return wrapDeviceResult(ctx, ct, std::move(ext->p));
-		}
+	auto p = ensureCt(ctx, ct);
+	std::vector<int32_t> rotIn(bStep);
+	for (uint32_t i = 0; i < bStep; ++i) {
+		rotIn[i] = static_cast<int32_t>(i);
 	}
-
-	auto precomp = ctx.EvalFastRotationPrecompute(ct);
-	std::vector<Ciphertext<DCRTPoly>> rot(bStep);
-	rot[0] = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
-	for (uint32_t i = 1; i < bStep; ++i) {
-		rot[i] = ctx.EvalFastRotation(ct, static_cast<int32_t>(i), m, precomp);
-	}
-
-	auto evalBlock = [&](uint32_t j) {
-		auto acc = ctx.EvalMult(rot[0], const_cast<Plaintext&>(a[bStep * j]));
-		for (uint32_t i = 1; i < bStep; ++i) {
-			if (bStep * j + i < slots) {
-				auto term = ctx.EvalMult(rot[i], const_cast<Plaintext&>(a[bStep * j + i]));
-				ctx.EvalAddInPlace(acc, term);
-			}
-		}
-		return acc;
-	};
-
-	Ciphertext<DCRTPoly> result = evalBlock(gStep - 1);
-	for (int32_t j = static_cast<int32_t>(gStep) - 2; j >= 0; --j) {
-		result	   = ctx.EvalRotate(result, static_cast<int32_t>(bStep));
-		auto inner = evalBlock(static_cast<uint32_t>(j));
-		ctx.EvalAddInPlace(result, inner);
-	}
-	return result;
+	const int32_t stride = (gStep > 1) ? static_cast<int32_t>(bStep) : 0;
+	// numRotSkip = a.size(): no oracle skip term in LT — the k < a.size() bound is the guard.
+	Operand res = extBsgsStage(ctx, asOperand(p), a, rotIn, stride, gStep, slots, /*deltaStride=*/0);
+	return wrapDeviceResult(ctx, ct, std::move(res.p));
 }
 
-// ---- staged bootstrap (sparse path) ----
+// ---- staged bootstrap ----
 
 namespace {
 // Debug bisection hook: FIDESLIB_HAZE_BOOT_DEBUG_STAGE=<k> makes bootstrapStaged return the
@@ -593,11 +567,8 @@ int bootDebugStage() {
 } // namespace
 
 Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
-	// CUDA parity (#9): the Engine-dispatched bootstrap is ALWAYS the ModRaise-first (normal)
-	// variant (FIDESlib::CKKS::Bootstrap, Bootstrap.cu:169) — the precom's BTSlotsEncoding flag
-	// (forwarded from btsfirstboot, default false) only steers OpenFHE's host setup, not the
-	// runtime variant. We select ModRaise-first for BTSlotsEncoding=false (CUDA-matching, the
-	// path the parity oracle also runs) and keep the StC-first port for BTSlotsEncoding=true.
+	// The precom's BTSlotsEncoding flag (forwarded from btsfirstboot, default false) selects the circuit, as it does in
+	// OpenFHE's EvalBootstrap and in CUDA's Bootstrap(): ModRaise-first when false, StC-first when true.
 	auto pIn = ensureCt(ctx, ciphertext);
 	requireComputable(*pIn, "EvalBootstrap");
 	// Bootstrap bypasses the facade (it drives the engine cores directly), so the degree-1
@@ -609,16 +580,15 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStaged(CryptoContextImpl<DCRTPoly>& ct
 		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
 	}
 	if (bpIt->second.btSlotsEncoding) {
-		return bootstrapStCFirst(ctx, ciphertext); // BTSlotsEncoding=true (CPU-oracle slim path)
+		return bootstrapStCFirst(ctx, ciphertext); // BTSlotsEncoding=true: OpenFHE's EvalBootstrapStCFirst
 	}
-	return bootstrapModRaiseFirst(ctx, ciphertext); // BTSlotsEncoding=false (CUDA Engine path)
+	return bootstrapModRaiseFirst(ctx, ciphertext); // BTSlotsEncoding=false: OpenFHE's EvalBootstrap
 }
 
 // Multi-stage FFT CoeffsToSlots / SlotsToCoeffs (levelBudget != {1,1}; #11). Port of OpenFHE
 // EvalCoeffsToSlots / EvalSlotsToCoeffs (ckksrns-fhe.cpp:1885-2200), iterating the per-stage LT
 // vectors. Each stage runs the extended-basis BSGS (extBsgsStage — baby steps in Q∥P,
-// one KeySwitchDown per giant step, matching the oracle's hoisted form); the plain-EvalRotate
-// body below remains as the fallback for non-extended precompute or FIDESLIB_HAZE_BOOT_NO_EXT.
+// one KeySwitchDown per giant step, matching the oracle's hoisted form), which refuses what it cannot run.
 Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ct, uint32_t slots, bool decode) {
 	const BootPrecom& bp = boot_.at(slots);
 	const auto& p		 = decode ? bp.paramsDec : bp.paramsEnc;
@@ -711,126 +681,50 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 		first = false;
 
 		const bool rem		  = (flagRem == 1) && ((decode && s == static_cast<int32_t>(p.lvlb) - 1) || (!decode && s == stop));
-		const uint32_t g	  = rem ? p.gRem : p.g;
 		const uint32_t b	  = rem ? p.bRem : p.b;
 		const uint32_t numRot = rem ? p.numRotationsRem : p.numRotations;
 		const int32_t t		  = stride[s];
 		const int32_t stageDelta = (s == stageOrder.back()) ? delta : 0;
 
-		// Extended-basis Horner BSGS stage (OpenFHE's hoisted form): baby rotations stay
-		// in Q∥P via the shared ModUp handle, the accumulator rotates by the single stride t
-		// between giant blocks. Falls back to the plain path when the ext preconditions fail
-		// (non-extended pts, depth != 1, or FIDESLIB_HAZE_BOOT_NO_EXT).
-		{
-			// Directional bisection: FIDESLIB_HAZE_BOOT_NO_EXT=cts|stc disables the ext form for
-			// that direction only (any other non-empty value disables it globally, inside
-			// extBsgsStage).
-			const char* noExt	  = std::getenv("FIDESLIB_HAZE_BOOT_NO_EXT");
-			const bool dirBlocked = (noExt != nullptr) && ((std::string(noExt) == "cts" && !decode) || (std::string(noExt) == "stc" && decode));
-			auto px = ensureCt(ctx, result);
-			if (!dirBlocked) {
-				if (auto ext = extBsgsStage(ctx, asOperand(px), A[s], rot_in[s], t, b, numRot, stageDelta)) {
-					result = wrapDeviceResult(ctx, result, std::move(ext->p));
-					continue;
-				}
-			}
-		}
-
-		// Plain-rotation fallback (#19 hoisting kept): the same Horner accumulation with plain
-		// per-rotation ModDown. Mathematically identical; bit-parity with the oracle is owned by
-		// the ext path above.
-		const uint32_t M = static_cast<uint32_t>(ctx.GetCyclotomicOrder());
-		auto precomp	 = ctx.EvalFastRotationPrecompute(result);
-		std::vector<Ciphertext<DCRTPoly>> fastRotation(g);
-		for (uint32_t j = 0; j < g; ++j) {
-			fastRotation[j] = (rot_in[s][j] != 0) ? ctx.EvalFastRotation(result, rot_in[s][j], M, precomp) : std::make_shared<CiphertextImpl<DCRTPoly>>(*result);
-		}
-
-		auto evalBlock = [&](uint32_t i, bool topBlock) {
-			const uint32_t G		 = g * i;
-			Ciphertext<DCRTPoly> acc = ctx.EvalMult(fastRotation[0], const_cast<Plaintext&>(A[s][G]));
-			for (uint32_t j = 1; j < g; ++j) {
-				if ((G + j) >= A[s].size() || (topBlock && (G + j) == numRot)) {
-					continue;
-				}
-				auto term = ctx.EvalMult(fastRotation[j], const_cast<Plaintext&>(A[s][G + j]));
-				ctx.EvalAddInPlace(acc, term);
-			}
-			return acc;
-		};
-
-		Ciphertext<DCRTPoly> outer = evalBlock(b - 1, /*topBlock=*/true);
-		for (int32_t i = static_cast<int32_t>(b) - 2; i >= 0; --i) {
-			if (t != 0) {
-				outer = ctx.EvalRotate(outer, t);
-			}
-			auto inner = evalBlock(static_cast<uint32_t>(i), /*topBlock=*/false);
-			ctx.EvalAddInPlace(outer, inner);
-		}
-		result = outer;
-		if (stageDelta != 0) {
-			// The plain path rotates after the stage's ModDown; it is value-correct, and bit-parity with the oracle is
-			// owned by the extended path above.
-			auto px					 = ensureCt(ctx, result);
-			const uint32_t autoIndex = hostContext(ctx)->FindAutomorphismIndex(static_cast<uint32_t>(stageDelta));
-			Operand rot				 = rotateByAutoIndex(ctx, asOperand(px), autoIndex);
-			result					 = wrapDeviceResult(ctx, result, std::move(rot.p));
-		}
+		// Extended-basis Horner BSGS stage (OpenFHE's hoisted form): baby rotations stay in Q∥P via the shared ModUp
+		// handle, the accumulator rotates by the single stride t between giant blocks.
+		auto px		= ensureCt(ctx, result);
+		Operand ext = extBsgsStage(ctx, asOperand(px), A[s], rot_in[s], t, b, numRot, stageDelta);
+		result		= wrapDeviceResult(ctx, result, std::move(ext.p));
 	}
 	return result;
 }
 
 Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
-	// Port of OpenFHE FHECKKSRNS::EvalBootstrapStCFirst (the path the CPU policy's
-	// BTSlotsEncoding=true selects), single iteration, REAL data, sparse packing,
-	// levelBudget {1,1}: deplete -> SlotsToCoeffs -> raise -> CoeffsToSlots -> EvalMod ->
-	// scale-back. Like the oracle, an input that would not gain levels is returned as a
-	// clone (the suite's full-level inputs take exactly that path on CPU too).
+	// Port of OpenFHE FHECKKSRNS::EvalBootstrapStCFirst (ckksrns-fhe.cpp:1091-1476), the circuit BTSlotsEncoding=true
+	// selects: deplete -> SlotsToCoeffs -> raise -> CoeffsToSlots -> EvalMod -> scale-back, single iteration, REAL data,
+	// every packing, level budget and scaling technique. An input that would not gain levels runs the whole pipeline and
+	// is then returned as a clone by the oracle's no-gain check (:1472), except a full-height one, which returns before the circuit.
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
 	const bool fixedManual = (st == lbcrypto::FIXEDMANUAL);
-	if (st != lbcrypto::FIXEDAUTO && st != lbcrypto::FLEXIBLEAUTO && st != lbcrypto::FLEXIBLEAUTOEXT) {
-		notImplemented("EvalBootstrapStCFirst under FIXEDMANUAL");
-	}
 
 	auto pIn = ensureCt(ctx, ciphertext);
 	requireComputable(*pIn, "EvalBootstrap");
 
 	const uint32_t slots = static_cast<uint32_t>(pIn->slots);
 	const uint32_t N	 = static_cast<uint32_t>(ringDim_);
-	if (slots == N / 2) {
-		notImplemented("fully-packed EvalBootstrapStCFirst (slots == N/2)");
-	}
 	const auto bpIt = boot_.find(slots);
 	if (bpIt == boot_.end()) {
 		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
 	}
 	const BootPrecom& bp = bpIt->second;
-	if (!bp.isLT) {
-		notImplemented("EvalBootstrapStCFirst with levelBudget != {1,1}");
-	}
 
-	// Constants (ckksrns-fhe.cpp:940-954, 64-bit branch).
+	// Constants (ckksrns-fhe.cpp:1191-1205, 64-bit branch).
 	const uint32_t L0	 = static_cast<uint32_t>(qBase_.size());
 	const double qDouble = static_cast<double>(qBase_.front());
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
-	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
+	const uint32_t correction = bootstrapCorrection(bp.correctionFactor, deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
 	const double pre		  = 1.0 / post;
 	const uint64_t scalar	  = static_cast<uint64_t>(std::llround(post));
 
 	const size_t initTowers = pIn->towers;
-
-	// Early-out (oracle ckksrns-fhe.cpp:1222: output towers <= input towers -> return the
-	// input clone; on the CPU oracle a full-level input takes exactly this path). The
-	// pipeline consumes AT LEAST 3 mod-reduces + (numIter-1) double-angle rescales + 2
-	// Chebyshev levels after the raise, so any input with at least L0 - that many towers
-	// cannot gain levels — clone without recording the (discarded) program. Borderline
-	// inputs below the bound still run the pipeline and hit the same comparison after it.
-	const uint32_t minPipelineLevels = 3 + (bp.numIter - 1) + 2;
-	if (initTowers + minPipelineLevels >= L0) {
-		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
-	}
 
 	// In-place helpers on a working facade ct.
 	auto rescaleHard = [&](Ciphertext<DCRTPoly>& c) { // ModReduceInternalInPlace(1)
@@ -849,20 +743,29 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 		rebindPayload(*p, std::move(r.p->components), r);
 	};
 
-	// ---- Dropping unnecessary towers (deplete; ckksrns-fhe.cpp:995-1033) ----
+	// ---- Level guard (ckksrns-fhe.cpp:1250-1257) ----
+	// m_paramsDec.lvlb: BootPrecom copies the FFT parameters only when !isLT, and isLT means both budgets are 1.
+	const uint32_t lvlbDec	   = bp.isLT ? 1 : bp.paramsDec.lvlb;
+	const size_t expectedLevel = L0 - (lvlbDec + 2 + (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0));
+	if ((L0 - pIn->towers) + (pIn->noiseScaleDeg - 1) > expectedLevel) {
+		throw std::runtime_error("haze backend: not enough levels to perform bootstrapping");
+	}
+	// The oracle runs the circuit on a full-height input and returns the input clone at its no-gain check, since every
+	// stage after the deplete consumes levels and the output is always below the chain top. Skipping the circuit is
+	// therefore exact, and it avoids the FLEXIBLE deplete's read of the scaling-factor tables below level 0.
+	if (pIn->towers == L0) {
+		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+	}
+
+	// ---- Dropping unnecessary towers (deplete; ckksrns-fhe.cpp:1259-1284) ----
 	Ciphertext<DCRTPoly> work = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
-	const size_t expectedLevel = L0 - (/*lvlbDec=*/1 + 2 + (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0));
 	{
-		auto p = devicePayload(work);
-		if ((L0 - p->towers) + (p->noiseScaleDeg - 1) > expectedLevel) {
-			throw std::runtime_error("haze backend: not enough levels to perform bootstrapping");
-		}
 		toDepthOne(work);
-		p = devicePayload(work);
+		auto p				   = devicePayload(work);
 		const size_t ctxtLevel = L0 - p->towers;
-		if (st == lbcrypto::FIXEDAUTO) {
+		if (st == lbcrypto::FIXEDAUTO || fixedManual) {
 			if (ctxtLevel < expectedLevel) {
-				// LevelReduceInternalInPlace: pure truncation, no IR.
+				// LevelReduceInternalInPlace: pure truncation, no IR (oracle :1262-1266).
 				const size_t targetTowers = L0 - expectedLevel;
 				for (auto& comp : p->components) {
 					comp.truncate(targetTowers);
@@ -870,7 +773,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 				p->towers = targetTowers;
 			}
 		} else if (ctxtLevel < expectedLevel) {
-			// FLEXIBLE deplete (oracle :1016-1029): scale to the expected level's factor,
+			// FLEXIBLE deplete (oracle :1268-1280): scale to the expected level's factor,
 			// level-reduce, mod-reduce, then pin the scaling factor.
 			const double scf2 = p->scalingFactor;
 			const double scf1 = sfRealBig_[ctxtLevel - 1 + (p->noiseScaleDeg - 1)];
@@ -892,9 +795,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 		return work;
 	}
 
-	// ---- SlotsToCoeffs first (LT path), then the sparse fold ----
-	work = linearTransform(ctx, bp.u0Pre, work, bp.bStep);
-	{
+	// ---- SlotsToCoeffs first (isLT -> EvalLinearTransform, else FFT), then the sparse fold (oracle :1292-1300) ----
+	work = bp.isLT ? linearTransform(ctx, bp.u0Pre, work, bp.bStep) : evalCoeffsToSlotsFFT(ctx, work, slots, /*decode=*/true);
+	if (slots != N / 2) {
 		auto rotated = ctx.EvalRotate(work, static_cast<int32_t>(slots));
 		ctx.EvalAddInPlace(work, rotated);
 	}
@@ -906,9 +809,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	toDepthOne(work); // ModReduceInternalInPlace(NSD-1)
 	// AdjustCiphertext(work, 2^-correction, lvl) with the modReduce=true default, so the
 	// raise is entered at depth 1. FIXED modes: public EvalMult by the correction scale.
-	// FLEXIBLE modes (oracle ckksrns-fhe.cpp:2237-2260): scale to the target level's
+	// FLEXIBLE modes (oracle ckksrns-fhe.cpp:2435-2461): scale to the target level's
 	// factor folded with the correction, then pin the scaling factor.
-	if (st == lbcrypto::FIXEDAUTO) {
+	if (st == lbcrypto::FIXEDAUTO || fixedManual) {
 		ctx.EvalMultInPlace(work, std::pow(2.0, -static_cast<double>(correction)));
 		rescaleHard(work);
 	} else {
@@ -938,25 +841,31 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 		return work;
 	}
 
-	// ---- Partial sum (sparse packing): EvalPartialSumInPlace(work, slots), the AccumulateSum core with
-	// stride = slots and size = N / (2 * slots) ----
-	accumulateSumInPlace(ctx, work, static_cast<int>(N / (2 * slots)), static_cast<int>(slots));
-	rescaleHard(work); // ModReduceInternalInPlace(1) before CoeffsToSlots
+	// ---- Partial sum (sparse packing only; oracle :1369-1378): EvalPartialSumInPlace(work, slots), the
+	// AccumulateSum core with stride = slots and size = N / (2 * slots) ----
+	if (slots != N / 2) {
+		accumulateSumInPlace(ctx, work, static_cast<int>(N / (2 * slots)), static_cast<int>(slots));
+	}
+	rescaleHard(work); // ModReduceInternalInPlace(1) before CoeffsToSlots (oracle :1388)
 	if (bootDebugStage() == 5) {
 		return work;
 	}
 
-	// ---- CoeffsToSlots (LT path) ----
-	auto ctxtEnc = linearTransform(ctx, bp.u0hatTPre, work, bp.bStep);
+	// ---- CoeffsToSlots (isLT -> EvalLinearTransform, else FFT; oracle :1390-1391) ----
+	auto ctxtEnc = bp.isLT ? linearTransform(ctx, bp.u0hatTPre, work, bp.bStep) : evalCoeffsToSlotsFFT(ctx, work, slots, /*decode=*/false);
 
-	// ctxtEnc += Conjugate(ctxtEnc): keyswitch with the conjugation key (2N-1).
+	// ctxtEnc += Conjugate(ctxtEnc): keyswitch with the conjugation key (2N-1). REAL data has no imaginary
+	// branch at any packing: the raised CtS output's imaginary part is q0 * integer noise (oracle :1393-1400).
 	{
 		auto pEnc	 = devicePayload(ctxtEnc);
 		Operand conj = rotateByAutoIndex(ctx, asOperand(pEnc), 2 * N - 1);
 		auto conjCt	 = wrapDeviceResult(ctx, ctxtEnc, std::move(conj.p));
 		ctx.EvalAddInPlace(ctxtEnc, conjCt);
 	}
-	if (devicePayload(ctxtEnc)->noiseScaleDeg == 2) {
+	// FIXEDMANUAL: drain to depth 1; else rescale only if NSD==2 (oracle :1402-1415).
+	if (fixedManual) {
+		toDepthOne(ctxtEnc);
+	} else if (devicePayload(ctxtEnc)->noiseScaleDeg == 2) {
 		rescaleHard(ctxtEnc);
 	}
 	if (bootDebugStage() == 6) {
@@ -966,7 +875,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	// ---- Approximate modular reduction: Chebyshev + double-angle ----
 	std::vector<double> coeffs = bp.coefficients;
 	ctx.EvalChebyshevSeriesInPlace(ctxtEnc, coeffs, -1.0, 1.0);
-	toDepthOne(ctxtEnc); // ModReduceInternalInPlace(NSD-1)
+	if (!fixedManual) {
+		toDepthOne(ctxtEnc); // ModReduceInternalInPlace(NSD-1) (oracle :1438-1439)
+	}
 	if (bootDebugStage() == 7) {
 		return ctxtEnc;
 	}
@@ -990,7 +901,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	multInt(ctxtEnc, scalar);
 	multInt(ctxtEnc, static_cast<uint64_t>(1) << correction);
 
-	// Oracle line 1222: if bootstrapping did not gain levels, return the input clone (the
+	// Oracle :1472-1473: if bootstrapping did not gain levels, return the input clone (the
 	// recorded pipeline becomes a discarded program-local — never tagged, never read).
 	if (devicePayload(ctxtEnc)->towers <= initTowers) {
 		return std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
@@ -999,8 +910,8 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 }
 
 Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext) {
-	// CUDA-matching ModRaise-first (normal) bootstrap: FIDESlib::CKKS::Bootstrap (Bootstrap.cu:169),
-	// the variant CudaEngine::evalBootstrap always runs. Cross-ref OpenFHE FHECKKSRNS::EvalBootstrap
+	// ModRaise-first (normal) bootstrap: OpenFHE's EvalBootstrap, which CUDA's Bootstrap() (Bootstrap.cu:169) mirrors.
+	// Cross-ref OpenFHE FHECKKSRNS::EvalBootstrap
 	// (ckksrns-fhe.cpp:430, BTSlotsEncoding=false branch): ModReduce(NSD-1) -> AdjustCiphertext ->
 	// ModRaise -> scale by pre/(k*N) -> [sparse partial sum] -> ModReduce -> CtS -> +Conjugate ->
 	// approxMod (Chebyshev + double-angle + scalar) -> StC -> [sparse rotate+add] -> *2^correction.
@@ -1022,8 +933,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 	const double qDouble = static_cast<double>(qBase_.front());
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
-	// CUDA leaves the deg>correctionFactor throw commented out (Bootstrap.cu:53-58); match it (#11).
-	const uint32_t correction = bp.correctionFactor - static_cast<uint32_t>(deg);
+	const uint32_t correction = bootstrapCorrection(bp.correctionFactor, deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
 	const double pre		  = 1.0 / post;
 	const uint64_t scalar	  = static_cast<uint64_t>(std::llround(post));
