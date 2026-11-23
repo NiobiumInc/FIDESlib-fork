@@ -138,10 +138,10 @@ process (`OMP: Error #15`), so a consumer that uses OpenMP itself must link the 
 | libstdc++ floor | `GLIBCXX_3.4.29` |
 | macOS floor | 15.4 (`minos` of every library, release builds) |
 | CPU baseline | generic; `-march=native` is explicitly disabled |
-| OpenFHE | patched `fideslib-ref-v1.5.1.6`, `WITH_REDUCED_NOISE=ON` |
+| OpenFHE | `fideslib-ref-v1.5.1.6` plus `fideslib-ref-1.5.1.7.patch`, `WITH_REDUCED_NOISE=ON` |
 
 The OpenFHE inside this package is **not** stock: it carries
-`deps/fideslib-ref-1.5.1.6.patch` and is built `WITH_REDUCED_NOISE=ON`, which the haze
+`deps/fideslib-ref-1.5.1.7.patch` and is built `WITH_REDUCED_NOISE=ON`, which the haze
 backend needs for bit-exact parity. A distro OpenFHE cannot be substituted.
 
 `packaging/verify-artifact.sh` checks each of these against the built artifact rather

@@ -126,7 +126,7 @@ enum SecretKeyDist {
 /// fixed at 32 inside OpenFHE's own key generation (the `DCRTPoly(tug, ..., 32)` in
 /// `FHECKKSRNS::EvalBootstrapKeyGen`), and the overflow bound K it pairs with is baked into the
 /// coefficients-to-slots precomputation at setup. Moving it needs a hunk in
-/// `deps/fideslib-ref-1.5.1.6.patch` at the key-generation site and at every `K_SPARSE_ENCAPSULATED`
+/// `deps/fideslib-ref-1.5.1.7.patch` at the key-generation site and at every `K_SPARSE_ENCAPSULATED`
 /// / `g_coefficientsSparseEncapsulated` selection site, not a field here; `SPARSE_TERNARY` is the
 /// only weight-192 bootstrap the library can run today, and it is not encapsulated.
 struct ModReductionConfig {
