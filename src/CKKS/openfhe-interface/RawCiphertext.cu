@@ -1277,6 +1277,8 @@ void FIDESlib::CKKS::AddBootstrapPrecomputationReduced(const lbcrypto::CryptoCon
 		return;
 	if (!GPUcc.HasBootPrecomputation(slots))
 		OPENFHE_THROW("FIDESlib: install the full-height bootstrap precomputation before a reduced-level one");
+	if (GPUcc.GetBootPrecomputation(slots).stc_first)
+		OPENFHE_THROW("FIDESlib: AddBootstrapPrecomputationReduced does not support an StC-first set (no variable-height raise)");
 
 	const auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE);
 	if (!fhe)
@@ -1289,11 +1291,6 @@ void FIDESlib::CKKS::AddBootstrapPrecomputationReduced(const lbcrypto::CryptoCon
 	if (precom->m_paramsEnc.lvlb == 1 && precom->m_paramsDec.lvlb == 1)
 		OPENFHE_THROW("FIDESlib: a reduced-level bootstrap precomputation is only implemented for a "
 					  "collapsed-FFT level budget; this context was set up with {1,1}");
-	if (precom->BTSlotsEncoding)
-		OPENFHE_THROW("FIDESlib: a reduced-level bootstrap precomputation is only implemented for the "
-					  "classic bootstrap order (raise, CoeffsToSlots, EvalMod, SlotsToCoeffs) -- the one "
-					  "the device Bootstrap runs. This context was set up with slots encoding, whose "
-					  "SlotsToCoeffs runs on the INPUT and cannot be moved with the raise.");
 
 	const auto cryptoParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters());
 	const uint32_t sizeP	= static_cast<uint32_t>(cryptoParams->GetParamsP()->GetParams().size());
@@ -1393,6 +1390,8 @@ void FIDESlib::CKKS::AddBootstrapPrecomputationShared(int slots, int levelsToDro
 	if (!GPUcc.HasBootPrecomputation(slots))
 		OPENFHE_THROW("FIDESlib: install the full-height bootstrap precomputation before a shared view of it");
 	const BootstrapPrecomputation& full = GPUcc.GetBootPrecomputation(slots);
+	if (full.stc_first)
+		OPENFHE_THROW("FIDESlib: AddBootstrapPrecomputationShared does not support an StC-first set (no variable-height raise)");
 	if (full.CtS.empty() || full.StC.empty())
 		OPENFHE_THROW("FIDESlib: a shared bootstrap precomputation is only implemented for a collapsed-FFT "
 					  "level budget; this context was set up with {1,1}");
@@ -1491,7 +1490,12 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
 
 		AddBootstrapPlaintexts(cc, slots, GPUcc_, result);
 
-		result.correctionFactor = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_correctionFactor;
+		const auto fhe	   = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE);
+		const auto& precom = fhe->m_bootPrecomMap.find(slots)->second;
+
+		result.correctionFactor = fhe->m_correctionFactor;
+		result.stc_first		= precom->BTSlotsEncoding;
+		result.levels_dec		= precom->m_paramsDec.lvlb;
 
 		if (GPUcc.param.raw->sparse_encaps) {
 			result.sparse_encaps = true;

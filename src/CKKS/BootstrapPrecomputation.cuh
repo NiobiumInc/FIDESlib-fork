@@ -39,6 +39,11 @@ class BootstrapPrecomputation {
 	// second "switchable" GPU context, so the old `std::weak_ptr<ContextData> sparse_context`
 	// member is gone.
 	bool sparse_encaps{ false };
+	/// @brief True when OpenFHE built this set for the StC-first circuit (BTSlotsEncoding): the
+	/// SlotsToCoeffs diagonals then sit at the bottom of the chain and Bootstrap runs BootstrapStCFirst.
+	bool stc_first{ false };
+	/// @brief Decode level budget (m_paramsDec.lvlb); the StC-first deplete needs it to place the input.
+	uint32_t levels_dec{ 0 };
 	/// @brief How many Q towers below the chain top this set's transform plaintexts are
 	/// encoded at. 0 is the full-height set every ordinary bootstrap uses. A non-zero value
 	/// is what makes a shortened mod-raise legal: the CoeffsToSlots/SlotsToCoeffs diagonals

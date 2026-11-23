@@ -41,6 +41,16 @@ void BootstrapCPUraise(Ciphertext& ctxt,
  *   meets them at, and the default set is encoded for the full-height raise.
  */
 void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled = false, const int levelsToDrop = 0);
+/**
+ * @brief Refresh a ciphertext in place with the StC-first (slim) circuit: deplete, SlotsToCoeffs,
+ *        mod-raise, CoeffsToSlots, EvalMod. Transcription of FHECKKSRNS::EvalBootstrapStCFirst,
+ *        single iteration, REAL data. The precomputation installed for `slots` must be an
+ *        StC-first set (BootstrapPrecomputation::stc_first); Bootstrap() dispatches here itself.
+ * @pre towers - (NoiseLevel - 1) >= levels_dec + 2 (+1 under FLEXIBLEAUTOEXT), the oracle's
+ *      "Not enough levels" guard; violations throw std::invalid_argument.
+ * @post Like the oracle, an input the circuit cannot gain levels on is returned unchanged.
+ */
+void BootstrapStCFirst(Ciphertext& ctxt, const int slots);
 double GetPreScaleFactor(Context& cc, int slots);
 /// @param levelsToDrop Stop the raise that many Q towers below the chain top (0 = the top,
 ///                     the default). See Bootstrap.
