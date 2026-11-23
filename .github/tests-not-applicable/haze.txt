@@ -1,10 +1,11 @@
 # Tests left out of the runs on the haze backend, one `PATTERN | REASON` per line (gtest patterns,
 # several joined with `:`). It is counted as not applicable in the test report, with this reason,
 # and it is not run. A test that has a meaning here and fails because the backend lacks something
-# goes in .github/tests-known-gaps/haze.txt instead. There are none.
+# goes in .github/tests-known-gaps/haze.txt instead.
 #
 # A test that exists only on some backends is registered only there (test/TestRegistration.hpp), so
 # it is not listed here. This list holds what is left: a test that is present on the backend and
 # does not apply to it for another reason, such as the hardware it needs.
 #
 # A pattern that matches no test is an error (see .github/scripts/run_gtest.py).
+Large/ApiParityExactBootstrapTest.*:LargeSaveLevel/ApiParityExactBootstrapTest.* | Production-ring (N = 65536) copies of the exact-bootstrap shapes. They mirror OpenFHE's benchmark rows, not its unit tests, and take minutes on a GPU and hours on the in-process simulator, so CI does not gate them. Run by hand with --gtest_filter='Large/*:LargeSaveLevel/*'.
