@@ -745,6 +745,7 @@ if (FIDESLIB_COMPILE_TESTS)
         add_executable(fideslib-test)
 
         target_sources(fideslib-test PRIVATE ${TEST_SOURCE})
+        target_compile_definitions(fideslib-test PRIVATE FIDESLIB_TEST_DATA_DIR="${TEST_SOURCE_DIR}/data")
 
         target_sources(fideslib-test PRIVATE
                 FILE_SET dependency_headers

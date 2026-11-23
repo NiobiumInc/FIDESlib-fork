@@ -5,7 +5,6 @@
 #include <gtest/gtest.h>
 #include <openfhe.h>
 
-#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <iostream>
@@ -14,89 +13,39 @@
 #include <utility>
 #include <vector>
 
-#include "ParityHelpers.hpp"	// LbCc, LbCt, HostCt
-#include "TestEngineConfig.hpp" // FIDESlib::Testing::ConfigureTestEngine
+#include "ExactBootstrapShared.hpp" // Circuit, MakeExactContext, ExpectBootstrapExact, ExpectBootstrapPrecision, ExpectDegreeRefusal, the small-ring constants
+#include "ParityHelpers.hpp"		// LbCc, LbCt, HostCt
 #include "TestRegistration.hpp" // OnDevice, OnlyIf
 #include "fideslib.hpp"
 
 using namespace fideslib;
-using FIDESlib::Testing::ConfigureTestEngine;
-using FIDESlib::Testing::OnDevice;
-using FIDESlib::Testing::OnlyIf;
-
-// Every limb of both components plus the metadata that places the ciphertext, so a circuit that lands on the right
-// bits at the wrong level cannot pass. A mismatch names the first differing limb and never prints a vector.
-static void ExpectBootstrapExact(const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& oracle, const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>& got) {
-	EXPECT_EQ(oracle->GetLevel(), got->GetLevel());
-	EXPECT_EQ(oracle->GetNoiseScaleDeg(), got->GetNoiseScaleDeg());
-	EXPECT_EQ(oracle->GetScalingFactor(), got->GetScalingFactor()); // exact double
-	EXPECT_EQ(oracle->GetSlots(), got->GetSlots());
-	EXPECT_EQ(oracle->GetEncodingType(), got->GetEncodingType());
-
-	constexpr size_t kComponents = 2;
-	if (oracle->GetElements().size() != kComponents || got->GetElements().size() != kComponents) {
-		ADD_FAILURE() << "component counts differ from " << kComponents << ": oracle " << oracle->GetElements().size() << ", got " << got->GetElements().size();
-		return;
-	}
-	for (size_t j = 0; j < kComponents; ++j) {
-		const auto& limbsOracle = oracle->GetElements().at(j).GetAllElements();
-		const auto& limbsGot	= got->GetElements().at(j).GetAllElements();
-		if (limbsOracle.size() != limbsGot.size()) {
-			ADD_FAILURE() << "component " << j << " has " << limbsOracle.size() << " limbs in the oracle and " << limbsGot.size() << " in the result";
-			return;
-		}
-		for (size_t i = 0; i < limbsOracle.size(); ++i) {
-			const auto& a = limbsOracle.at(i).GetValues();
-			const auto& b = limbsGot.at(i).GetValues();
-			if (a.GetLength() != b.GetLength()) {
-				ADD_FAILURE() << "component " << j << ", limb " << i << " has " << a.GetLength() << " coefficients in the oracle and " << b.GetLength() << " in the result";
-				return;
-			}
-			size_t differing = 0, first = 0;
-			for (size_t k = 0; k < a.GetLength(); ++k) {
-				if (a[k] != b[k] && differing++ == 0)
-					first = k;
-			}
-			if (differing > 0) {
-				ADD_FAILURE() << "component " << j << ", limb " << i << " of " << limbsOracle.size() << ": " << differing << " of " << a.GetLength()
-							  << " coefficients differ, the first at index " << first;
-				return;
-			}
-		}
-	}
-}
+using namespace FIDESlib::Testing;
 
 struct ExactBootstrapShape {
-	std::string name; // gtest-safe; empty names the shape after its fields, and the mode (_stc or _raise) is appended either way
+	std::string name; // gtest-safe base name; empty takes the one spelled from the fields, and the circuit's suffix follows it in the test name
 	uint32_t ringDim, slots, scaleMod, firstMod, numLargeDigits;
 	std::vector<uint32_t> levelBudget;
 	ScalingTechnique scalingTech;
 	SecretKeyDist secretKeyDist;
 	uint32_t correctionFactor; // 0 derives
 	uint32_t numIterations, precision;
-	bool stcFirst;
+	Circuit circuit;			 // StCFirstSaveLevel is EvalBootstrapSetup's StCFirstSavesLevel (OpenFHE PR #1374), so the input sits one level higher
 	uint32_t levelsAfter;		 // levels the context keeps once the bootstrap has run
 	uint32_t levelsBelowDeepest; // 0: the input sits at the deepest level the circuit accepts
 	bool degreeTwoInput;		 // the input is multiplied by 1.0 first, so it arrives at noise degree 2 on both sides
 	bool fullHeightInput;		 // the input is encrypted at level 0, the chain top, where a bootstrap gains nothing and returns it
+
+	std::string TestName() const {
+		return name + CircuitSuffix(circuit);
+	}
 };
 
 // Prints the shape by name instead of as a byte dump.
 void PrintTo(const ExactBootstrapShape& shape, std::ostream* os) {
-	*os << shape.name;
+	*os << shape.TestName();
 }
 
 namespace {
-
-const char* ExactTechniqueName(ScalingTechnique technique) {
-	switch (technique) {
-	case FIXEDMANUAL: return "FIXEDMANUAL";
-	case FIXEDAUTO: return "FIXEDAUTO";
-	case FLEXIBLEAUTO: return "FLEXIBLEAUTO";
-	case FLEXIBLEAUTOEXT: return "FLEXIBLEAUTOEXT";
-	default: throw std::invalid_argument("ExactTechniqueName: unsupported scaling technique");
-	}
-}
 
 const char* ExactKeyName(SecretKeyDist dist) {
 	switch (dist) {
@@ -104,16 +53,6 @@ const char* ExactKeyName(SecretKeyDist dist) {
 	case SPARSE_TERNARY: return "sparse";
 	case SPARSE_ENCAPSULATED: return "encaps";
 	default: throw std::invalid_argument("ExactKeyName: unsupported secret key distribution");
-	}
-}
-
-// OpenFHE's enumerator for a fideslib one, which the two enums do not guarantee to share a value for.
-lbcrypto::SecretKeyDist ExactOpenFheKeyDist(SecretKeyDist dist) {
-	switch (dist) {
-	case UNIFORM_TERNARY: return lbcrypto::UNIFORM_TERNARY;
-	case SPARSE_TERNARY: return lbcrypto::SPARSE_TERNARY;
-	case SPARSE_ENCAPSULATED: return lbcrypto::SPARSE_ENCAPSULATED;
-	default: throw std::invalid_argument("ExactOpenFheKeyDist: unsupported secret key distribution");
 	}
 }
 
@@ -135,28 +74,19 @@ std::string ExactNameFromFields(const ExactBootstrapShape& shape) {
 	return name;
 }
 
-// Names the shape and appends it, refusing a name that is already taken.
+// Names the shape after its fields when it has no name, then appends it, refusing a test name that is already taken.
 void AddShape(std::vector<ExactBootstrapShape>& shapes, ExactBootstrapShape shape) {
-	shape.name = (shape.name.empty() ? ExactNameFromFields(shape) : shape.name) + (shape.stcFirst ? "_stc" : "_raise");
+	if (shape.name.empty())
+		shape.name = ExactNameFromFields(shape);
 	for (const auto& existing : shapes) {
-		if (existing.name == shape.name)
-			throw std::logic_error("duplicate exact bootstrap shape name: " + shape.name);
+		if (existing.TestName() == shape.TestName())
+			throw std::logic_error("duplicate exact bootstrap shape name: " + shape.TestName());
 	}
 	shapes.push_back(std::move(shape));
 }
 
-constexpr uint32_t kSmallRing			  = 1u << 12;
-constexpr uint32_t kSmallScaleMod		  = 50;
-constexpr uint32_t kSmallFirstMod		  = 60;
-constexpr uint32_t kSmallLargeDigits	  = 3;
-constexpr uint32_t kSmallLevelsAfter	  = 3;
-constexpr uint32_t kSparseSlots			  = 1u << 5;
 constexpr uint32_t kFullSlots			  = kSmallRing / 2;
 constexpr uint32_t kLargeRing			  = 1u << 16;
-constexpr uint32_t kDerivedCorrection	  = 0;
-constexpr uint32_t kNoPrecision			  = 0;
-constexpr uint32_t kMetaPrecisionFlexible = 7;
-constexpr uint32_t kMetaPrecisionManual	  = 8;
 // OpenFHE derives 9 for this ring and packing (ckksrns-fhe.cpp:165-167), below the degree 10 these moduli give, so the derived
 // value is refused; 10 is the O6d precedent.
 constexpr uint32_t kFixedAutoFullPackCorrection = 10;
@@ -190,7 +120,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 				.correctionFactor	= kDerivedCorrection,
 				.numIterations		= 1,
 				.precision			= kNoPrecision,
-				.stcFirst			= false,
+				.circuit			= Circuit::ModRaiseFirst,
 				.levelsAfter		= kSmallLevelsAfter,
 				.levelsBelowDeepest = 0,
 				.degreeTwoInput		= false,
@@ -210,7 +140,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kCorrectionAboveDegree,
 		.numIterations		= 1,
 		.precision			= kNoPrecision,
-		.stcFirst			= false,
+		.circuit			= Circuit::ModRaiseFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -228,7 +158,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kFixedAutoFullPackCorrection,
 		.numIterations		= 1,
 		.precision			= kNoPrecision,
-		.stcFirst			= false,
+		.circuit			= Circuit::ModRaiseFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -245,7 +175,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kDerivedCorrection,
 		.numIterations		= 1,
 		.precision			= kNoPrecision,
-		.stcFirst			= false,
+		.circuit			= Circuit::ModRaiseFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -264,7 +194,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 			.correctionFactor	= kDerivedCorrection,
 			.numIterations		= 1,
 			.precision			= kNoPrecision,
-			.stcFirst			= false,
+			.circuit			= Circuit::ModRaiseFirst,
 			.levelsAfter		= kSmallLevelsAfter,
 			.levelsBelowDeepest = 0,
 			.degreeTwoInput		= false,
@@ -286,7 +216,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 				.correctionFactor	= kDerivedCorrection,
 				.numIterations		= 1,
 				.precision			= kNoPrecision,
-				.stcFirst			= true,
+				.circuit			= Circuit::StCFirst,
 				.levelsAfter		= kSmallLevelsAfter,
 				.levelsBelowDeepest = 0,
 				.degreeTwoInput		= false,
@@ -309,7 +239,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 				.correctionFactor	= kDerivedCorrection,
 				.numIterations		= iterations,
 				.precision			= precision,
-				.stcFirst			= true,
+				.circuit			= Circuit::StCFirst,
 				.levelsAfter		= kSmallLevelsAfter,
 				.levelsBelowDeepest = 0,
 				.degreeTwoInput		= false,
@@ -333,7 +263,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 					.correctionFactor	= kDerivedCorrection,
 					.numIterations		= 1,
 					.precision			= kNoPrecision,
-					.stcFirst			= true,
+					.circuit			= Circuit::StCFirst,
 					.levelsAfter		= kSmallLevelsAfter,
 					.levelsBelowDeepest = 0,
 					.degreeTwoInput		= false,
@@ -356,7 +286,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 				.correctionFactor	= kDerivedCorrection,
 				.numIterations		= 1,
 				.precision			= kNoPrecision,
-				.stcFirst			= true,
+				.circuit			= Circuit::StCFirst,
 				.levelsAfter		= kSmallLevelsAfter,
 				.levelsBelowDeepest = kShallowDeplete,
 				.degreeTwoInput		= false,
@@ -375,7 +305,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 				.correctionFactor	= kDerivedCorrection,
 				.numIterations		= 1,
 				.precision			= kNoPrecision,
-				.stcFirst			= true,
+				.circuit			= Circuit::StCFirst,
 				.levelsAfter		= kDeepDepleteLevelsAfter,
 				.levelsBelowDeepest = kDeepDeplete,
 				.degreeTwoInput		= false,
@@ -397,7 +327,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 			.correctionFactor	= kDerivedCorrection,
 			.numIterations		= 1,
 			.precision			= kNoPrecision,
-			.stcFirst			= true,
+			.circuit			= Circuit::StCFirst,
 			.levelsAfter		= kSmallLevelsAfter,
 			.levelsBelowDeepest = kDegreeTwoDepth,
 			.degreeTwoInput		= true,
@@ -416,7 +346,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 			.correctionFactor	= kDerivedCorrection,
 			.numIterations		= 1,
 			.precision			= kNoPrecision,
-			.stcFirst			= true,
+			.circuit			= Circuit::StCFirst,
 			.levelsAfter		= kSmallLevelsAfter,
 			.levelsBelowDeepest = 0,
 			.degreeTwoInput		= false,
@@ -434,7 +364,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kCorrectionAboveDegree,
 		.numIterations		= 1,
 		.precision			= kNoPrecision,
-		.stcFirst			= true,
+		.circuit			= Circuit::StCFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -452,7 +382,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kDerivedCorrection,
 		.numIterations		= 2,
 		.precision			= kMetaPrecisionFlexible,
-		.stcFirst			= true,
+		.circuit			= Circuit::StCFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -469,7 +399,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 		.correctionFactor	= kDerivedCorrection,
 		.numIterations		= 2,
 		.precision			= kMetaPrecisionManual,
-		.stcFirst			= true,
+		.circuit			= Circuit::StCFirst,
 		.levelsAfter		= kSmallLevelsAfter,
 		.levelsBelowDeepest = 0,
 		.degreeTwoInput		= false,
@@ -479,7 +409,7 @@ std::vector<ExactBootstrapShape> BuildSmallShapes() {
 
 // The ModRaise-first twin of a row: the same context, with the input at the deepest level the baseline circuit accepts.
 ExactBootstrapShape RaiseTwin(ExactBootstrapShape row) {
-	row.stcFirst		   = false;
+	row.circuit			   = Circuit::ModRaiseFirst;
 	row.levelsBelowDeepest = 0;
 	return row;
 }
@@ -499,7 +429,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 5,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -516,7 +446,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 10,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -533,7 +463,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 2,
 		  .precision		  = kMetaPrecisionFlexible,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 9,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -550,7 +480,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 2,
 		  .precision		  = kMetaPrecisionManual,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 8,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -567,7 +497,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 7,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -584,7 +514,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 11,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -601,7 +531,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 4,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -618,7 +548,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 1,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -635,7 +565,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 10,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -652,7 +582,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 3,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -669,7 +599,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = 5,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 13,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -686,7 +616,7 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = kDerivedCorrection,
 		  .numIterations	  = 1,
 		  .precision		  = kNoPrecision,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 3,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
@@ -703,8 +633,26 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 		  .correctionFactor	  = 5,
 		  .numIterations	  = 2,
 		  .precision		  = kMetaPrecisionFlexible,
-		  .stcFirst			  = true,
+		  .circuit			  = Circuit::StCFirst,
 		  .levelsAfter		  = 9,
+		  .levelsBelowDeepest = 0,
+		  .degreeTwoInput	  = false,
+		  .fullHeightInput	  = false },
+		// The first passing set of the 128-bit dcf CPU sweep, at a degree (10) above the old default factor.
+		{ .name				  = "dcf_e_3_50",
+		  .ringDim			  = kLargeRing,
+		  .slots			  = 1u << 15,
+		  .scaleMod			  = 50,
+		  .firstMod			  = 60,
+		  .numLargeDigits	  = 2,
+		  .levelBudget		  = { 4, 3 },
+		  .scalingTech		  = FLEXIBLEAUTO,
+		  .secretKeyDist	  = SPARSE_ENCAPSULATED,
+		  .correctionFactor	  = 10,
+		  .numIterations	  = 1,
+		  .precision		  = kNoPrecision,
+		  .circuit			  = Circuit::StCFirst,
+		  .levelsAfter		  = 3,
 		  .levelsBelowDeepest = 0,
 		  .degreeTwoInput	  = false,
 		  .fullHeightInput	  = false },
@@ -717,8 +665,20 @@ std::vector<ExactBootstrapShape> BuildLargeShapes() {
 	return shapes;
 }
 
+// Every StC-first shape again with the level saving on, its name ending _stcsave instead of _stc.
+std::vector<ExactBootstrapShape> SaveLevelTwins(const std::vector<ExactBootstrapShape>& shapes) {
+	std::vector<ExactBootstrapShape> twins;
+	for (auto shape : shapes) {
+		if (shape.circuit != Circuit::StCFirst)
+			continue;
+		shape.circuit = Circuit::StCFirstSaveLevel;
+		AddShape(twins, std::move(shape));
+	}
+	return twins;
+}
+
 std::string ExactBootstrapShapeName(const ::testing::TestParamInfo<ExactBootstrapShape>& info) {
-	return info.param.name;
+	return info.param.TestName();
 }
 
 } // namespace
@@ -732,7 +692,7 @@ class ApiParityExactBootstrapTest : public ::testing::TestWithParam<ExactBootstr
 	// The levels the context keeps after the bootstrap plus the ones it consumes, as upstream sizes its contexts.
 	uint32_t Depth() const {
 		const ExactBootstrapShape& s = GetParam();
-		return s.levelsAfter + lbcrypto::FHECKKSRNS::GetBootstrapDepth(s.levelBudget, ExactOpenFheKeyDist(s.secretKeyDist)) + (s.numIterations - 1);
+		return s.levelsAfter + lbcrypto::FHECKKSRNS::GetBootstrapDepth(s.levelBudget, OpenFheKeyDist(s.secretKeyDist)) + (s.numIterations - 1);
 	}
 
 	// The StC-first circuit spends its decode budget on the input before the raise, so its deepest input sits that much higher.
@@ -740,38 +700,35 @@ class ApiParityExactBootstrapTest : public ::testing::TestWithParam<ExactBootstr
 		const ExactBootstrapShape& s = GetParam();
 		if (s.fullHeightInput)
 			return 0;
-		const uint32_t deepest = Depth() - 1 - (s.stcFirst ? s.levelBudget.at(1) : 0);
+		const uint32_t deepest = s.circuit == Circuit::StCFirstSaveLevel ? SaveLevelEncryptLevel(Depth(), s.levelBudget.at(1), s.scalingTech) :
+																		   Depth() - 1 - (s.circuit == Circuit::StCFirst ? s.levelBudget.at(1) : 0);
 		return deepest - s.levelsBelowDeepest;
 	}
 
 	void SetUp() override {
 		const ExactBootstrapShape& s = GetParam();
 
-		v1.resize(s.slots);
-		for (uint32_t i = 0; i < s.slots; ++i)
-			v1[i] = 0.25 * std::sin(0.01 * static_cast<double>(i)) + 0.5;
+		v1 = InputValues(s.slots);
 
-		CCParams<CryptoContextCKKSRNS> params;
-		params.SetMultiplicativeDepth(Depth());
-		params.SetScalingModSize(s.scaleMod);
-		params.SetFirstModSize(s.firstMod);
-		params.SetBatchSize(s.slots);
-		params.SetRingDim(s.ringDim);
-		params.SetScalingTechnique(s.scalingTech);
-		params.SetKeySwitchTechnique(HYBRID);
-		params.SetNumLargeDigits(s.numLargeDigits);
-		params.SetSecretKeyDist(s.secretKeyDist);
-		params.SetSecurityLevel(HEStd_NotSet);
-		ConfigureTestEngine(params);
-		cc = GenCryptoContext(params);
-		cc->Enable(PKE);
-		cc->Enable(KEYSWITCH);
-		cc->Enable(LEVELEDSHE);
-		cc->Enable(ADVANCEDSHE);
-		cc->Enable(FHE);
+		const ExactContextParams params = { .multiplicativeDepth = Depth(),
+			.scaleMod											 = s.scaleMod,
+			.firstMod											 = s.firstMod,
+			.batchSize											 = s.slots,
+			.ringDim											 = s.ringDim,
+			.numLargeDigits										 = s.numLargeDigits,
+			.scalingTech										 = s.scalingTech,
+			.secretKeyDist										 = s.secretKeyDist };
+
+		cc	 = MakeExactContext(params);
 		keys = cc->KeyGen();
 		cc->EvalMultKeyGen(keys.secretKey);
-		cc->EvalBootstrapSetup(s.levelBudget, { 0, 0 }, s.slots, s.correctionFactor, /*precompute=*/true, /*btsfirstboot=*/s.stcFirst);
+		cc->EvalBootstrapSetup(s.levelBudget,
+		  { 0, 0 },
+		  s.slots,
+		  s.correctionFactor,
+		  /*precompute=*/true,
+		  /*btsfirstboot=*/s.circuit != Circuit::ModRaiseFirst,
+		  /*stcFirstSavesLevel=*/s.circuit == Circuit::StCFirstSaveLevel);
 		cc->EvalBootstrapKeyGen(keys.secretKey, s.slots);
 		cc->LoadContext(keys.publicKey);
 	}
@@ -789,17 +746,17 @@ TEST_P(ApiParityExactBootstrapTest, EvalBootstrap) {
 		// before the bootstrap (haze refuses compute after a readback); both multiplies are limb-exact against OpenFHE.
 		lbCt = LbCc(cc)->EvalMult(lbCt, 1.0);
 		ct	 = cc->EvalMult(ct, 1.0);
-		ASSERT_EQ(lbCt->GetNoiseScaleDeg(), 2u) << s.name << ": the input did not arrive at noise degree 2, so this shape exercised nothing";
+		ASSERT_EQ(lbCt->GetNoiseScaleDeg(), 2u) << s.TestName() << ": the input did not arrive at noise degree 2, so this shape exercised nothing";
 	}
 	const size_t levelBefore = ct->GetLevel();
 	auto refreshed			 = cc->EvalBootstrap(ct, s.numIterations, s.precision);
 	if (s.fullHeightInput) {
 		// A chain-top input gains no levels, so the bootstrap returns it unchanged; the exact comparison below checks that against the oracle.
-		ASSERT_EQ(refreshed->GetLevel(), levelBefore) << s.name << ": a chain-top input must come back at its own level";
+		ASSERT_EQ(refreshed->GetLevel(), levelBefore) << s.TestName() << ": a chain-top input must come back at its own level";
 	} else {
 		// A refresh that gained no levels returns its input, and the comparison would hold vacuously.
-		ASSERT_LT(refreshed->GetLevel(), levelBefore)
-		  << s.name << ": the bootstrap gained no levels (depth " << Depth() << ", encrypted at level " << EncryptLevel() << "), so this test exercised nothing";
+		ASSERT_LT(refreshed->GetLevel(), levelBefore) << s.TestName() << ": the bootstrap gained no levels (depth " << Depth() << ", encrypted at level "
+													  << EncryptLevel() << "), so this test exercised nothing";
 	}
 	auto oracle = LbCc(cc)->EvalBootstrap(lbCt, s.numIterations, s.precision);
 
@@ -807,7 +764,7 @@ TEST_P(ApiParityExactBootstrapTest, EvalBootstrap) {
 	std::snprintf(line,
 	  sizeof line,
 	  "[parity] %s: input level %zu, oracle level %zu nsd %zu scaling factor %.17g towers %u\n",
-	  s.name.c_str(),
+	  s.TestName().c_str(),
 	  levelBefore,
 	  oracle->GetLevel(),
 	  oracle->GetNoiseScaleDeg(),
@@ -816,6 +773,7 @@ TEST_P(ApiParityExactBootstrapTest, EvalBootstrap) {
 	std::cout << line;
 
 	ExpectBootstrapExact(oracle, HostCt(cc, refreshed));
+	ExpectBootstrapPrecision(cc, keys.secretKey, oracle, v1);
 }
 
 INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityExactBootstrapTest, ::testing::ValuesIn(BuildSmallShapes()), ExactBootstrapShapeName);
@@ -823,48 +781,32 @@ INSTANTIATE_TEST_SUITE_P(Shapes, ApiParityExactBootstrapTest, ::testing::ValuesI
 // Production-ring shapes: a case costs tens of seconds on the host oracle alone, so they run on the device backends only.
 INSTANTIATE_TEST_SUITE_P(Large, ApiParityExactBootstrapTest, OnlyIf<ExactBootstrapShape>(OnDevice(), ::testing::ValuesIn(BuildLargeShapes())), ExactBootstrapShapeName);
 
+INSTANTIATE_TEST_SUITE_P(SaveLevel, ApiParityExactBootstrapTest, ::testing::ValuesIn(SaveLevelTwins(BuildSmallShapes())), ExactBootstrapShapeName);
+
+INSTANTIATE_TEST_SUITE_P(LargeSaveLevel, ApiParityExactBootstrapTest, OnlyIf<ExactBootstrapShape>(OnDevice(), ::testing::ValuesIn(SaveLevelTwins(BuildLargeShapes()))), ExactBootstrapShapeName);
+
 namespace {
-
-// q0 / 2^40 is 2^20 here, above any correction factor OpenFHE derives for this ring, so every bootstrap circuit must refuse the context.
-constexpr uint32_t kRefusalScaleMod	 = 40;
-constexpr const char* kDegreeRefusal = "must be less than or equal to the correction factor";
-
-// Calls `call` and expects the engine's own exception, whatever its type, to carry OpenFHE's wording of the refusal.
-template <typename Call> void ExpectDegreeRefusal(const char* what, Call&& call) {
-	try {
-		call();
-	} catch (const std::exception& e) {
-		EXPECT_NE(std::string(e.what()).find(kDegreeRefusal), std::string::npos) << what << " threw without the degree refusal: " << e.what();
-		return;
-	}
-	ADD_FAILURE() << what << " returned instead of refusing the degree";
-}
 
 // The context is the small-ring fixture's, at moduli whose degree exceeds the correction factor; the input sits at the deepest level the
 // circuit would accept, so the refusal is the only thing that can stop the bootstrap.
-void ExpectBootstrapRefusesDegree(bool stcFirst) {
+void ExpectBootstrapRefusesDegree(Circuit circuit) {
+	if (circuit == Circuit::StCFirstSaveLevel)
+		throw std::invalid_argument("ExpectBootstrapRefusesDegree: the level-saving circuit is covered by ApiParitySaveLevelTest.cpp");
+	const bool stcFirst						= circuit == Circuit::StCFirst;
 	const std::vector<uint32_t> levelBudget = { 3, 3 };
 	const uint32_t depth					= kSmallLevelsAfter + lbcrypto::FHECKKSRNS::GetBootstrapDepth(levelBudget, lbcrypto::UNIFORM_TERNARY);
 	const uint32_t encryptLevel				= depth - 1 - (stcFirst ? levelBudget.at(1) : 0);
 
-	CCParams<CryptoContextCKKSRNS> params;
-	params.SetMultiplicativeDepth(depth);
-	params.SetScalingModSize(kRefusalScaleMod);
-	params.SetFirstModSize(kSmallFirstMod);
-	params.SetBatchSize(kSparseSlots);
-	params.SetRingDim(kSmallRing);
-	params.SetScalingTechnique(FIXEDAUTO);
-	params.SetKeySwitchTechnique(HYBRID);
-	params.SetNumLargeDigits(kSmallLargeDigits);
-	params.SetSecretKeyDist(UNIFORM_TERNARY);
-	params.SetSecurityLevel(HEStd_NotSet);
-	ConfigureTestEngine(params);
-	auto cc = GenCryptoContext(params);
-	cc->Enable(PKE);
-	cc->Enable(KEYSWITCH);
-	cc->Enable(LEVELEDSHE);
-	cc->Enable(ADVANCEDSHE);
-	cc->Enable(FHE);
+	const ExactContextParams params = { .multiplicativeDepth = depth,
+		.scaleMod											 = kRefusalScaleMod,
+		.firstMod											 = kSmallFirstMod,
+		.batchSize											 = kSparseSlots,
+		.ringDim											 = kSmallRing,
+		.numLargeDigits										 = kSmallLargeDigits,
+		.scalingTech										 = FIXEDAUTO,
+		.secretKeyDist										 = UNIFORM_TERNARY };
+
+	auto cc	  = MakeExactContext(params);
 	auto keys = cc->KeyGen();
 	cc->EvalMultKeyGen(keys.secretKey);
 	cc->EvalBootstrapSetup(levelBudget, { 0, 0 }, kSparseSlots, kDerivedCorrection, /*precompute=*/true, /*btsfirstboot=*/stcFirst);
@@ -884,9 +826,9 @@ void ExpectBootstrapRefusesDegree(bool stcFirst) {
 
 // Runs on every backend: the engines refuse a degree above the correction factor as OpenFHE does, instead of wrapping the unsigned difference.
 TEST(ApiParityBootstrapRefusalTest, StcFirstRefusesDegreeAboveCorrection) {
-	ExpectBootstrapRefusesDegree(/*stcFirst=*/true);
+	ExpectBootstrapRefusesDegree(Circuit::StCFirst);
 }
 
 TEST(ApiParityBootstrapRefusalTest, ModRaiseFirstRefusesDegreeAboveCorrection) {
-	ExpectBootstrapRefusesDegree(/*stcFirst=*/false);
+	ExpectBootstrapRefusesDegree(Circuit::ModRaiseFirst);
 }
