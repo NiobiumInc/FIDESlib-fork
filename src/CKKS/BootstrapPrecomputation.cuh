@@ -8,9 +8,21 @@
 #define AFFINE_LT true
 
 #include "Plaintext.cuh"
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace FIDESlib::CKKS {
+
+/// @brief The OpenFHE values a level-saving StC-first set snapshots at load; the exponent it applies is read per bootstrap instead.
+struct StCFirstSavedLevel {
+	/// @brief Exponent c of the 2^-c folded into SlotsToCoeffs (OpenFHE m_foldedCorrection).
+	uint32_t folded_correction;
+	/// @brief Scaling factor of the SlotsToCoeffs output before its last rescale (OpenFHE StCFirstRaiseScaling::stcSF).
+	double stc_sf;
+	/// @brief Scaling factor of the raised level (OpenFHE StCFirstRaiseScaling::targetSF).
+	double target_sf;
+};
 
 class BootstrapPrecomputation {
   public:
@@ -44,6 +56,9 @@ class BootstrapPrecomputation {
 	bool stc_first{ false };
 	/// @brief Decode level budget (m_paramsDec.lvlb); the StC-first deplete needs it to place the input.
 	uint32_t levels_dec{ 0 };
+	/// @brief What a level-saving StC-first set (OpenFHE StCFirstSavesLevel, PR #1374) needs from OpenFHE at load. The set saves a
+	/// level exactly when this is engaged: SlotsToCoeffs ends on the raising tower, so the input sits one level higher, two under FLEXIBLEAUTOEXT, and ModRaise does no adjust.
+	std::optional<StCFirstSavedLevel> saved_level;
 	/// @brief How many Q towers below the chain top this set's transform plaintexts are
 	/// encoded at. 0 is the full-height set every ordinary bootstrap uses. A non-zero value
 	/// is what makes a shortened mod-raise legal: the CoeffsToSlots/SlotsToCoeffs diagonals

@@ -6,6 +6,7 @@
 
 #include "engine/haze/HazeEngine.hpp"
 
+#include "CKKS/StCFirstSaveLevel.hpp"
 #include "CryptoContext.hpp"
 
 #include <haze/haze.h>
@@ -86,6 +87,10 @@ void HazeEngine::extractBootPrecom(CryptoContextImpl<DCRTPoly>& ctx, uint32_t sl
 	BootPrecom bp;
 	bp.slots			= slots;
 	bp.btSlotsEncoding	= precom->BTSlotsEncoding;
+	if (precom->StCFirstSavesLevel) {
+		const auto raise = lbcrypto::FHECKKSRNS::GetStCFirstRaiseScaling(std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters()));
+		bp.savedLevel = BootPrecom::SavedLevel{ precom->m_foldedCorrection, raise.stcSF, raise.targetSF };
+	}
 	bp.isLT				= (precom->m_paramsEnc.lvlb == 1) && (precom->m_paramsDec.lvlb == 1);
 	bp.bStep = (precom->m_paramsEnc.g == 0) ? static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<double>(slots)))) : static_cast<uint32_t>(precom->m_paramsEnc.g);
 	bp.correctionFactor = fhe->GetCKKSBootCorrectionFactor();
@@ -713,13 +718,16 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 		throw std::runtime_error("haze backend: no bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup + EvalBootstrapKeyGen before LoadContext)");
 	}
 	const BootPrecom& bp = bpIt->second;
+	const std::optional<BootPrecom::SavedLevel>& saved = bp.savedLevel;
 
-	// Constants (ckksrns-fhe.cpp:1191-1205, 64-bit branch).
+	// Constants (ckksrns-fhe.cpp:1191-1205, 64-bit branch). A saved-level set applies the exponent OpenFHE reads at this bootstrap,
+	// which also raises OpenFHE's own refusals.
 	const uint32_t L0	 = static_cast<uint32_t>(qBase_.size());
 	const double qDouble = static_cast<double>(qBase_.front());
 	const double powP	 = std::pow(2.0, static_cast<double>(plaintextModulus_));
 	const int32_t deg	 = static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
-	const uint32_t correction = bootstrapCorrection(bp.correctionFactor, deg);
+	const uint32_t correction =
+	  saved ? FIDESlib::CKKS::ReadStCFirstAppliedCorrection(hostContext(ctx), slots, saved->foldedCorrection) : bootstrapCorrection(bp.correctionFactor, deg);
 	const double post		  = std::pow(2.0, static_cast<double>(deg));
 	const double pre		  = 1.0 / post;
 	const uint64_t scalar	  = static_cast<uint64_t>(std::llround(post));
@@ -746,7 +754,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	// ---- Level guard (ckksrns-fhe.cpp:1250-1257) ----
 	// m_paramsDec.lvlb: BootPrecom copies the FFT parameters only when !isLT, and isLT means both budgets are 1.
 	const uint32_t lvlbDec	   = bp.isLT ? 1 : bp.paramsDec.lvlb;
-	const size_t expectedLevel = L0 - (lvlbDec + 2 + (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0));
+	const size_t expectedLevel = saved ? L0 - (lvlbDec + 1) : L0 - (lvlbDec + 2 + (st == lbcrypto::FLEXIBLEAUTOEXT ? 1 : 0));
 	if ((L0 - pIn->towers) + (pIn->noiseScaleDeg - 1) > expectedLevel) {
 		throw std::runtime_error("haze backend: not enough levels to perform bootstrapping");
 	}
@@ -791,6 +799,14 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 			devicePayload(work)->scalingFactor = scf;
 		}
 	}
+	// CheckStCFirstInputScalingFactor: the factor that reaches the raise is fixed at setup.
+	if (saved && st != lbcrypto::FIXEDAUTO && !fixedManual) {
+		const auto p = devicePayload(work);
+		if (std::abs(p->scalingFactor / sfReal_[L0 - p->towers] - 1.0) > FIDESlib::CKKS::kStCFirstScalingFactorTolerance) {
+			throw std::runtime_error("haze backend: the scaling factor of the bootstrap input differs from the scaling factor of its level; provide an "
+									 "input with at least one more level");
+		}
+	}
 	if (bootDebugStage() == 1) {
 		return work;
 	}
@@ -806,24 +822,41 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	}
 
 	// ---- Raising the modulus ----
-	toDepthOne(work); // ModReduceInternalInPlace(NSD-1)
-	// AdjustCiphertext(work, 2^-correction, lvl) with the modReduce=true default, so the
-	// raise is entered at depth 1. FIXED modes: public EvalMult by the correction scale.
-	// FLEXIBLE modes (oracle ckksrns-fhe.cpp:2435-2461): scale to the target level's
-	// factor folded with the correction, then pin the scaling factor.
-	if (st == lbcrypto::FIXEDAUTO || fixedManual) {
-		ctx.EvalMultInPlace(work, std::pow(2.0, -static_cast<double>(correction)));
-		rescaleHard(work);
+	if (saved) {
+		// RescaleStCFirstOutputInPlace: the last SlotsToCoeffs rescale lands on the raising tower; the correction is in its matrix.
+		if (st == lbcrypto::FIXEDAUTO || fixedManual) {
+			toDepthOne(work);
+		} else {
+			const auto p = devicePayload(work);
+			if (p->noiseScaleDeg != 2 || std::abs(p->scalingFactor / saved->stcSF - 1.0) > FIDESlib::CKKS::kStCFirstScalingFactorTolerance) {
+				throw std::runtime_error("haze backend: unexpected scaling factor of the SlotsToCoeffs output in bootstrapping");
+			}
+			rescaleHard(work);
+			devicePayload(work)->scalingFactor = saved->targetSF;
+		}
+		if (correction < saved->foldedCorrection) {
+			multInt(work, uint64_t{ 1 } << (saved->foldedCorrection - correction));
+		}
 	} else {
-		auto p				   = devicePayload(work);
-		const uint32_t lvl	   = (st == lbcrypto::FLEXIBLEAUTOEXT) ? 1 : 0;
-		const double targetSF  = sfReal_[lvl];
-		const double sourceSF  = p->scalingFactor;
-		const double modToDrop = modReduceFactor_[p->towers - 1]; // double(q_{towers-1}) under FLEXIBLE
-		const double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / sourceSF) * std::pow(2.0, -static_cast<double>(correction));
-		ctx.EvalMultInPlace(work, adjustmentFactor);
-		rescaleHard(work);
-		devicePayload(work)->scalingFactor = targetSF;
+		toDepthOne(work); // ModReduceInternalInPlace(NSD-1)
+		// AdjustCiphertext(work, 2^-correction, lvl) with the modReduce=true default, so the
+		// raise is entered at depth 1. FIXED modes: public EvalMult by the correction scale.
+		// FLEXIBLE modes (oracle ckksrns-fhe.cpp:2435-2461): scale to the target level's
+		// factor folded with the correction, then pin the scaling factor.
+		if (st == lbcrypto::FIXEDAUTO || fixedManual) {
+			ctx.EvalMultInPlace(work, std::pow(2.0, -static_cast<double>(correction)));
+			rescaleHard(work);
+		} else {
+			auto p						  = devicePayload(work);
+			const uint32_t lvl			  = (st == lbcrypto::FLEXIBLEAUTOEXT) ? 1 : 0;
+			const double targetSF		  = sfReal_[lvl];
+			const double sourceSF		  = p->scalingFactor;
+			const double modToDrop		  = modReduceFactor_[p->towers - 1]; // double(q_{towers-1}) under FLEXIBLE
+			const double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / sourceSF) * std::pow(2.0, -static_cast<double>(correction));
+			ctx.EvalMultInPlace(work, adjustmentFactor);
+			rescaleHard(work);
+			devicePayload(work)->scalingFactor = targetSF;
+		}
 	}
 	{
 		auto p					  = devicePayload(work);

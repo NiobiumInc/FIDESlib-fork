@@ -334,7 +334,13 @@ void CryptoContextImpl<DCRTPoly>::SetModReductionConfig(const ModReductionConfig
 	modReduction = cfg;
 }
 
-void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget, std::vector<uint32_t> dim1, uint32_t slots, uint32_t correctionFactor, bool precompute, bool btsfirstboot) {
+void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget,
+  std::vector<uint32_t> dim1,
+  uint32_t slots,
+  uint32_t correctionFactor,
+  bool precompute,
+  bool btsfirstboot,
+  bool stcFirstSavesLevel) {
 	// Bootstrap setup is a host (OpenFHE) computation; the facade performs it and the engine only
 	// supplies the per-backend argument policy.
 	if (engine_->isContextLoaded()) {
@@ -347,7 +353,7 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 	}
 	int32_t modall		   = bootstrapModEvalLevels(this->keyDist, this->modReduction);
 	BootstrapSetupPolicy p = engine_->bootstrapSetupPolicy(precompute, btsfirstboot, modall);
-	context->EvalBootstrapSetup(levelBudget, std::move(dim1), slots, correctionFactor, p.precompute, p.btSlotsEncoding, p.modEvalLevels);
+	context->EvalBootstrapSetup(levelBudget, std::move(dim1), slots, correctionFactor, p.precompute, p.btSlotsEncoding, p.modEvalLevels, stcFirstSavesLevel);
 }
 
 void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>& secretKey, uint32_t slots) {

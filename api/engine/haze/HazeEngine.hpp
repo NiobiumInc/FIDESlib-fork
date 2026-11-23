@@ -502,6 +502,18 @@ class HazeEngine : public Engine {
 		// bootstrapStaged runs the ModRaise-first circuit when false and the StC-first circuit when true, as CUDA's
 		// Bootstrap() does.
 		bool btSlotsEncoding = false;
+
+		// OpenFHE precom->StCFirstSavesLevel (PR #1374), engaged exactly when the set saves a level: SlotsToCoeffs ends on the raising
+		// tower with 2^-foldedCorrection in its matrix, so the input sits one level higher, two under FLEXIBLEAUTOEXT, and the raise does no adjust.
+		// foldedCorrection is snapshotted at LoadContext and re-checked per bootstrap, which also reads the applied exponent, while stcSF
+		// and targetSF depend only on the crypto parameters.
+		struct SavedLevel {
+			uint32_t foldedCorrection;
+			double stcSF;
+			double targetSF;
+		};
+
+		std::optional<SavedLevel> savedLevel;
 		uint32_t bStep = 0;		// m_dim1 / m_paramsEnc.g; 0 -> ceil(sqrt(slots))
 		uint32_t correctionFactor = 0;
 		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts (isLT)

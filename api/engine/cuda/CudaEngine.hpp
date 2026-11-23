@@ -209,6 +209,10 @@ class CudaEngine final : public Engine {
 	/// Relinearize/RelinearizeInPlace hit GetEvalMultKeyVector(tag) first and that accessor throws.
 	void requireRelinKey(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct, const char* op) const;
 
+	/// @brief Bootstrap `ct` on the device with the entry its set needs. A level-saving StC-first set is given the applied correction
+	/// OpenFHE reads at this bootstrap, so a factor changed after load takes effect and a re-encoding the device never saw is refused.
+	void bootstrapOnDevice(CryptoContextImpl<DCRTPoly>& ctx, FIDESlib::CKKS::Ciphertext& ct, int slots, bool prescaled, int levelsToDrop) const;
+
 	/// @brief CUDA CKKS context; null == not loaded. Owned by this engine (one engine per context).
 	std::unique_ptr<FIDESlib::CKKS::Context> context_;
 	/// @brief Devices this context is loaded on (default: device 0).

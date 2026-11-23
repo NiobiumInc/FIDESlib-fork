@@ -9,6 +9,7 @@
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
+#include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -17,6 +18,7 @@
 #include "CKKS/Plaintext.cuh"
 #include "CKKS/PreparedLT.cuh"
 #include "CKKS/RNSPoly.cuh"
+#include "CKKS/StCFirstSaveLevel.hpp"
 #include "CKKS/forwardDefs.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "CudaUtils.cuh"
@@ -831,6 +833,21 @@ void CudaEngine::evalBootstrapKeyGen(CryptoContextImpl<DCRTPoly>& ctx, const Pri
 // cheap host arithmetic between them.
 static std::recursive_mutex g_hostSchemeLock;
 
+void CudaEngine::bootstrapOnDevice(CryptoContextImpl<DCRTPoly>& ctx, FIDESlib::CKKS::Ciphertext& ct, int slots, bool prescaled, int levelsToDrop) const {
+	const auto& precom = (*context_)->GetBootPrecomputation(slots, /*levelsToDrop=*/0);
+	if (!precom.saved_level) {
+		FIDESlib::CKKS::Bootstrap(ct, slots, prescaled, levelsToDrop);
+		return;
+	}
+	if (prescaled)
+		throw std::invalid_argument("FIDESlib: BootstrapStCFirst takes no prescaled input");
+	if (levelsToDrop != 0)
+		throw std::invalid_argument("FIDESlib: BootstrapStCFirst has no variable-height raise");
+	const uint32_t applied = FIDESlib::CKKS::ReadStCFirstAppliedCorrection(
+	  std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(ctx.host), static_cast<uint32_t>(slots), precom.saved_level->folded_correction);
+	FIDESlib::CKKS::BootstrapStCFirstSaved(ct, slots, applied);
+}
+
 Ciphertext<DCRTPoly>
 CudaEngine::evalBootstrap(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t numIterations, uint32_t precision, bool prescaled) {
 	return evalBootstrapInternal(ctx, ciphertext, numIterations, precision, prescaled, /*levelsToDrop=*/0);
@@ -861,7 +878,7 @@ CudaEngine::evalBootstrapMetaDevice(CryptoContextImpl<DCRTPoly>& ctx, const Ciph
 	auto b1 = std::make_shared<FIDESlib::CKKS::Ciphertext>(*context_);
 	b1->copy(*in_gpu);
 	if (trace) fprintf(stderr, "[metabts] device glue: boot1 (input towers %d)\n", inLevel + 1);
-	FIDESlib::CKKS::Bootstrap(*b1, b1->slots, prescaled, levelsToDrop);
+	bootstrapOnDevice(ctx, *b1, b1->slots, prescaled, levelsToDrop);
 	if (b1->NoiseLevel == 2)
 		b1->rescale(); // ModReduceInternalInPlace when the noise degree is 2
 	if (trace) fprintf(stderr, "[metabts] device glue: boot1 back (towers %d, nsd %d)\n", b1->getLevel() + 1, b1->NoiseLevel);
@@ -896,7 +913,7 @@ CudaEngine::evalBootstrapMetaDevice(CryptoContextImpl<DCRTPoly>& ctx, const Ciph
 
 	// Step 8: bootstrap the error.
 	if (trace) fprintf(stderr, "[metabts] device glue: boot2 (err towers %d)\n", err->getLevel() + 1);
-	FIDESlib::CKKS::Bootstrap(*err, err->slots, /*prescaled=*/false, levelsToDrop);
+	bootstrapOnDevice(ctx, *err, err->slots, /*prescaled=*/false, levelsToDrop);
 	if (err->NoiseLevel == 2)
 		err->rescale();
 
@@ -1019,7 +1036,7 @@ CudaEngine::evalBootstrapInternal(CryptoContextImpl<DCRTPoly>& ctx, const Cipher
 	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
 	auto res_gpu				= deviceCt(result);
-	FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled, levelsToDrop);
+	bootstrapOnDevice(ctx, *res_gpu, res_gpu->slots, prescaled, levelsToDrop);
 	return result;
 }
 
@@ -1033,7 +1050,7 @@ void CudaEngine::evalBootstrapInPlace(CryptoContextImpl<DCRTPoly>& ctx, Cipherte
 	}
 	ctx.LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 	auto res_gpu = deviceCt(ciphertext);
-	FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled);
+	bootstrapOnDevice(ctx, *res_gpu, res_gpu->slots, prescaled, /*levelsToDrop=*/0);
 }
 
 // ---------------------------------------------------------------------------------------

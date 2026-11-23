@@ -14,8 +14,10 @@
 #include "CKKS/ElemenwiseBatchKernels.cuh" // copy_ (and, transitively, AddSub.cuh: sub_)
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/Rescale.cuh" // SwitchModulus<T> global (device modulus switch + sign recentering)
+#include "CKKS/StCFirstSaveLevel.hpp"
 #include "Math.cuh"
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #if defined(__clang__)
@@ -477,6 +479,8 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
 			throw std::invalid_argument("FIDESlib: BootstrapStCFirst takes no prescaled input");
 		if (levelsToDrop != 0)
 			throw std::invalid_argument("FIDESlib: BootstrapStCFirst has no variable-height raise");
+		if (precom.saved_level)
+			throw std::invalid_argument("FIDESlib: a level-saving StC-first set needs the host's applied correction, so call BootstrapStCFirstSaved");
 		BootstrapStCFirst(ctxt, slots);
 		return;
 	}
@@ -672,7 +676,11 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
 	ctxt.slots = old_slots;
 }
 
-void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
+namespace FIDESlib::CKKS {
+
+// The one StC-first body: `savedApplied` is the exponent the host applies for a level-saving set (see ReadStCFirstAppliedCorrection) and is engaged
+// exactly for such a set, which the two public entries below enforce.
+static void BootstrapStCFirstBody(Ciphertext& ctxt, const int slots, const std::optional<uint32_t> savedApplied) {
 	ConcurrentOpsDiagScope diag(ConcurrentOpsDiag::kBoot);
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 
@@ -686,6 +694,15 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
 	BootstrapPrecomputation& precom = cc.GetBootPrecomputation(slots);
 	if (!precom.stc_first)
 		throw std::invalid_argument("FIDESlib::CKKS::BootstrapStCFirst: the precomputation for " + std::to_string(slots) + " slots is not an StC-first set");
+	const std::optional<StCFirstSavedLevel>& saved = precom.saved_level;
+	if (saved && !savedApplied)
+		throw std::invalid_argument("FIDESlib::CKKS::BootstrapStCFirst: the precomputation for " + std::to_string(slots) +
+		  " slots saves a level and needs the host's applied correction, so call BootstrapStCFirstSaved");
+	if (!saved && savedApplied)
+		throw std::invalid_argument("FIDESlib::CKKS::BootstrapStCFirstSaved: the precomputation for " + std::to_string(slots) + " slots does not save a level");
+	if (saved && *savedApplied > saved->folded_correction)
+		throw std::invalid_argument("FIDESlib::CKKS::BootstrapStCFirstSaved: the applied correction " + std::to_string(*savedApplied) +
+		  " exceeds the folded one " + std::to_string(saved->folded_correction));
 	// A shared view is the only set with a fold, and it is never full-height, so a fold here is a broken set.
 	if (precom.cts_fold != 1.0 || precom.stc_fold != 1.0)
 		throw std::logic_error("FIDESlib::CKKS::BootstrapStCFirst: the full-height precomputation carries a scale fold");
@@ -697,14 +714,16 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
 	double powP	   = pow(2, p);
 	int32_t deg	   = std::round(std::log2(qDouble / powP));
 
-	uint32_t correction = BootstrapCorrection(cc, precom);
+	uint32_t correction = saved ? *savedApplied : BootstrapCorrection(cc, precom);
 	double post			= std::pow(2, static_cast<double>(deg));
 
 	double pre		= 1. / post;
 	uint64_t scalar = std::llround(post);
 
 	const int32_t extraModulus	 = cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT;
-	const int32_t expectedTowers = static_cast<int32_t>(precom.levels_dec) + 2 + extraModulus;
+	const bool flexible			 = cc.rescaleTechnique != CKKS::FIXEDAUTO && cc.rescaleTechnique != CKKS::FIXEDMANUAL;
+	// Stock StCFirstSavesLevel (PR #1374): SlotsToCoeffs ends on the raising tower, so the input sits one level higher, two under FLEXIBLEAUTOEXT.
+	const int32_t expectedTowers = saved ? static_cast<int32_t>(precom.levels_dec) + 1 : static_cast<int32_t>(precom.levels_dec) + 2 + extraModulus;
 	const int32_t inTowers		 = ctxt.getLevel() + 1;
 	ChecksumProbe(ctxt, "in");
 
@@ -741,6 +760,10 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
 		ctxt.rescale();
 		ctxt.NoiseFactor = scf;
 	}
+	// Stock CheckStCFirstInputScalingFactor: the factor that reaches ModRaise is fixed at setup.
+	if (saved && flexible && std::abs(ctxt.NoiseFactor / cc.param.ScalingFactorReal[ctxt.getLevel()] - 1.0) > kStCFirstScalingFactorTolerance)
+		throw std::invalid_argument("FIDESlib::CKKS::BootstrapStCFirst: the scaling factor of the input differs from the scaling factor of its level; "
+									"provide an input with at least one more level");
 	ChecksumProbe(ctxt, "post-deplete");
 
 	// SlotsToCoeffs runs first here, so it needs the slot convention Bootstrap() has when its own StC runs: normalyzeIndex maps
@@ -758,8 +781,27 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
 	}
 	ChecksumProbe(ctxt, "post-stc");
 
-	// ModRaise's adjust is stock's AdjustCiphertext(2^-correction); the 2N-2 switch-back follows it as in Bootstrap().
-	ModRaise(ctxt, slots, correction, false, precom.sparse_encaps, 0);
+	if (saved) {
+		// Stock RescaleStCFirstOutputInPlace: the last SlotsToCoeffs rescale lands on the raising tower and the correction is
+		// already in its matrix, so ModRaise runs its prescaled path (no adjust) and sets the raised scaling factor itself.
+		if (!flexible) {
+			while (ctxt.NoiseLevel > 1)
+				ctxt.rescale();
+		} else {
+			if (ctxt.NoiseLevel != 2 || std::abs(ctxt.NoiseFactor / saved->stc_sf - 1.0) > kStCFirstScalingFactorTolerance)
+				throw std::logic_error("FIDESlib::CKKS::BootstrapStCFirst: unexpected scaling factor of the SlotsToCoeffs output");
+			ctxt.rescale();
+		}
+		if (correction < saved->folded_correction)
+			multIntScalar(ctxt, uint64_t{ 1 } << (saved->folded_correction - correction));
+		ModRaise(ctxt, slots, correction, true, precom.sparse_encaps, 0);
+		// ModRaise takes the raised factor from FIDESlib's own table; it must be the one the oracle sets.
+		if (flexible && ctxt.NoiseFactor != saved->target_sf)
+			throw std::logic_error("FIDESlib::CKKS::BootstrapStCFirst: the raised scaling factor differs from OpenFHE's");
+	} else {
+		// ModRaise's adjust is stock's AdjustCiphertext(2^-correction); the 2N-2 switch-back follows it as in Bootstrap().
+		ModRaise(ctxt, slots, correction, false, precom.sparse_encaps, 0);
+	}
 	if (precom.sparse_encaps) {
 		ctxt.keySwitch(cc.GetRotationKey(2 * cc.N - 2, ctxt.keyID));
 		EncapsFingerprint(ctxt, "post-switch-back");
@@ -813,6 +855,16 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
 	PoolTraceMarkCiphertextOutput(ctxt);
 
 	ctxt.slots = old_slots;
+}
+
+} // namespace FIDESlib::CKKS
+
+void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt, const int slots) {
+	BootstrapStCFirstBody(ctxt, slots, std::nullopt);
+}
+
+void FIDESlib::CKKS::BootstrapStCFirstSaved(Ciphertext& ctxt, const int slots, const uint32_t appliedCorrection) {
+	BootstrapStCFirstBody(ctxt, slots, appliedCorrection);
 }
 
 double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {

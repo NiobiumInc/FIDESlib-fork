@@ -345,6 +345,8 @@ target_include_directories(fideslib
         # api/ is the include root so headers use api-relative paths (e.g. "engine/cuda/CudaEngine.hpp").
         PUBLIC $<BUILD_INTERFACE:${API_DIR}>
 )
+# The engines include host-only headers from src/CKKS.
+target_include_directories(fideslib PRIVATE ${SOURCE_DIR})
 # The installed public headers include OpenFHE by paths relative to core/ and pke/
 # ("lattice/hal/lat-backend.h", "key/evalkey-fwd.h"), so all five roots have to be
 # on a consumer's include path, not just include/openfhe. That holds for the static

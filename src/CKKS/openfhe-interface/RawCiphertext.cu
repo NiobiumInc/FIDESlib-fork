@@ -1496,6 +1496,10 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
 		result.correctionFactor = fhe->m_correctionFactor;
 		result.stc_first		= precom->BTSlotsEncoding;
 		result.levels_dec		= precom->m_paramsDec.lvlb;
+		if (precom->StCFirstSavesLevel) {
+			const auto raise = lbcrypto::FHECKKSRNS::GetStCFirstRaiseScaling(std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters()));
+			result.saved_level = StCFirstSavedLevel{ precom->m_foldedCorrection, raise.stcSF, raise.targetSF };
+		}
 
 		if (GPUcc.param.raw->sparse_encaps) {
 			result.sparse_encaps = true;
