@@ -578,12 +578,14 @@ class HazeEngine : public Engine {
 	/// (ckksrns-fhe.cpp:1918-2186): baby-step rotations via EvalFastRotationExt (per-key dot
 	/// product only, NO per-baby ModDown), plaintext multiply + accumulation in Q∥P, and a
 	/// SINGLE constant giant stride applied to the accumulator between blocks
-	/// (EvalHornerGiantRotate: KeySwitchDown, ModUp of the a part, ext keyswitch, addFirst
-	/// c0·PModq fold, automorph both), plus one final KeySwitchDown. rotIn has g entries
+	/// (EvalHornerGiantRotate: ModDown and ModUp of the a part, ext keyswitch, the extended b
+	/// part folded in unrounded, automorph both), plus one final KeySwitchDown. rotIn has g entries
 	/// (rotIn[0] = 0 = identity); numBlocks = b giant blocks are consumed from the TOP
 	/// (i = b-1) downward; term k = g*i + j is included iff k < pts.size(), and the top
 	/// block additionally skips k == numRotSkip (OpenFHE's (Gtop+j) != numRotations guard).
-	/// giantStride 0 disables the accumulator rotation. Returns nullopt when the ext
+	/// giantStride 0 disables the accumulator rotation. deltaStride != 0 folds one more extended-basis
+	/// rotation by that stride into the accumulator after the last block, before the final KeySwitchDown
+	/// (the CtS/StC delta); 0 = none. Returns nullopt when the ext
 	/// preconditions do not hold (non-extended pt encoding, depth != 1, or the
 	/// FIDESLIB_HAZE_BOOT_NO_EXT kill switch) — the caller falls back to the plain-rotation
 	/// path unchanged.
@@ -593,7 +595,8 @@ class HazeEngine : public Engine {
 	  const std::vector<int32_t>& rotIn,
 	  int32_t giantStride,
 	  uint32_t numBlocks,
-	  uint32_t numRotSkip);
+	  uint32_t numRotSkip,
+	  int32_t deltaStride);
 
 	// ---- Chebyshev series ----
 

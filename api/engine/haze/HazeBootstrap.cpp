@@ -271,7 +271,8 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
   const std::vector<int32_t>& rotIn,
   int32_t giantStride,
   uint32_t numBlocks,
-  uint32_t numRotSkip) {
+  uint32_t numRotSkip,
+  int32_t deltaStride) {
 	// Kill switch for A/B and bisection: force the plain-rotation (per-baby ModDown) path.
 	// ("cts"/"stc" are DIRECTIONAL switches handled at the evalCoeffsToSlotsFFT call site.)
 	if (const char* noExt = std::getenv("FIDESLIB_HAZE_BOOT_NO_EXT"); noExt != nullptr) {
@@ -473,19 +474,16 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 		gAuto				= resolved.second;
 	}
 
-	// EvalHornerGiantRotate: outer = KeySwitchDown(outer) on both components, then ONE ModUp of
-	// the a part, ext keyswitch with the giant key, addFirst fold of the moddowned b part
-	// (cTilda[0] += b·PModq on the Q rows; P rows of b·P are 0), automorph both Ext components.
-	auto hornerRotate = [&](LimbChain& outB, LimbChain& outA) {
-		LimbChain bQ		   = extModDownChain(outB, towers);
+	// EvalHornerGiantRotate (ckksrns-fhe.cpp:97-128): only the a part is moddowned, since its digit decomposition needs
+	// base-Q rows; the b part stays extended and is folded into the key-switch product on every Q∥P row. Rounding b
+	// early would differ from the oracle's single final KeySwitchDown by a carry.
+	auto hornerRotate = [&](LimbChain& outB, LimbChain& outA, KsKey& key, uint32_t autoIndex) {
 		LimbChain aQ		   = extModDownChain(outA, towers);
 		const HoistedDigits gd = hoistedKeyswitchPrefix(aQ, towers, numPartQ_);
-		KsContribution ks	   = hybridKeyswitchFromDigits(gd, *gKey, /*ext=*/true);
-		LimbChain bRaised(towers, polyBytes_);
-		hazeCheck(hazeMulScalarMrp(bRaised.data(), bQ.asConst().data(), pmodq.data(), qSub.data(), towers, nullptr), "hazeMulScalarMrp(extLT horner)");
-		addQIntoExt(ks.b, bRaised);
-		outB = automorphChain(ks.b, gAuto, qpBase);
-		outA = automorphChain(ks.a, gAuto, qpBase);
+		KsContribution ks	   = hybridKeyswitchFromDigits(gd, key, /*ext=*/true);
+		addInPlace(ks.b, outB, qpBase);
+		outB = automorphChain(ks.b, autoIndex, qpBase);
+		outA = automorphChain(ks.a, autoIndex, qpBase);
 	};
 
 	// Horner backward accumulation (ckksrns-fhe.cpp:2011-2026): start from the TOP giant block,
@@ -499,12 +497,19 @@ std::optional<HazeEngine::Operand> HazeEngine::extBsgsStage(CryptoContextImpl<DC
 	LimbChain outerA = std::move(topBlock->second);
 	for (int32_t i = static_cast<int32_t>(b) - 2; i >= 0; --i) {
 		if (gKey != nullptr) {
-			hornerRotate(outerB, outerA);
+			hornerRotate(outerB, outerA, *gKey, gAuto);
 		}
 		if (auto blk = buildBlock(static_cast<uint32_t>(i), /*topBlock=*/false)) {
 			addInPlace(outerB, blk->first, qpBase);
 			addInPlace(outerA, blk->second, qpBase);
 		}
+	}
+
+	// The CtS/StC delta rotation, folded into the last stage's extended output (ckksrns-fhe.cpp:2216-2221,
+	// 2262-2267, 2338-2343, 2386-2391). The oracle resolves its key by FindAutomorphismIndex, with no slots-aware remap.
+	if (deltaStride != 0) {
+		const uint32_t deltaAuto = hostContext(ctx)->FindAutomorphismIndex(static_cast<uint32_t>(deltaStride));
+		hornerRotate(outerB, outerA, autoKeyFor(ctx, deltaAuto), deltaAuto);
 	}
 
 	// result = KeySwitchDown(outer) (ckksrns-fhe.cpp:2026).
@@ -543,7 +548,7 @@ Ciphertext<DCRTPoly> HazeEngine::linearTransform(CryptoContextImpl<DCRTPoly>& ct
 		}
 		const int32_t stride = (gStep > 1) ? static_cast<int32_t>(bStep) : 0;
 		// numRotSkip = a.size(): no oracle skip term in LT — the k < a.size() bound is the guard.
-		if (auto ext = extBsgsStage(ctx, asOperand(p), a, rotIn, stride, gStep, slots)) {
+		if (auto ext = extBsgsStage(ctx, asOperand(p), a, rotIn, stride, gStep, slots, /*deltaStride=*/0)) {
 			return wrapDeviceResult(ctx, ct, std::move(ext->p));
 		}
 	}
@@ -689,6 +694,11 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 			stageOrder.push_back(stop);
 	}
 
+	// Aut_{-(slots-1)}, the accumulated per-stage pre-rotation, applied by the oracle at the end of both
+	// EvalCoeffsToSlots and EvalSlotsToCoeffs (ckksrns-fhe.cpp:2216-2221, 2262-2267, 2338-2343, 2386-2391): inside the last
+	// evaluated stage, before its final ModDown.
+	const int32_t delta = reduceRot(-static_cast<int32_t>(slots - 1), reduceMod);
+
 	bool first = true;
 	for (int32_t s : stageOrder) {
 		if (!first) {
@@ -705,6 +715,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 		const uint32_t b	  = rem ? p.bRem : p.b;
 		const uint32_t numRot = rem ? p.numRotationsRem : p.numRotations;
 		const int32_t t		  = stride[s];
+		const int32_t stageDelta = (s == stageOrder.back()) ? delta : 0;
 
 		// Extended-basis Horner BSGS stage (OpenFHE's hoisted form): baby rotations stay
 		// in Q∥P via the shared ModUp handle, the accumulator rotates by the single stride t
@@ -718,7 +729,7 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 			const bool dirBlocked = (noExt != nullptr) && ((std::string(noExt) == "cts" && !decode) || (std::string(noExt) == "stc" && decode));
 			auto px = ensureCt(ctx, result);
 			if (!dirBlocked) {
-				if (auto ext = extBsgsStage(ctx, asOperand(px), A[s], rot_in[s], t, b, numRot)) {
+				if (auto ext = extBsgsStage(ctx, asOperand(px), A[s], rot_in[s], t, b, numRot, stageDelta)) {
 					result = wrapDeviceResult(ctx, result, std::move(ext->p));
 					continue;
 				}
@@ -757,19 +768,14 @@ Ciphertext<DCRTPoly> HazeEngine::evalCoeffsToSlotsFFT(CryptoContextImpl<DCRTPoly
 			ctx.EvalAddInPlace(outer, inner);
 		}
 		result = outer;
-	}
-
-	// Undo the per-stage accumulated pre-rotation: Aut_{-(slots-1)}, applied by the oracle at the
-	// end of BOTH EvalCoeffsToSlots and EvalSlotsToCoeffs (ckksrns-fhe.cpp:2070/2183). The oracle
-	// goes through EvalAtIndex — FindAutomorphismIndex key, no slots-aware remap — so mirror that
-	// exact automorphism via rotateByAutoIndex.
-	const int32_t delta = reduceRot(-static_cast<int32_t>(slots - 1), reduceMod);
-	if (delta != 0) {
-		auto px					 = ensureCt(ctx, result);
-		auto& context			 = hostContext(ctx);
-		const uint32_t autoIndex = context->FindAutomorphismIndex(static_cast<uint32_t>(delta));
-		Operand rot				 = rotateByAutoIndex(ctx, asOperand(px), autoIndex);
-		result					 = wrapDeviceResult(ctx, result, std::move(rot.p));
+		if (stageDelta != 0) {
+			// The plain path rotates after the stage's ModDown; it is value-correct, and bit-parity with the oracle is
+			// owned by the extended path above.
+			auto px					 = ensureCt(ctx, result);
+			const uint32_t autoIndex = hostContext(ctx)->FindAutomorphismIndex(static_cast<uint32_t>(stageDelta));
+			Operand rot				 = rotateByAutoIndex(ctx, asOperand(px), autoIndex);
+			result					 = wrapDeviceResult(ctx, result, std::move(rot.p));
+		}
 	}
 	return result;
 }
@@ -781,6 +787,7 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 	// scale-back. Like the oracle, an input that would not gain levels is returned as a
 	// clone (the suite's full-level inputs take exactly that path on CPU too).
 	const auto st = static_cast<lbcrypto::ScalingTechnique>(scalingTech_);
+	const bool fixedManual = (st == lbcrypto::FIXEDMANUAL);
 	if (st != lbcrypto::FIXEDAUTO && st != lbcrypto::FLEXIBLEAUTO && st != lbcrypto::FLEXIBLEAUTOEXT) {
 		notImplemented("EvalBootstrapStCFirst under FIXEDMANUAL");
 	}
@@ -931,12 +938,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 		return work;
 	}
 
-	// ---- Partial sum (sparse packing) ----
-	const uint32_t limit = N / (2 * slots);
-	for (uint32_t j = 1; j < limit; j <<= 1) {
-		auto rotated = ctx.EvalRotate(work, static_cast<int32_t>(j * slots));
-		ctx.EvalAddInPlace(work, rotated);
-	}
+	// ---- Partial sum (sparse packing): EvalPartialSumInPlace(work, slots), the AccumulateSum core with
+	// stride = slots and size = N / (2 * slots) ----
+	accumulateSumInPlace(ctx, work, static_cast<int>(N / (2 * slots)), static_cast<int>(slots));
 	rescaleHard(work); // ModReduceInternalInPlace(1) before CoeffsToSlots
 	if (bootDebugStage() == 5) {
 		return work;
@@ -973,7 +977,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& 
 			ctx.EvalSquareInPlace(ctxtEnc);
 			auto shifted = ctx.EvalAdd(ctxtEnc, angleScalar);
 			ctx.EvalAddInPlace(ctxtEnc, shifted);
-			ctx.RescaleInPlace(ctxtEnc); // public ModReduce: FIXEDAUTO no-op (oracle-exact)
+			if (fixedManual) {
+				rescaleHard(ctxtEnc); // public ModReduceInPlace: rescales only under FIXEDMANUAL
+			}
 		}
 	}
 	if (bootDebugStage() == 8) {
@@ -1080,12 +1086,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 	// ---- Scale before CoeffsToSlots (Bootstrap.cu:225,235; OpenFHE :639) ----
 	ctx.EvalMultInPlace(raised, pre * (1.0 / (bp.k * static_cast<double>(N))));
 
-	// ---- Sparse partial sum (Bootstrap.cu sparse Accumulate; OpenFHE :744-746) ----
-	const uint32_t limit = N / (2 * slots);
-	for (uint32_t j = 1; j < limit; j <<= 1) {
-		auto rotated = ctx.EvalRotate(raised, static_cast<int32_t>(j * slots));
-		ctx.EvalAddInPlace(raised, rotated);
-	}
+	// ---- Sparse partial sum (Bootstrap.cu sparse Accumulate; OpenFHE :744-746): EvalPartialSumInPlace(raised, slots),
+	// the AccumulateSum core with stride = slots and size = N / (2 * slots); a no-op when fully packed ----
+	accumulateSumInPlace(ctx, raised, static_cast<int>(N / (2 * slots)), static_cast<int>(slots));
 	// ModReduceInternal before CoeffsToSlots (OpenFHE :756). Unconditional (eager) — CUDA rescale.
 	rescaleHard(raised);
 	if (bootDebugStage() == 2) {
@@ -1145,7 +1148,9 @@ Ciphertext<DCRTPoly> HazeEngine::bootstrapModRaiseFirst(CryptoContextImpl<DCRTPo
 			ctx.EvalSquareInPlace(c);
 			auto shifted = ctx.EvalAdd(c, angleScalar);
 			ctx.EvalAddInPlace(c, shifted);
-			ctx.RescaleInPlace(c); // eager (parity #3); FIXEDAUTO no-op on OpenFHE, eager here
+			if (fixedManual) {
+				rescaleHard(c); // public ModReduceInPlace: rescales only under FIXEDMANUAL
+			}
 		}
 	};
 	// CUDA orders the imaginary Chebyshev first (ApproxModEval.cu:35-36), then real; mirror it.
