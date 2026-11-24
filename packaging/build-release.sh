@@ -136,14 +136,14 @@ if [ "${DEPS_CACHED:-0}" = 1 ]; then
         || { echo "DEPS_CACHED=1 but a cached build tree is missing under $BUILD_ROOT" >&2; exit 1; }
 else
     # ---- 1. OpenFHE oracle (patched; WITH_REDUCED_NOISE is required for haze parity) --
-    # deps/build.sh (the normal dev-build path) applies deps/fideslib-ref-1.5.1.6.patch
+    # deps/build.sh (the normal dev-build path) applies deps/fideslib-ref-1.5.1.7.patch
     # before building deps/openfhe-src. FIDESlib's api/*.cpp and CUDA sources reach into
     # OpenFHE internals (m_FHE, m_bootPrecomMap, K_SPARSE, ...) that are protected/private
     # upstream and call an EvalBootstrapSetup overload the patch adds; without it, this
     # step compiles but step 4 fails.
     echo "==> [1/5] OpenFHE"
     git -C "$OFHE_SRC" checkout -- .
-    git -C "$OFHE_SRC" apply "$REPO/deps/fideslib-ref-1.5.1.6.patch"
+    git -C "$OFHE_SRC" apply "$REPO/deps/fideslib-ref-1.5.1.7.patch"
     cmake -S "$OFHE_SRC" -B "$BUILD_ROOT/openfhe" $OFHE_COMMON \
           -DCMAKE_INSTALL_PREFIX="$OFHE_INS" -DWITH_OPENMP=ON \
           -DCMAKE_CXX_FLAGS="$PREFIX_MAP" >/dev/null

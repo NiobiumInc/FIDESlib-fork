@@ -345,6 +345,8 @@ target_include_directories(fideslib
         # api/ is the include root so headers use api-relative paths (e.g. "engine/cuda/CudaEngine.hpp").
         PUBLIC $<BUILD_INTERFACE:${API_DIR}>
 )
+# The engines include host-only headers from src/CKKS.
+target_include_directories(fideslib PRIVATE ${SOURCE_DIR})
 # The installed public headers include OpenFHE by paths relative to core/ and pke/
 # ("lattice/hal/lat-backend.h", "key/evalkey-fwd.h"), so all five roots have to be
 # on a consumer's include path, not just include/openfhe. That holds for the static
@@ -743,6 +745,7 @@ if (FIDESLIB_COMPILE_TESTS)
         add_executable(fideslib-test)
 
         target_sources(fideslib-test PRIVATE ${TEST_SOURCE})
+        target_compile_definitions(fideslib-test PRIVATE FIDESLIB_TEST_DATA_DIR="${TEST_SOURCE_DIR}/data")
 
         target_sources(fideslib-test PRIVATE
                 FILE_SET dependency_headers
@@ -772,8 +775,11 @@ if (FIDESLIB_COMPILE_TESTS)
                 ${TEST_SOURCE_DIR}/ApiBootstrapToLevelTests.cpp
                 ${TEST_SOURCE_DIR}/ApiPreparedLinearTransformTests.cpp
                 ${TEST_SOURCE_DIR}/ApiParityTest.cpp
+                ${TEST_SOURCE_DIR}/ApiParityExactBootstrapTest.cpp
+                ${TEST_SOURCE_DIR}/ApiParitySaveLevelTest.cpp
                 ${TEST_SOURCE_DIR}/ApiHazeRolesTests.cpp
                 ${TEST_SOURCE_DIR}/ReducedNoiseTests.cpp)
+        target_compile_definitions(fideslib-cpu-test PRIVATE FIDESLIB_TEST_DATA_DIR="${TEST_SOURCE_DIR}/data")
         target_link_libraries(fideslib-cpu-test PRIVATE gtest gtest_main fideslib)
         set_target_properties(fideslib-cpu-test PROPERTIES POSITION_INDEPENDENT_CODE ON)
         gtest_discover_tests(fideslib-cpu-test DISCOVERY_MODE PRE_TEST)

@@ -497,19 +497,31 @@ class HazeEngine : public Engine {
 	// ---- bootstrap precomputation (extracted at loadContext per slots_bootstrap) ----
 	struct BootPrecom {
 		uint32_t slots = 0;
-		bool isLT	   = false; // levelBudget {1,1} (the acceptance path)
-		// OpenFHE precom->BTSlotsEncoding (ckksrns-fhe.cpp:125). CUDA's Engine path is ALWAYS
-		// ModRaise-first (Bootstrap.cu:169) and forwards btsfirstboot into this flag (default
-		// false). bootstrapStaged selects the ModRaise-first port when false (CUDA-matching) and
-		// keeps the StC-first port when true (the CPU oracle's BTSlotsEncoding=true configs).
+		bool isLT	   = false; // levelBudget {1,1}: one linear transform per direction
+		// OpenFHE precom->BTSlotsEncoding (ckksrns-fhe.cpp:125), forwarded from btsfirstboot (default false).
+		// bootstrapStaged runs the ModRaise-first circuit when false and the StC-first circuit when true, as CUDA's
+		// Bootstrap() does.
 		bool btSlotsEncoding = false;
+
+		// OpenFHE precom->StCFirstSavesLevel (PR #1374), engaged exactly when the set saves a level: SlotsToCoeffs ends on the raising
+		// tower with 2^-foldedCorrection in its matrix, so the input sits one level higher, two under FLEXIBLEAUTOEXT, and the raise does no adjust.
+		// foldedCorrection is snapshotted at LoadContext and re-checked per bootstrap, which also reads the applied exponent, while stcSF
+		// and targetSF depend only on the crypto parameters.
+		struct SavedLevel {
+			uint32_t foldedCorrection;
+			double stcSF;
+			double targetSF;
+		};
+
+		std::optional<SavedLevel> savedLevel;
 		uint32_t bStep = 0;		// m_dim1 / m_paramsEnc.g; 0 -> ceil(sqrt(slots))
 		uint32_t correctionFactor = 0;
 		std::vector<Plaintext> u0hatTPre; // CoeffsToSlots linear-transform plaintexts (isLT)
 		std::vector<Plaintext> u0Pre;	  // SlotsToCoeffs linear-transform plaintexts (isLT)
+
 		// Multi-stage FFT precom (levelBudget != {1,1}, !isLT). Per-stage plaintext vectors
 		// (m_U0hatTPreFFT / m_U0PreFFT) plus the BSGS params (m_paramsEnc / m_paramsDec). The
-		// driver iterates stages with plain EvalRotate (Task 06 hoists). decode (StC) uses Dec.
+		// driver runs each stage through extBsgsStage. decode (StC) uses Dec.
 		struct FFTParams {
 			uint32_t lvlb = 0, layersCollapse = 0, remCollapse = 0;
 			uint32_t numRotations = 0, b = 0, g = 0;
@@ -547,18 +559,16 @@ class HazeEngine : public Engine {
 	/// r; a ciphertext with fewer towers multiplies by its prefix.
 	const hazebk::LimbChain& monomialChain(CryptoContextImpl<DCRTPoly>& ctx, uint32_t r);
 	std::map<uint32_t, hazebk::LimbChain> monomials_;
-	/// @brief BSGS linear transform with precomputed plaintexts (plain-rotation equivalent
-	/// of OpenFHE EvalLinearTransform).
+	/// @brief BSGS linear transform with precomputed plaintexts (OpenFHE EvalLinearTransform), one extBsgsStage.
 	Ciphertext<DCRTPoly> linearTransform(CryptoContextImpl<DCRTPoly>& ctx, const std::vector<Plaintext>& a, const Ciphertext<DCRTPoly>& ct, uint32_t bStep);
-	/// @brief Shared staged bootstrap dispatcher. Selects the CUDA-matching ModRaise-first
-	/// variant (Bootstrap.cu:169) when bp.btSlotsEncoding is false — the path the Engine always
-	/// runs — and the StC-first variant (EvalBootstrapStCFirst port) when true.
+	/// @brief Shared staged bootstrap dispatcher. Selects the ModRaise-first circuit when bp.btSlotsEncoding is
+	/// false and the StC-first circuit (EvalBootstrapStCFirst port) when true.
 	Ciphertext<DCRTPoly> bootstrapStaged(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
-	/// @brief ModRaise-first (normal) bootstrap — CUDA FIDESlib::CKKS::Bootstrap (Bootstrap.cu:169);
-	/// the variant CudaEngine::evalBootstrap always dispatches. Selected for btSlotsEncoding=false.
+	/// @brief ModRaise-first (normal) bootstrap — OpenFHE EvalBootstrap, mirrored by CUDA's Bootstrap()
+	/// (Bootstrap.cu:169). Selected for btSlotsEncoding=false.
 	Ciphertext<DCRTPoly> bootstrapModRaiseFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
-	/// @brief StC-first (slim) bootstrap — OpenFHE EvalBootstrapStCFirst port; kept for the
-	/// CPU-oracle's btSlotsEncoding=true configs (CUDA never selects this through the Engine).
+	/// @brief StC-first (slim) bootstrap — OpenFHE EvalBootstrapStCFirst port, mirrored by CUDA's BootstrapStCFirst.
+	/// Selected for btSlotsEncoding=true, on every packing, level budget and scaling technique.
 	Ciphertext<DCRTPoly> bootstrapStCFirst(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext);
 	/// @brief Multi-stage FFT CoeffsToSlots / SlotsToCoeffs driver (levelBudget != {1,1}),
 	/// iterating the per-stage LTstep vectors (CoeffsToSlots.cu:75-151). decode=false → CtS.
@@ -578,22 +588,24 @@ class HazeEngine : public Engine {
 	/// (ckksrns-fhe.cpp:1918-2186): baby-step rotations via EvalFastRotationExt (per-key dot
 	/// product only, NO per-baby ModDown), plaintext multiply + accumulation in Q∥P, and a
 	/// SINGLE constant giant stride applied to the accumulator between blocks
-	/// (EvalHornerGiantRotate: KeySwitchDown, ModUp of the a part, ext keyswitch, addFirst
-	/// c0·PModq fold, automorph both), plus one final KeySwitchDown. rotIn has g entries
+	/// (EvalHornerGiantRotate: ModDown and ModUp of the a part, ext keyswitch, the extended b
+	/// part folded in unrounded, automorph both), plus one final KeySwitchDown. rotIn has g entries
 	/// (rotIn[0] = 0 = identity); numBlocks = b giant blocks are consumed from the TOP
 	/// (i = b-1) downward; term k = g*i + j is included iff k < pts.size(), and the top
 	/// block additionally skips k == numRotSkip (OpenFHE's (Gtop+j) != numRotations guard).
-	/// giantStride 0 disables the accumulator rotation. Returns nullopt when the ext
-	/// preconditions do not hold (non-extended pt encoding, depth != 1, or the
-	/// FIDESLIB_HAZE_BOOT_NO_EXT kill switch) — the caller falls back to the plain-rotation
-	/// path unchanged.
-	std::optional<Operand> extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
+	/// giantStride 0 disables the accumulator rotation. deltaStride != 0 folds one more extended-basis
+	/// rotation by that stride into the accumulator after the last block, before the final KeySwitchDown
+	/// (the CtS/StC delta); 0 = none. Throws std::runtime_error when a precondition fails (input not at
+	/// depth 1 and degree 1, or plaintexts not extended-encoded at the input's level): a plain-rotation
+	/// stage is not oracle-exact, so there is no fallback.
+	Operand extBsgsStage(CryptoContextImpl<DCRTPoly>& ctx,
 	  const Operand& x,
 	  const std::vector<Plaintext>& pts,
 	  const std::vector<int32_t>& rotIn,
 	  int32_t giantStride,
 	  uint32_t numBlocks,
-	  uint32_t numRotSkip);
+	  uint32_t numRotSkip,
+	  int32_t deltaStride);
 
 	// ---- Chebyshev series ----
 

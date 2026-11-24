@@ -41,6 +41,27 @@ void BootstrapCPUraise(Ciphertext& ctxt,
  *   meets them at, and the default set is encoded for the full-height raise.
  */
 void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled = false, const int levelsToDrop = 0);
+/**
+ * @brief Refresh a ciphertext in place with the StC-first (slim) circuit: deplete, SlotsToCoeffs,
+ *        mod-raise, CoeffsToSlots, EvalMod. Transcription of FHECKKSRNS::EvalBootstrapStCFirst,
+ *        single iteration, REAL data. The precomputation installed for `slots` must be an
+ *        StC-first set (BootstrapPrecomputation::stc_first); Bootstrap() dispatches here itself.
+ * @pre towers - (NoiseLevel - 1) >= levels_dec + 2 (+1 under FLEXIBLEAUTOEXT), the oracle's "Not enough levels"
+ *      guard; violations throw std::invalid_argument. A set that saves a level (BootstrapPrecomputation::saved_level)
+ *      is refused here: it needs BootstrapStCFirstSaved.
+ * @post Like the oracle, an input the circuit cannot gain levels on is returned unchanged.
+ */
+void BootstrapStCFirst(Ciphertext& ctxt, const int slots);
+/**
+ * @brief BootstrapStCFirst for a set that saves a level (OpenFHE StCFirstSavesLevel, PR #1374): SlotsToCoeffs ends on the raising
+ *        tower with 2^-folded in its matrices, so the circuit only lowers that to the exponent the host applies.
+ * @param appliedCorrection The exponent OpenFHE applies for `slots` at this bootstrap, from ReadStCFirstAppliedCorrection
+ *        (StCFirstSaveLevel.hpp); at most the set's folded correction, else std::invalid_argument.
+ * @pre The set for `slots` saves a level, else std::invalid_argument. towers - (NoiseLevel - 1) >= levels_dec + 1 under
+ *      every technique, the oracle's "Not enough levels" guard; violations throw std::invalid_argument.
+ * @post Like the oracle, an input the circuit cannot gain levels on is returned unchanged.
+ */
+void BootstrapStCFirstSaved(Ciphertext& ctxt, const int slots, const uint32_t appliedCorrection);
 double GetPreScaleFactor(Context& cc, int slots);
 /// @param levelsToDrop Stop the raise that many Q towers below the chain top (0 = the top,
 ///                     the default). See Bootstrap.

@@ -105,11 +105,6 @@ class CudaEngine final : public Engine {
 	/// host composition, no readbacks.
 	Ciphertext<DCRTPoly>
 	evalBootstrapMetaDevice(CryptoContextImpl<DCRTPoly>& ctx, const Ciphertext<DCRTPoly>& ciphertext, uint32_t precision, bool prescaled, int levelsToDrop);
-	/// @brief Throw if the bootstrap precomputation for `slots` was set up for the slots-encoding
-	/// (StC-first) order, which the device Bootstrap does not implement: running it against those
-	/// precomputations would return a wrong result silently. No-op when there is no
-	/// precomputation for `slots`, which the device Bootstrap reports itself.
-	void requireClassicBootstrapOrder(CryptoContextImpl<DCRTPoly>& ctx, int slots);
 	/// @brief Install the reduced-level bootstrap precomputation for (slots, levelsToDrop) if
 	/// it is not there yet. Host-scheme work, so it takes the host lock.
 	void ensureReducedBootPrecomputation(CryptoContextImpl<DCRTPoly>& ctx, int slots, int levelsToDrop);
@@ -213,6 +208,10 @@ class CudaEngine final : public Engine {
 	/// decides whether to upload the key — and called BEFORE any degree branch, because OpenFHE's
 	/// Relinearize/RelinearizeInPlace hit GetEvalMultKeyVector(tag) first and that accessor throws.
 	void requireRelinKey(CryptoContextImpl<DCRTPoly>& ctx, const CiphertextImpl<DCRTPoly>& ct, const char* op) const;
+
+	/// @brief Bootstrap `ct` on the device with the entry its set needs. A level-saving StC-first set is given the applied correction
+	/// OpenFHE reads at this bootstrap, so a factor changed after load takes effect and a re-encoding the device never saw is refused.
+	void bootstrapOnDevice(CryptoContextImpl<DCRTPoly>& ctx, FIDESlib::CKKS::Ciphertext& ct, int slots, bool prescaled, int levelsToDrop) const;
 
 	/// @brief CUDA CKKS context; null == not loaded. Owned by this engine (one engine per context).
 	std::unique_ptr<FIDESlib::CKKS::Context> context_;
