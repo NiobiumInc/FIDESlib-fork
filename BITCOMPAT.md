@@ -12,11 +12,12 @@ countermeasure), so decrypted values are compared within precision (`ASSERT_ERRO
 
 1. **OpenFHE dev branch** — algorithmic changes with standalone value (formulation unification,
    optimizations that also help the CPU).
-2. **`deps/fideslib-ref-1.5.1.6.patch`** — kept minimal; visibility/build-config shims only
-   (applies on tag `fideslib-ref-v1.5.1.6`). Temporary home for changes queued for upstream.
+2. **`deps/fideslib-ref-1.5.1.7.patch`** — kept minimal; visibility/build-config shims plus the
+   level-saving StC-first bootstrap (applies on tag `fideslib-ref-v1.5.1.6`). Temporary home for
+   changes queued for upstream.
 3. **FIDESlib** — GPU-side fixes and anything that is a FIDESlib bug.
 
-## Current test status (`test/ApiParityTest.cpp`)
+## Current test status (`test/ApiParityTest.cpp`, `test/ApiParityExactBootstrapTest.cpp`)
 
 The bit-compatibility tests that lived in `test/OpenFheCompatTests.cu` were written for the line before
 the Engine abstraction, where `SetDevices` moved a context to the GPU. After the refactor every context
@@ -35,16 +36,19 @@ Measured on this tree:
 | Chebyshev series, degree 12 | `ApiParityTechniqueTest.ChebyshevSeries` | identical | identical |
 | rotation, fast rotation, hoisted rotation, add-many | `ApiParityTechniqueTest.Rotation`, `.FastRotation`, `.FastRotationHoisted`, `.AddMany` | identical | identical |
 | accumulate sum | `ApiParityTechniqueTest.AccumulateSum` | identical | identical |
-| bootstrap: sparse, 64 slots, level budgets {1,1} and {3,3}, FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT, sparse-ternary and sparse-encapsulated secrets | `ApiParityBootstrapShapeTest.EvalBootstrap` | as accurate as OpenFHE (see below) | as accurate as OpenFHE, and on the same level (FLEXIBLE at N = 65536, because the in-process replay bridge rejects FLEXIBLE primes at small rings) |
-| bootstrap, fully packed (slots = N/2), FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT and FIXEDMANUAL | `ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked` | pass | FIXEDAUTO and FIXEDMANUAL; the FLEXIBLE cases do not fit the in-process simulator at the ring the bridge accepts for them |
+| bootstrap, limb-exact against the oracle (every limb of both components plus level, noise scale degree, scaling factor, slots): ModRaise-first and StC-first, level budgets {1,1} to {4,4}, four scaling techniques, uniform, sparse-ternary and sparse-encapsulated secrets, sparse and fully packed, Meta-BTS, depleted, degree-2 and chain-top inputs (R18) | `ApiParityExactBootstrapTest.EvalBootstrap`: `Shapes` (92, N = 4096), `Large` (28, N = 65536, devices only), and the saved-level twins `SaveLevel` (75) and `LargeSaveLevel` (14) (R19) | identical ciphertext: `Shapes` 92/92, `Large` 28/28, `SaveLevel` 75/75, `LargeSaveLevel` 14/14 | identical ciphertext: `Shapes` 92/92, `Large` 28/28, `SaveLevel` 75/75, `LargeSaveLevel` 14/14 on the local target; on FUNC_SIM 35 of the 39 StC-first FLEXIBLE `Shapes` and 3 StC-first `Large` shapes (R18) |
+| bootstrap: sparse, 64 slots, level budgets {1,1} and {3,3}, FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT, sparse-ternary and sparse-encapsulated secrets | `ApiParityBootstrapShapeTest.EvalBootstrap` (decrypted error against repeated OpenFHE bootstraps) | limb-exact in the row above; this test still checks the decrypted error | limb-exact in the row above; this test still checks the decrypted error and the level (FLEXIBLE at N = 65536 in this test, because the in-process replay bridge rejects FLEXIBLE primes at small rings; the exact suite runs FLEXIBLE at N = 4096 in-process, see R18) |
+| bootstrap, fully packed (slots = N/2), FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT and FIXEDMANUAL | `ApiParityFullPackBootstrapTest.EvalBootstrapFullyPacked` | pass | FIXEDAUTO and FIXEDMANUAL; the FLEXIBLE cases do not fit the in-process simulator at the ring the bridge accepts for them (fully packed FLEXIBLE shapes at N = 4096 run in-process and are exact in the first row) |
 | bootstrap at N = 65536, level budgets {1,1}, {2,2}, {3,3}; sparse-ternary secret | `ApiParityBootstrapTest`, `ApiParitySparseSecretBootstrapTest` | pass | pass |
 
-**A bootstrap is not reproducible bit for bit, on OpenFHE or on the device.** Two bootstraps of copies of
-the same ciphertext differ from each other by about as much as either differs from the plaintext (about
-1e-4 to 1e-2 at N = 4096, depending on the technique). A comparison of the device result with one host
-run compares two noise samples, so the bootstrap tests do not require agreement with a host run. They run
-the host bootstrap several times and require the device result to be no further from the plaintext than a
-small factor of the worst of those runs.
+**A bootstrap is reproducible bit for bit.** Two OpenFHE bootstraps of the same ciphertext are identical,
+and the CUDA and haze bootstraps reproduce them limb for limb (R18). What differs between two runs is the
+decryption: `Decode` floods every decryption with fresh Gaussian noise (above), so decrypting two identical
+bootstrap outputs gives two noise samples, about 1e-4 to 1e-2 apart at N = 4096 depending on the
+technique. A bootstrap parity check therefore compares ciphertexts. The decrypted-error tests
+(`ApiParityBootstrapShapeTest`) remain as a second check: a decrypted comparison measures noise, so they
+compare the device result with several host bootstraps and require it to be no further from the plaintext
+than a small factor of the worst of those runs.
 
 ## Resolved issues
 
@@ -275,7 +279,7 @@ test's level guard fired.
 default setup is ModRaise-first on every backend. Run that way, the CPU engine lands on the same tower
 count as haze at every stage of the circuit. At these parameters, a CPU refresh now leaves two fewer
 levels than before, the same budget the device backends leave. `btsfirstboot = true` still selects
-StC-first on CPU.
+StC-first on CPU, and since R18 on CUDA and haze too.
 
 Tests: `BootstrapToLevelTest.RefreshLandsOnTheCpuEngineLevel` compares each device backend's refresh
 level with that of a CPU-engine context built from the same parameters.
@@ -317,6 +321,148 @@ ciphertext.
 
 Tests: `CKKSTest.*MultByMonomial*` (`test/ApiTests.cpp`); `ApiParityTest.*MultByMonomial*`
 (`test/ApiParityTest.cpp`).
+
+### R18. StC-first bootstrap on CUDA and haze, and haze bootstrap exactness
+Line numbers in this section cite the code before the level-saving change (R19): OpenFHE at `fideslib-ref-v1.5.1.6` with
+`fideslib-ref-1.5.1.6.patch` applied, FIDESlib at the commit `test(parity): cover degree-2 and no-gain inputs`.
+
+OpenFHE's `EvalBootstrap` dispatches on `BTSlotsEncoding` (`btsfirstboot` on the api): ModRaise-first by
+default, `EvalBootstrapStCFirst` (`ckksrns-fhe.cpp:1091-1476`, SlotsToCoeffs on the input before the raise) when
+set. CUDA had no StC-first pipeline and refused it (O11); haze ported it for sparse packing, `{1,1}` budgets
+and the AUTO techniques only. Both device bootstraps were compared with
+the oracle by decrypted tolerance, on the belief that a bootstrap is not reproducible bit for bit. It is (see
+above), and a limb-exact comparison showed the haze ModRaise-first circuit was not exact.
+
+**The exact suite.** `test/ApiParityExactBootstrapTest.cpp` (accessors and equality macros shared through
+`test/ParityHelpers.hpp`) bootstraps one encryption on the active backend and on the context's OpenFHE shadow.
+`ExpectBootstrapExact` (`test/ExactBootstrapShared.hpp`) compares every limb of both components plus level, noise scale degree,
+scaling factor, slot count and encoding type, and a precondition (`ASSERT_LT` on the level) rejects a refresh
+that gained nothing, which would pass vacuously. Four instantiations of one fixture, at the end of the file: `Shapes` and `Large` below, and `SaveLevel` and
+`LargeSaveLevel`, their saved-level twins (R19):
+
+- `Shapes`: 92 shapes at N = 4096, 17 ModRaise-first and 75 StC-first. Level budgets `{1,1}` to `{4,4}`; all
+  four scaling techniques; uniform, sparse-ternary and sparse-encapsulated secrets; 32 slots and fully packed;
+  Meta-BTS (two iterations, precision 7 under FLEXIBLEAUTO and 8 under FIXEDMANUAL); inputs one and three
+  levels above the deepest the circuit accepts (the deplete path, `_dep1`, `_dep3`); a degree-2 input
+  (`_deg2`); a chain-top input that gains no levels and must come back unchanged (`_full`); explicit
+  correction factors (`_corr12`, and 10 for the ModRaise-first fully packed FIXEDAUTO shape, whose derived 9
+  is below the degree 10 these moduli give, as in O6d).
+- `Large`: 28 shapes at N = 65536, device backends only. Fourteen rows, each as its StC-first shape and its
+  ModRaise-first twin: rows 1, 2, 3, 5, 7, 8, 9, 10, 11 of OpenFHE v1.6.1 `benchmark/src/ckks-bootstrapping.cpp`
+  (`upstream_r*`), four sweep shapes (`sweep_a` to `sweep_d`) and a 128-bit dcf shape (`dcf_e_3_50`).
+
+| Instantiation | cpu | CUDA | haze, local target | haze, FUNC_SIM |
+|---|--:|--:|--:|--:|
+| `Shapes` (92) | 92/92 | 92/92 | 92/92 | 35 of the 39 StC-first FLEXIBLE shapes |
+| `Large` (28) | not instantiated | 28/28 | 28/28 | 3 of the 14 StC-first shapes (`upstream_r9`, `sweep_a`, `upstream_r1`) |
+| `SaveLevel` (75) | 75/75 | 75/75 | 75/75 | - |
+| `LargeSaveLevel` (14) | not instantiated | 14/14 | 14/14 | - |
+
+Every result listed is an identical ciphertext. A dash marks a combination with no result recorded here. The
+cpu column is the oracle against itself: on the CPU backend the "device" result is a second OpenFHE
+bootstrap, so 92/92 there is the determinism the other columns rest on. Haze runs every `Shapes` technique,
+FLEXIBLE included, in-process at N = 4096; the known-gap entry for fully packed FLEXIBLE shapes
+(`.github/tests-known-gaps/haze.txt`) concerns `ApiParityFullPackBootstrapTest` and does not apply to this
+suite. FUNC_SIM processes need the replay cache cleared first (O15).
+
+**CUDA: StC-first.** `FIDESlib::CKKS::BootstrapStCFirst` (`src/CKKS/Bootstrap.cu:675`, declared at
+`Bootstrap.cuh:53`) transcribes `EvalBootstrapStCFirst` for REAL data and one iteration; Meta-BTS composes it
+through `CudaEngine::evalBootstrapMetaDevice` unchanged. `Bootstrap()` dispatches to it on
+`BootstrapPrecomputation::stc_first` (`Bootstrap.cu:475-481`), as OpenFHE dispatches on `BTSlotsEncoding`, so
+every caller runs the circuit its precomputation was built for. `AddBootstrapPrecomputation` records
+`stc_first` and the decode level budget `levels_dec` (`RawCiphertext.cu:1497-1498`,
+`BootstrapPrecomputation.cuh:44-46`). `CudaEngine::requireClassicBootstrapOrder` and its two call sites are
+deleted. The function follows the oracle at its edges:
+
+- fewer than `levels_dec + 2` towers (one more under FLEXIBLEAUTOEXT) after the pending rescale throws "not
+  enough levels" (`Bootstrap.cu:712-715`, oracle `:1253-1257`);
+- the deplete drains every pending rescale (`:728`);
+- a full-height input returns unchanged before the deplete, whose scaling-factor table read would be out of
+  range (`:720`, oracle `:1471-1474`); an input that runs the circuit but gains no levels is restored from a
+  copy (`:811`);
+- `BootstrapCorrection` (`:439`, used by both circuits at `:510` and `:700`) throws when the degree the moduli
+  give exceeds the correction factor, as `ckksrns-fhe.cpp:789-794` and `:1194-1199` do. Before, the unsigned
+  difference wrapped and the bootstrap returned garbage silently;
+- a prescaled input or a nonzero `levelsToDrop` is refused (`:476-481`), and the reduced and shared
+  precomputations refuse an StC-first set (`RawCiphertext.cu:1280`, `:1393`), because the variable-height raise
+  has no StC-first design. `EvalBootstrapToLevel` still throws for a slots-encoding setup
+  (`CudaEngine.cpp:1066`).
+
+Test: `CKKSBootstrapSlotsEncodingTest.CudaRunsSlotsEncodingBootstrap` (`test/ApiTests.cpp:1158`) replaces
+`CudaRefusesSlotsEncodingBootstrap`: `EvalBootstrap` and `EvalBootstrapInPlace`, one and two iterations, gain
+levels and decrypt within `CKKS_BOOTSTRAP_PRECISION`.
+
+**haze: exactness and StC-first.** Stage bisection (`test/HazeBootstrapStageTest.cpp`, which rebuilds the
+oracle's intermediate at each marker; the engine returns its own at `FIDESLIB_HAZE_BOOT_DEBUG_STAGE`,
+`HazeBootstrap.cpp:565-570`) found three divergences, each of which made the ModRaise-first bootstrap non-exact:
+
+| # | haze before | oracle | fix |
+|---|---|---|---|
+| 1 | sparse partial sum: radix-2 eager rotate-and-add (`EvalRotate` + `EvalAddInPlace`) | `EvalPartialSumInPlace`: lazy fold at radix `PARTIAL_SUM_RADIX` (`ckksrns-fhe.cpp:510-592`; R2, R11, O8) | routed through `accumulateSumInPlace`, the AccumulateSum core (`HazeBootstrap.cpp:847`, `:1001`) |
+| 2 | double-angle loop rescaled under every technique | the public `ModReduceInPlace` (`ckksrns-fhe.cpp:2570-2582`) rescales only under FIXEDMANUAL, as CUDA's loop does (O6b) | rescale gated on FIXEDMANUAL (`:891-893`, `:1061-1063`) |
+| 3 | `extBsgsStage::hornerRotate` ModDowned the b part early, and the CtS/StC delta rotation ran after the final ModDown | `EvalHornerGiantRotate` (`ckksrns-fhe.cpp:97-128`) moddowns only the a part and folds the extended b part into the key-switch product; the delta rotation folds into the last stage's extended output (`:2216`, `:2262`, `:2338`, `:2386`), so the b part rounds once | `hornerRotate` keeps b extended (`HazeBootstrap.cpp:491-499`); the delta rotation folds before the single ModDown (`:519-524`) |
+
+With all three fixed every shape in the table above is exact. Three further changes keep haze at the
+oracle's behaviour:
+
+- A stage that fails an extended-basis precondition throws, naming it (`extBsgsStage`, `:287-295`). The
+  plain-rotation fallback of `linearTransform` and `evalCoeffsToSlotsFFT` and the `FIDESLIB_HAZE_BOOT_NO_EXT`
+  switch are deleted: the fallback decoded correctly and differed from the oracle in the low bits.
+- A degree above the correction factor throws like the oracle (`bootstrapCorrection`, `:59`).
+- An StC-first input at the chain top returns its clone before the deplete (`:756`), as on CUDA.
+
+`bootstrapStCFirst` (`:698`) now covers every packing, level budget and scaling technique. Its three
+`notImplemented` guards (FIXEDMANUAL, fully packed, level budget other than `{1,1}`) and the
+`minPipelineLevels` early-out are deleted; what remains is the oracle's no-gain check at the end and the
+chain-top return above.
+
+**Sensitivity.** The suite was mutated during review and fails on: the correction factor doubled
+(`corFactor * 2`), the final correction multiply skipped (at shapes where `correction > 0`), the sparse fold
+dropped, and each of the three haze fixes reverted. It cannot see a 1-ULP change of the FLEXIBLE deplete
+constant `scf1 / scf2 / scf` (evaluated left to right in doubles, as the oracle does at `ckksrns-fhe.cpp:1259-1284`): the encoded integer is identical at these
+shapes, so that evaluation order is held by the transcription alone.
+
+Full-suite state after the change, per backend:
+
+Measured at `5fdcabcb` on `fideslib-test` (CUDA and haze enabled), against `4d2e88a` rebuilt the same way, with
+`-Large/*`, `-LargeSaveLevel/*` and the aborting tests below excluded (the Large shapes run separately, above).
+
+| backend | `4d2e88a` passed / failed | this branch passed / failed |
+|---|--:|--:|
+| cpu | 629 / 11 | 826 / 10 |
+| cuda | 754 / 10 | 950 / 10 |
+| haze (local) | 758 / 10 | 960 / 10 |
+
+Every test that fails on this branch also fails on `4d2e88a` (listed below). The branch adds 197 passing tests on cpu, 196 on cuda and 202 on haze. On cuda,
+`CKKSBootstrapSlotsEncodingTest.CudaRunsSlotsEncodingBootstrap` replaces `CudaRefusesSlotsEncodingBootstrap`.
+
+These fail or abort on the clean baseline `4d2e88a` as well and are unchanged by this branch:
+
+| test | outcome |
+|---|---|
+| `NTTTests32/NTTTest32.TestLimbNTT32/0`, `.TestLimbNTTSecondHalf32/0` | known gap (`.github/tests-known-gaps/cuda.txt`) |
+| `LLMTests/BtsTimingTests.SSE/0-7` | fail: approximation error too high |
+| `BootstrapPrecision.*`, `DeviceEncodeTest.*` | abort the process: CUDA out of memory, illegal memory access |
+| `BaseTests/BaseTest.ConstructRNSPolySimulateMultiGPU/*` | abort without NCCL |
+
+Tests: `ApiParityExactBootstrapTest.EvalBootstrap/*` (`Shapes/*`, `Large/*`), `HazeBootstrapStageTest.*`,
+`CKKSBootstrapSlotsEncodingTest.CudaRunsSlotsEncodingBootstrap`.
+
+### R19. StC-first saves a level (OpenFHE PR #1374, part 1)
+`CryptoContext::EvalBootstrapSetup` takes a trailing `stcFirstSavesLevel` (OpenFHE's `StCFirstSavesLevel`; StC-first
+only, refused otherwise). Off, the bootstrap is unchanged byte for byte. On, SlotsToCoeffs ends on the towers the
+raise starts from, with the correction (and, under FLEXIBLE*, the scaling-factor ratio) folded into its matrix, so
+the input needs one level less, two under FLEXIBLEAUTOEXT. A correction factor lowered after setup is applied at the
+raise as a multiply by 2^(folded - applied); one raised above the folded factor throws until `EvalBootstrapSetup` or
+`EvalBootstrapPrecompute` folds it again. Both device engines read that pair from `FHECKKSRNS::GetStCFirstCorrection`
+(`src/CKKS/StCFirstSaveLevel.hpp`) and compare scaling factors with the oracle's `STC_FIRST_SCALING_FACTOR_TOLERANCE`,
+so they refuse where the oracle refuses. The flag is serialized; archives written before it load as off
+(`test/data/precom-switch-off-ae9797f4.bin`). The oracle side is `deps/fideslib-ref-1.5.1.7.patch`.
+
+Tests: `SaveLevel/*` and `LargeSaveLevel/*` (`ApiParityExactBootstrapTest.EvalBootstrap`), the saved-level twin of every
+StC-first shape in `Shapes` and `Large`, and `ApiParitySaveLevel*` (`test/ApiParitySaveLevelTest.cpp`: the correction
+lowered or raised after load, the input scaling-factor check, multi-slot defaults, archives written with the switch off
+and on).
 
 ### O1. `EvalRotate` unification *(resolved — landed as `fideslib-ref-v1.5.1.2`)*
 The hoisted HYBRID formulation (already used by `EvalFastRotation`, added upstream for the GPU
@@ -379,7 +525,8 @@ FIXEDAUTO arithmetic all came back bit-exact with no changes; FIXEDAUTO bootstra
 Known remaining coverage gaps: dense×LT{1,1} needs ≈2·slots raised-level LT plaintexts resident
 (several GB at N=4096 fully packed) and could not run on a 4 GB GPU. **Stale as of
 2026-08-26:** it is testable on a GPU with 32 GB. Iterated bootstrap (`numIterations = 2`) is implemented on every
-backend and tested against OpenFHE (`ApiParityIteratedBootstrapTest`, see O11); CUDA now refuses StC-first setups in `EvalBootstrap` (see O11).
+backend and tested against OpenFHE by decrypted values (`ApiParityIteratedBootstrapTest`) and limb-exact by
+`ApiParityExactBootstrapTest` (R18); CUDA runs StC-first setups in `EvalBootstrap` (see O11).
 
 **Bit-compatible with no changes needed (green):**
 - Bootstrap level budget {1,1} → `isLT`/`EvalLinearTransform` branch (`EvalBootstrapLT`) —
@@ -723,7 +870,7 @@ code relying on the narrowing convention would break — worth confirming with t
 maintainers. `Broadcast` has the same trailing `slots` rewrite with no in-tree consumers;
 leave it alone for this fix but it is the same pattern.
 
-### O11. api `EvalBootstrap` GPU dispatch drops parameters *(resolved: iterations on CUDA and haze, StC-first refused on CUDA)*
+### O11. api `EvalBootstrap` GPU dispatch drops parameters *(resolved: iterations and StC-first on CUDA and haze)*
 Two silent divergences between the api's CPU path and its device paths, found while auditing the
 bootstrap dispatch during the combination sweep. The dispatch has since moved from
 `api/CryptoContext.cpp` into the engines (`EvalBootstrap` forwards to `Engine::evalBootstrap`).
@@ -740,30 +887,38 @@ bootstrap dispatch during the combination sweep. The dispatch has since moved fr
   - haze (`HazeEngine::evalBootstrap`, #85): every step recorded on the device operands,
     nothing read back. Before #85 haze still ran a single refresh.
 
-  Three or more iterations throw on both device engines. Test:
-  `ApiParityIteratedBootstrapTest.EvalBootstrapTwoIterations` (`test/ApiParityTest.cpp`) runs
-  `EvalBootstrap` and `EvalBootstrapInPlace` with two iterations on the device engine and checks
-  that each lands on OpenFHE's level, within the error of repeated OpenFHE two-iteration bootstraps,
-  and at least 16 times closer to the plaintext than the best single OpenFHE refresh (so a backend
-  that runs one refresh fails). The comparison is by decrypted values, not limb-exact: a bootstrap is
-  not deterministic.
-- **`btsfirstboot` (StC-first) misroutes on CUDA — resolved (CUDA throws).** api `EvalBootstrapSetup` forwards
+  Three or more iterations throw on both device engines. The compositions are compared limb-exact
+  with OpenFHE's iterated bootstrap by `ApiParityExactBootstrapTest` (R18): the four `_it2` StC-first
+  shapes of `Shapes`, and `upstream_r3`, `upstream_r5` and `sweep_d` of `Large`, each as StC-first
+  and ModRaise-first. Two iterations are also checked by decrypted values:
+  `ApiParityIteratedBootstrapTest.EvalBootstrapTwoIterations` (`test/ApiParityTest.cpp`) runs `EvalBootstrap` and
+  `EvalBootstrapInPlace` with two iterations on the device engine and checks that each lands on OpenFHE's level, within
+  the error of repeated OpenFHE two-iteration bootstraps, and at least 16 times closer to the plaintext than the best
+  single OpenFHE refresh (so a backend that runs one refresh fails). Before R18 that was the only comparison with
+  OpenFHE; before it, the haze composition had been checked only by decrypting an application circuit against its
+  plaintext reference (#85).
+- **`btsfirstboot` (StC-first) misroutes on CUDA - resolved (CUDA runs StC-first).** api `EvalBootstrapSetup` forwards
   `btsfirstboot` to OpenFHE's precomputation (`BTSlotsEncoding`) on every engine.
   - CPU: runs the variant the setup selects (ModRaise-first by default, StC-first for `true`).
-  - haze: dispatches on `btSlotsEncoding` to its StC-first port (`bootstrapStCFirst`) or to
-    ModRaise-first (`HazeBootstrap.cpp`).
-  - CUDA: `EvalBootstrapToLevel` throws for a slots-encoding setup, but the plain
-    `EvalBootstrap` path does not look at `BTSlotsEncoding` and runs the device ModRaise-first
-    `FIDESlib::CKKS::Bootstrap` (FIDESlib has no StC-first pipeline) against StC-first
-    precomputations. Run that way, the ciphertext dropped two levels, decrypted to noise and the
-    process later aborted with an illegal memory access.
+  - haze: dispatches on `btSlotsEncoding` to `bootstrapStCFirst` or to `bootstrapModRaiseFirst`
+    (`HazeBootstrap.cpp:587-590`); the StC-first port covers every packing, level budget and scaling
+    technique (R18).
+  - CUDA: `FIDESlib::CKKS::Bootstrap` dispatches on `BootstrapPrecomputation::stc_first` to
+    `BootstrapStCFirst` (R18). Before, the plain `EvalBootstrap` path did not look at
+    `BTSlotsEncoding` and ran the device ModRaise-first `Bootstrap` against StC-first
+    precomputations: the ciphertext dropped two levels, decrypted to noise and the process later
+    aborted with an illegal memory access.
 
-  Fix (#95): `CudaEngine::requireClassicBootstrapOrder` throws `OpenFHEException` for a
-  slots-encoding setup in `EvalBootstrap` and `EvalBootstrapInPlace`, one and two iterations
-  alike, before touching the ciphertext. CUDA still has no StC-first pipeline; a caller who needs
-  it uses the CPU or haze engine. Test: `CKKSBootstrapSlotsEncodingTest.CudaRefusesSlotsEncodingBootstrap`
-  (`test/ApiTests.cpp`) checks all four calls throw and the ciphertext is left untouched.
+  Interim fix (#95), superseded: `CudaEngine::requireClassicBootstrapOrder` threw `OpenFHEException`
+  for a slots-encoding setup in `EvalBootstrap` and `EvalBootstrapInPlace`, one and two iterations
+  alike, before touching the ciphertext. R18 deleted it. `EvalBootstrapToLevel` still throws for a
+  slots-encoding setup (`CudaEngine.cpp:1083`), because the variable-height raise has no StC-first
+  design. Test: `CKKSBootstrapSlotsEncodingTest.CudaRunsSlotsEncodingBootstrap`
+  (`test/ApiTests.cpp:1158`) replaced `CudaRefusesSlotsEncodingBootstrap`; `EvalBootstrap` and
+  `EvalBootstrapInPlace`, one and two iterations, gain levels and decrypt within
+  `CKKS_BOOTSTRAP_PRECISION`.
 
+Nothing in this item is open.
 
 ### O12. Degree-2 Rescale on device backends inherits the O3 divergence
 The api's degree-2 `Rescale` runs unconditionally on device backends (CUDA, haze); OpenFHE's
@@ -794,7 +949,7 @@ parity fixtures' scope, which target FIXEDAUTO.
 ## Plan forward
 
 **P1 — Land the current state.** *(ongoing)* The `OpenFHECompatTests` branch carries the work
-in per-milestone commits (FIDESlib fixes, `deps/fideslib-ref-1.5.1.6.patch` + `build.sh` bumps,
+in per-milestone commits (FIDESlib fixes, `deps/fideslib-ref-1.5.1.7.patch` + `build.sh` bumps,
 `test/OpenFheCompatTests.cu`, and this document); the upstream side is tagged
 `fideslib-ref-v1.5.1.2`–`v1.5.1.6`. The green suite is the regression wall for everything below.
 
@@ -917,6 +1072,20 @@ a time misses combinations — dense×FIXEDMANUAL diverged where each axis alone
 matching output metadata does not imply a matching pipeline — degree-gated rescales can absorb
 an extra upstream rescale and land at the right level via the wrong trajectory (O6d).
 
+**Exact suite, stage probe, mutation (R18).** A bootstrap is deterministic, so the first check of a bootstrap
+change is `ApiParityExactBootstrapTest`: limb-exact against the oracle, `Shapes` on the CPU backend (which shows
+the oracle reproduces itself), CUDA and haze, and `Large` on the devices. A decrypted tolerance cannot tell two
+noise samples from a wrong circuit; the haze ModRaise-first bootstrap passed one while non-exact. A failing shape
+is localised by `HazeBootstrapStageTest`: `FIDESLIB_HAZE_BOOT_DEBUG_STAGE=k` makes the engine return its
+ciphertext after stage k, and the test rebuilds OpenFHE's intermediate at that stage from the same encryption
+by replaying the calls `FHECKKSRNS::EvalBootstrap` makes, so the first stage that differs names the op. It
+replays the ModRaise-first circuit only, and haze refuses compute after a readback, so each stage runs in a
+context of its own. An exact check is accepted after a mutation pass: perturb what it claims to cover (a
+constant, a skipped multiply, a dropped fold, a reverted fix) and confirm it fails. R18 lists what the suite
+catches and the one change it cannot see. A degree-2 oracle input is built on the host (OpenFHE's own
+`EvalMult` on a clone taken before the api call), because a device readback before the bootstrap stops haze.
+FUNC_SIM and FPGA runs need the replay cache cleared first (O15).
+
 ## Performance accounting (recovered via P2)
 
 | Change | Cost of current (eager) form |
@@ -1005,3 +1174,11 @@ same-binary noise floor (3 ids), in the same families.
 
 Reproduce by building upstream FIDESlib at `786c760` twice: once against its own pinned OpenFHE
 (v1.5.1) and once against `fideslib-ref-v1.5.1.6`.
+
+### O15. `nbcc_fhetch_replay` replays a stale secondary recording across processes *(tooling, not a FIDESlib defect)*
+`nbcc_fhetch_replay` caches its secondary recording as `nbcc_fhetch_replay_source_<project>/` in the process's
+current working directory, keyed only on the project name. A later process that reuses a name (the haze
+projects match `ctx*`) replays the earlier program when the input address sets match: silently when the
+addresses coincide, so a FUNC_SIM or FPGA result can come from another process's program, and with
+`No computed values for output` otherwise. Clear
+`nbcc_fhetch_replay_source_ctx*` from the working directory before each FUNC_SIM or FPGA process.
